@@ -65,7 +65,10 @@ class GarbageCollection:
 
 
 # hardcoded BF16 type peak flops for NVIDIA A100, H100, H200, B200 GPU and AMD MI250, MI300X, MI325X, MI355X and Intel PVC
-def get_peak_flops(device_name: str) -> int:
+def get_peak_flops(device_name: str, dtype: torch.dtype = None) -> int:
+    if dtype is None:
+        dtype = torch.bfloat16
+
     try:
         # Run the lspci command and capture the output
         result = subprocess.run(["lspci"], stdout=subprocess.PIPE, text=True)
@@ -96,7 +99,14 @@ def get_peak_flops(device_name: str) -> int:
         return 989e12
     elif "B200" in device_name:
         # data from https://nvdam.widen.net/s/wwnsxrhm2w/blackwell-datasheet-3384703
-        return 2.25e15
+        if dtype.itemsize == 2:
+            # bf16
+            return 2.25e15
+        elif dtype.itemsize == 1:
+            # fp8
+            return 4.5e15
+        else:
+            raise ValueError((device_name, dtype))
     elif "MI355X" in device_name:
         # MI355X data from https://www.amd.com/en/products/accelerators/instinct/mi350/mi355x.html
         return 2500e12
@@ -122,7 +132,7 @@ def get_peak_flops(device_name: str) -> int:
         return 362e12
 
     else:  # for other GPU types, assume A100
-        logger.warning(f"Peak flops undefined for: {device_name}, fallback to A100")
+        raise ValueError(f"Peak flops undefined for: {device_name}, fallback to A100")
         return 312e12
 
 

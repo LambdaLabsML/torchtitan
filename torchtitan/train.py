@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import contextlib
 import importlib
 import os
 import time
@@ -171,7 +172,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # calculate model size and flops per token
         (
             model_param_count,
-            self.metrics_processor.num_flops_per_token,
+            self.metrics_processor.num_gemm_flops_per_token,
+            self.metrics_processor.num_attn_flops_per_token
         ) = model_args.get_nparams_and_flops(model, job_config.training.seq_len)
 
         logger.info(
@@ -287,11 +289,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # Post optimizer step model converters hook.
         # e.g. calculate float8 dynamic amax/scale for all-parameter for FSDP2
         # where it issues a single all-reduce for all parameters at once for better performance
-        self.optimizers.register_step_post_hook(
-            lambda o, *args, **kwargs: model_converters.post_optimizer_hook(
-                o, *args, **kwargs
-            )
-        )
+        self.optimizers.register_step_post_hook(model_converters.post_optimizer_hook)
         self.metrics_processor.optimizers = self.optimizers
         self.metrics_processor.model_parts = self.model_parts
 

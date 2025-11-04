@@ -368,8 +368,11 @@ class MetricsProcessor:
             else utils.Color()
         )
 
-        self.gpu_peak_flops = utils.get_peak_flops(
-            self.device_memory_monitor.device_name
+        self.bf16_peak_flops = utils.get_peak_flops(
+            self.device_memory_monitor.device_name, dtype=torch.bfloat16
+        )
+        self.fp8_peak_flops = utils.get_peak_flops(
+            self.device_memory_monitor.device_name, dtype=torch.float8_e4m3fn
         )
         self.ntokens_since_last_log = 0
         self.data_loading_times = []
@@ -393,7 +396,8 @@ class MetricsProcessor:
         grad_norm: float,
         extra_metrics: dict[str, Any] | None = None,
     ):
-        assert self.num_flops_per_token > 0, "num_flops_per_token must be set"
+        assert self.num_attn_flops_per_token > 0, "num_flops_per_token must be set"
+        assert self.num_gemm_flops_per_token > 0, "num_flops_per_token must be set"
 
         time_delta = time.perf_counter() - self.time_last_log
 
@@ -404,7 +408,9 @@ class MetricsProcessor:
         # model FLOPS utilization
         # For its definition and calculation, please refer to the PaLM paper:
         # https://arxiv.org/abs/2204.02311
-        mfu = 100 * self.num_flops_per_token * tps / self.gpu_peak_flops
+        attn_mfu = (self.num_attn_flops_per_token / self.bf16_peak_flops)
+        gemm_mfu = (self.num_gemm_flops_per_token / self.fp8_peak_flops)
+        mfu = 100 * tps * (attn_mfu + gemm_mfu)
         tflops = self.num_flops_per_token * tps / 1e12
 
         time_end_to_end = time_delta / self.job_config.metrics.log_freq

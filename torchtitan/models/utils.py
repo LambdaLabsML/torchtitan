@@ -393,16 +393,16 @@ def get_dense_model_nparams_and_flops(
     #    but recomputation should not be counted in calculating MFU           (+0)
     # 3. each matmul performs 1 multiplication and 1 addition                 (*2)
     # 4. we follow the convention and do not account for sparsity in causal attention
-    num_flops_per_token = (
-        6 * (nparams - nparams_embedding)
-        + 6 * model_args.n_layers * model_args.n_heads * head_dims * seq_len
+    num_gemm_flops_per_token = 6 * (nparams - nparams_embedding)
+    num_attn_flops_per_token = (
+        6 * model_args.n_layers * model_args.n_heads * head_dims * seq_len
     )
 
     # If weight tying is enabled, subtract embedding parameters from total count
     if hasattr(model_args, "enable_weight_tying") and model_args.enable_weight_tying:
         nparams = nparams - nparams_embedding
 
-    return nparams, num_flops_per_token
+    return nparams, num_gemm_flops_per_token, num_attn_flops_per_token
 
 
 def get_moe_model_nparams_and_flops(

@@ -167,7 +167,7 @@ class OptimizersInBackwardContainer(OptimizersContainer):
         self._validate_length(
             sum(len(list(model.parameters())) for model in self.model_parts)
         )
-        self._post_init(all_params, optimizer_kwargs)
+        # self._post_init(all_params, optimizer_kwargs)
 
     def register_step_post_hook(self, hook):
         for opt in self.optimizers:
