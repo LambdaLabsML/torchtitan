@@ -165,6 +165,32 @@ qwen3_args = {
             score_before_experts=False,
         ),
     ),
+    "30B-A3B-gpu-optimal": Qwen3ModelArgs(
+        vocab_size=151936,
+        max_seq_len=262144,
+        head_dim=128,
+        # DM: Was 2048
+        dim=3072,
+        # DM: Was 48
+        n_layers=32,
+        n_heads=32,
+        n_kv_heads=4,
+        qk_norm=True,
+        hidden_dim=6144,
+        rope_theta=1000000,
+        moe_enabled=True,
+        moe_inter_dim=768,
+        moe_args=MoEArgs(
+            num_experts=128,
+            num_shared_experts=0,
+            top_k=8,
+            score_func="softmax",
+            route_norm=True,
+            route_scale=1.0,
+            # DM: Switching to True. I don't think this is architectural?
+            score_before_experts=True,
+        ),
+    ),
     "235B-A22B": Qwen3ModelArgs(
         vocab_size=151936,
         max_seq_len=4096,
