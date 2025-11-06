@@ -24,7 +24,7 @@ mixed_precision_reduce = "bfloat16"
 
 [parallelism]
 data_parallel_replicate_degree = 1
-data_parallel_shard_degree = 2
+data_parallel_shard_degree = 4
 tensor_parallel_degree = 4
 enable_async_tensor_parallel = true
 pipeline_parallel_degree = 1
