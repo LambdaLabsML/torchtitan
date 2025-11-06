@@ -3,7 +3,7 @@ dump_folder = "./outputs"
 description = "Llama 3 8B training"
 
 [metrics]
-log_freq = 2
+log_freq = 10
 enable_tensorboard = false
 save_tb_folder = "tb"
 
@@ -31,6 +31,7 @@ context_parallel_degree = 1
 
 [activation_checkpoint]
 mode = "selective"  # ["none", "selective", "full"]
+early_stop = true
 selective_ac_option = "op"  # "int" = ac every positive int layer or 'op', ac based on ops policy
 
 [optimizer]

@@ -31,6 +31,7 @@ context_parallel_degree = 1
 
 [activation_checkpoint]
 mode = "selective"  # ["none", "selective", "full"]
+early_stop = true
 selective_ac_option = "op"  # "int" = ac every positive int layer or 'op', ac based on ops policy
 
 [optimizer]
