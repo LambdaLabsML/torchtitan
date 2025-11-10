@@ -165,6 +165,34 @@ qwen3_args = {
             score_before_experts=False,
         ),
     ),
+        "opt-30B-A3B": Qwen3ModelArgs(
+        vocab_size=151936,
+        max_seq_len=262144,
+        head_dim=128,
+        # DM: Was 2048, 4096 for best op
+        dim=4096,
+        # DM: Was 48, 24 for best op
+        n_layers=24,
+        # DM: Was 32, 8 for best op
+        n_heads=8,
+        n_kv_heads=4,
+        # DM: Was True
+        qk_norm=False,
+        hidden_dim=6144,
+        rope_theta=1000000,
+        moe_enabled=True,
+        moe_inter_dim=768,
+        moe_args=MoEArgs(
+            num_experts=128,
+            num_shared_experts=0,
+            top_k=8,
+            score_func="softmax",
+            route_norm=True,
+            route_scale=1.0,
+            # DM: Switching to True. I don't think this is architectural?
+            score_before_experts=True,
+        ),
+    ),
     "235B-A22B": Qwen3ModelArgs(
         vocab_size=151936,
         max_seq_len=4096,
