@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from contextlib import nullcontext
 import functools
 from typing import Any, Generic, Iterator, TypeVar
 
@@ -72,10 +73,14 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
         model_parts: list[nn.Module],
         optimizer_cls: type[T],
         optimizer_kwargs: dict[str, Any],
+        set_to_none: bool,
+        use_default_stream: bool,
     ) -> None:
         all_params = []
         self.optimizers = []
         self.model_parts = model_parts
+        self.set_to_none = set_to_none
+        self.use_default_stream = use_default_stream
         for model in self.model_parts:
             params = [p for p in model.parameters() if p.requires_grad]
             self.optimizers.append(optimizer_cls(params, **optimizer_kwargs))
@@ -90,12 +95,16 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
         return len(self.optimizers)
 
     def step(self, *args, **kwargs) -> None:
-        for optimizer in self.optimizers:
-            optimizer.step(*args, **kwargs)
+        ctx = nullcontext()
+        if self.use_default_stream:
+            ctx = torch.cuda.stream(torch.cuda.default_stream())
+        with ctx:
+            for optimizer in self.optimizers:
+                optimizer.step(*args, **kwargs)
 
     def zero_grad(self, *args, **kwargs) -> None:
         for optimizer in self.optimizers:
-            optimizer.zero_grad(*args, **kwargs)
+            optimizer.zero_grad(*args, **kwargs, set_to_none=self.set_to_none)
 
     def state_dict(self) -> dict[str, Any]:
         func = functools.partial(
@@ -144,6 +153,8 @@ class OptimizersInBackwardContainer(OptimizersContainer):
         model_parts: list[nn.Module],
         optimizer_cls: type[T],
         optimizer_kwargs: dict[str, Any],
+        set_to_none: bool,
+        use_default_stream: bool,
     ) -> None:
         all_params = []
         self.model_parts = model_parts
@@ -156,8 +167,12 @@ class OptimizersInBackwardContainer(OptimizersContainer):
                 all_params.append(p)
 
         def optim_hook(param) -> None:
-            optim_dict[param].step()
-            optim_dict[param].zero_grad()
+            ctx = nullcontext()
+            if use_default_stream:
+                ctx = torch.cuda.stream(torch.cuda.default_stream())
+            with ctx:
+                optim_dict[param].step()
+            optim_dict[param].zero_grad(set_to_none=set_to_none)
 
         for model in self.model_parts:
             for param in model.parameters():
@@ -324,7 +339,9 @@ def build_optimizers(
 
     if optim_in_bwd:
         return OptimizersInBackwardContainer(
-            model_parts, optimizer_cls, optimizer_kwargs
+            model_parts, optimizer_cls, optimizer_kwargs,
+            set_to_none=optimizer_config.set_to_none,
+            use_default_stream=optimizer_config.use_default_stream,
         )
 
     if ft_manager and ft_manager.enabled:
@@ -336,7 +353,7 @@ def build_optimizers(
             use_ft_optimizer=ft_manager.use_async_quorum,
         )
 
-    return OptimizersContainer(model_parts, optimizer_cls, optimizer_kwargs)
+    return OptimizersContainer(model_parts, optimizer_cls, optimizer_kwargs, set_to_none=optimizer_config.set_to_none, use_default_stream=optimizer_config.use_default_stream,)
 
 
 def build_optimizers_with_moe_load_balancing(

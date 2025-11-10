@@ -60,3 +60,5 @@ enable = false
 [lr_scheduler]
 warmup_steps = 200  # lr scheduler warm up
 
+[infra]
+set_gpu_affinity = true

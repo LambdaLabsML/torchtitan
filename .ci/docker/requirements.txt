@@ -8,3 +8,4 @@ fsspec
 tyro
 tokenizers >= 0.15.0
 safetensors
+git+https://github.com/NVIDIA/gpu_affinity

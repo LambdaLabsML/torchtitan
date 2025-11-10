@@ -89,6 +89,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # init distributed and build meshes
         self.parallel_dims = parallel_dims = self.init_distributed()
 
+        if job_config.infra.set_gpu_affinity:
+            import gpu_affinity
+
+            rank = torch.distributed.get_rank()
+            nproc_per_node = torch.cuda.device_count()
+            local_rank = rank % nproc_per_node
+            gpu_affinity.set_affinity(local_rank, nproc_per_node)
+
         world_mesh = parallel_dims.world_mesh
         if parallel_dims.dp_enabled:
             dp_mesh = world_mesh["dp"]

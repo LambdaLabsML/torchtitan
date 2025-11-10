@@ -165,6 +165,9 @@ class Optimizer:
     register_post_accumulate_grad_hook after the optimizer is built.
     """
 
+    set_to_none: bool = True
+    use_default_stream: bool = False
+
 
 @dataclass
 class LRScheduler:
@@ -772,6 +775,11 @@ class Quantize:
 
 
 @dataclass
+class Infra:
+    set_gpu_affinity: bool = False
+
+
+@dataclass
 class Comm:
     init_timeout_seconds: int = 300
     """Timeout for communication operations, during initialization and first train step."""
@@ -939,6 +947,7 @@ class JobConfig:
     experimental: Experimental = field(default_factory=Experimental)
     validation: Validation = field(default_factory=Validation)
     debug: Debug = field(default_factory=Debug)
+    infra: Infra = field(default_factory=Infra)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
