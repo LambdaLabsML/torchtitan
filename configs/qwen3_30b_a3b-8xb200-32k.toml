@@ -14,7 +14,7 @@ save_tb_folder = "tb"
 
 [model]
 name = "qwen3"
-flavor = "opt-30B-A3B"
+flavor = "30B-A3B"
 hf_assets_path = "./assets/hf/Qwen3-30B-A3B"
 # converters = ["float8"]
 
@@ -26,13 +26,11 @@ implementation = "fused"
 early_step_in_backward = true
 
 [lr_scheduler]
-# DM: trying to explicitly define a decay type
 warmup_steps = 200  # lr scheduler warm up, 20% total steps
 
 [training]
-# DM: Seq len = 8k and lbs = 12 has maxed out mem perfectly so far
 # with selective activation checkpointing
-local_batch_size = 4
+local_batch_size = 3
 seq_len = 32768
 max_norm = 1.0  # grad norm clipping
 steps = 1000
@@ -43,7 +41,6 @@ mixed_precision_reduce = "bfloat16"
 [parallelism]
 data_parallel_replicate_degree = 1
 data_parallel_shard_degree = 8
-# DM: Was default, switching to always
 fsdp_reshard_after_forward = "default" # default / never / always
 tensor_parallel_degree = 1
 enable_async_tensor_parallel = false
@@ -59,7 +56,7 @@ export_dtype = "float16"
 async_mode = "disabled" # ["disabled", "async", "async_with_pinned_mem"]
 
 [activation_checkpoint]
-mode = "full"  # ["none", "selective", "full"]
+mode = "selective"  # ["none", "selective", "full"]
 early_stop = true
 selective_ac_option = "op"  # "int" = ac every positive int layer or 'op', ac based on ops policy
 

@@ -41,6 +41,7 @@ lr = 3e-4
 eps = 1e-8
 implementation = "fused"
 early_step_in_backward = true
+follow_fsdp_groups = true
 
 [profiling]
 enable_profiling = false

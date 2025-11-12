@@ -156,6 +156,7 @@ class OptimizersInBackwardContainer(OptimizersContainer):
         optimizer_kwargs: dict[str, Any],
         set_to_none: bool,
         use_default_stream: bool,
+        follow_fsdp_groups: bool
     ) -> None:
         all_params = []
         self.model_parts = model_parts
@@ -170,50 +171,60 @@ class OptimizersInBackwardContainer(OptimizersContainer):
                 optim_dict[param].step()
             optim_dict[param].zero_grad(set_to_none=set_to_none)
 
-        container = {}
-        for model in self.model_parts:
-            for p in model.parameters():
-                if p.requires_grad:
-                    container[p] = None
 
-        for model in self.model_parts:
-            for n, m in model.named_modules():
-                if isinstance(m, FSDPModule):
-                    if m._get_fsdp_state()._fsdp_param_group is None:
-                        print(f"WARNING '{n}' had no param groups associated with it")
-                        continue
-                    for p in m._get_fsdp_state()._fsdp_param_group.fsdp_params:
-                        if p.sharded_param.requires_grad:
-                            assert p.sharded_param in container
-                            assert container[p.sharded_param] is None, f"Went to assign"
-                            container[p.sharded_param] = n
+        if follow_fsdp_groups:
+            container = {}
+            for model in self.model_parts:
+                for p in model.parameters():
+                    if p.requires_grad:
+                        container[p] = None
 
-        for model in self.model_parts:
-            for n, m in model.named_modules():
-                if isinstance(m, FSDPModule) and m._get_fsdp_state()._fsdp_param_group is not None:
-                    params = [
-                        p.sharded_param
-                        for p in m._get_fsdp_state()._fsdp_param_group.fsdp_params
-                    ]
-                    all_params.extend(params)
-                    params = [p for p in params if p.requires_grad]
-                    opt = optimizer_cls(params, **optimizer_kwargs)
-                    for p in params:
-                        assert container[p] == n
-                        optim_dict[p] = opt
-                    params[-1].register_post_accumulate_grad_hook(optim_hook)
+            for model in self.model_parts:
+                for n, m in model.named_modules():
+                    if isinstance(m, FSDPModule):
+                        if m._get_fsdp_state()._fsdp_param_group is None:
+                            print(f"WARNING '{n}' had no param groups associated with it")
+                            continue
+                        for p in m._get_fsdp_state()._fsdp_param_group.fsdp_params:
+                            if p.sharded_param.requires_grad:
+                                assert p.sharded_param in container
+                                assert container[p.sharded_param] is None, f"Went to assign"
+                                container[p.sharded_param] = n
 
-        for model in self.model_parts:
-            for p in model.parameters():
-                if p not in optim_dict:
+            for model in self.model_parts:
+                for n, m in model.named_modules():
+                    if isinstance(m, FSDPModule) and m._get_fsdp_state()._fsdp_param_group is not None:
+                        params = [
+                            p.sharded_param
+                            for p in m._get_fsdp_state()._fsdp_param_group.fsdp_params
+                        ]
+                        all_params.extend(params)
+                        params = [p for p in params if p.requires_grad]
+                        opt = optimizer_cls(params, **optimizer_kwargs)
+                        for p in params:
+                            assert container[p] == n
+                            optim_dict[p] = opt
+                        params[-1].register_post_accumulate_grad_hook(optim_hook)
+
+            for model in self.model_parts:
+                for p in model.parameters():
+                    if p not in optim_dict:
+                        all_params.append(p)
+                    if p.requires_grad and p not in optim_dict:
+                        assert container[p] is None, container[p]
+                        optim_dict[p] = optimizer_cls([p], **optimizer_kwargs)
+                        p.register_post_accumulate_grad_hook(optim_hook)
+
+            num_model_params = len(list(model.parameters()))
+            assert len(all_params) == num_model_params, (len(all_params), num_model_params)
+        else:
+            optim_dict = {}
+            for model in self.model_parts:
+                for p in model.parameters():
+                    if p.requires_grad:
+                        optim_dict[p] = optimizer_cls([p], **optimizer_kwargs)
+                        p.register_post_accumulate_grad_hook(optim_hook)
                     all_params.append(p)
-                if p.requires_grad and p not in optim_dict:
-                    assert container[p] is None, container[p]
-                    optim_dict[p] = optimizer_cls([p], **optimizer_kwargs)
-                    p.register_post_accumulate_grad_hook(optim_hook)
-
-        num_model_params = len(list(model.parameters()))
-        assert len(all_params) == num_model_params, (len(all_params), num_model_params)
 
         self.optimizers = list(optim_dict.values())
 
@@ -378,6 +389,7 @@ def build_optimizers(
             model_parts, optimizer_cls, optimizer_kwargs,
             set_to_none=optimizer_config.set_to_none,
             use_default_stream=optimizer_config.use_default_stream,
+            follow_fsdp_groups=optimizer_config.follow_fsdp_groups,
         )
 
     if ft_manager and ft_manager.enabled:
