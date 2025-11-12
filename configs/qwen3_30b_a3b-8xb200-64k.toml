@@ -60,13 +60,12 @@ async_mode = "disabled" # ["disabled", "async", "async_with_pinned_mem"]
 
 [activation_checkpoint]
 mode = "full"  # ["none", "selective", "full"]
+early_stop = true
 selective_ac_option = "op"  # "int" = ac every positive int layer or 'op', ac based on ops policy
 
 [compile]
 enable=true
 components = ["model", "loss"]
 
-[quantize.linear.float8]
-enable_fsdp_float8_all_gather = false
-precompute_float8_dynamic_scale_for_fsdp = false
-filter_fqns = ["output"]
+[infra]
+set_gpu_affinity = true
