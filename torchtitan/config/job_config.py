@@ -167,7 +167,7 @@ class Optimizer:
 
     set_to_none: bool = True
     use_default_stream: bool = False
-    follow_fsdp_groups = False
+    follow_fsdp_groups: bool = False
 
 
 @dataclass

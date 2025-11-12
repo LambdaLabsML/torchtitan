@@ -188,7 +188,7 @@ class OptimizersInBackwardContainer(OptimizersContainer):
                         for p in m._get_fsdp_state()._fsdp_param_group.fsdp_params:
                             if p.sharded_param.requires_grad:
                                 assert p.sharded_param in container
-                                assert container[p.sharded_param] is None, f"Went to assign"
+                                assert container[p.sharded_param] is None, f"Tried assigning to {n}, found {container[p.sharded_param]}"
                                 container[p.sharded_param] = n
 
             for model in self.model_parts:
@@ -202,15 +202,16 @@ class OptimizersInBackwardContainer(OptimizersContainer):
                         params = [p for p in params if p.requires_grad]
                         opt = optimizer_cls(params, **optimizer_kwargs)
                         for p in params:
-                            assert container[p] == n
+                            assert container[p] == n, f"{container[p]} != {n}"
                             optim_dict[p] = opt
                         params[-1].register_post_accumulate_grad_hook(optim_hook)
 
             for model in self.model_parts:
-                for p in model.parameters():
+                for name, p in model.named_parameters():
                     if p not in optim_dict:
                         all_params.append(p)
                     if p.requires_grad and p not in optim_dict:
+                        print(f"WARNING: optimizing {name} by itself - not part of any FSDP group")
                         assert container[p] is None, container[p]
                         optim_dict[p] = optimizer_cls([p], **optimizer_kwargs)
                         p.register_post_accumulate_grad_hook(optim_hook)

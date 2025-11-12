@@ -151,6 +151,7 @@ def parallelize_qwen3(
                 else None
             ),
             gradient_divide_factor=parallel_dims.fsdp_gradient_divide_factor,
+            prefetch_distance=job_config.parallelism.prefetch_distance
         )
 
         if parallel_dims.dp_replicate_enabled:

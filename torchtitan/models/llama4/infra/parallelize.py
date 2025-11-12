@@ -162,6 +162,7 @@ def parallelize_llama(
                 else None
             ),
             gradient_divide_factor=parallel_dims.fsdp_gradient_divide_factor,
+            prefetch_distance=job_config.parallelism.prefetch_distance,
         )
 
         if parallel_dims.dp_replicate_enabled:
@@ -287,6 +288,7 @@ def apply_fsdp(
     ep_degree: int = 1,
     dp_mod_ep_mesh: DeviceMesh | None = None,
     gradient_divide_factor: int | None = None,
+    prefetch_distance: int = 1,
 ):
     """
     Apply data parallelism (via FSDP2) to the model.
@@ -376,14 +378,44 @@ def apply_fsdp(
 
     # As an optimization, do not reshard_after_forward the last layers by default
     # since FSDP would prefetch them immediately after the forward pass
-    if model.norm is not None and model.output is not None:
+    if model.norm is not None:
         fully_shard(
-            [model.norm, model.output],
+            model.norm,
+            **fsdp_config,
+            reshard_after_forward=reshard_after_forward_policy == "always",
+        )
+    if model.output is not None:
+        fully_shard(
+            model.output,
             **fsdp_config,
             reshard_after_forward=reshard_after_forward_policy == "always",
         )
 
     fully_shard(model, **fsdp_config)
+
+    if prefetch_distance > 1:
+        dist = prefetch_distance
+        layers = list(model.layers.values())
+
+        # forward prefetch
+        if model.tok_embeddings is not None:
+            model.tok_embeddings.set_modules_to_forward_prefetch(layers[:dist])
+        for i, layer in enumerate(layers):
+            layer.set_modules_to_forward_prefetch(
+                [layers[i + j] for j in range(1, dist + 1) if i + j < len(layers)]
+            )
+        layers[-1].set_modules_to_forward_prefetch(
+            [model.norm, model.output]
+        )
+
+        # backward prefetch
+        model.output.set_modules_to_backward_prefetch(
+            layers[-dist:]
+        )
+        for i, layer in enumerate(layers):
+            layer.set_modules_to_backward_prefetch(
+                [layers[i - j] for j in range(1, dist + 1) if i - j >= 0]
+            )
 
     # NOTE: set up explicit prefetching when EP is enabled, as D2H syncs
     # in EP could interfere with implicit prefetching in FSDP
@@ -515,7 +547,7 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig):
     # but it is experimental.
     torch._dynamo.config.capture_scalar_outputs = True
     # Workaround for https://github.com/pytorch/pytorch/issues/166926
-    torch._C._dynamo.eval_frame._set_lru_cache(False)
+    # torch._C._dynamo.eval_frame._set_lru_cache(False)
     for layer_id, transformer_block in model.layers.named_children():
         if transformer_block.moe_enabled:
             # If it is a MoE layer, FSDP(GroupedExperts) will cause a graph break
