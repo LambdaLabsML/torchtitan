@@ -11,7 +11,7 @@ from datetime import timedelta
 from typing import Any, Generator, Iterable
 
 import torch
-
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.elastic.multiprocessing.errors import record
 
 import torchtitan.protocols.train_spec as train_spec_module
@@ -261,6 +261,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             model.train()
 
             self.model_parts = [model]
+
+        self.prefetch_before_data = self.job_config.parallelism.prefetch_before_data
+        self.prefetch_before_data = self.prefetch_before_data and (len(self.model_parts) == 1 and isinstance(self.model_parts[0], FSDPModule))
 
         self.ft_manager.maybe_set_all_reduce_hook(self.model_parts)
 
@@ -557,6 +560,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # If data runs out during gradient accumulation, that
         # entire step will not be executed.
         for _microbatch in range(self.gradient_accumulation_steps):
+            if self.prefetch_before_data:
+                self.model_parts[0].unshard()
+
             input_dict, labels = next(data_iterator)
             loss = self.forward_backward_step(input_dict, labels)
             accumulated_losses.append(loss.detach())

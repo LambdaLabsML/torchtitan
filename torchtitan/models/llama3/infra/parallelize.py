@@ -122,8 +122,7 @@ def parallelize_llama(
             param_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_param],
             reduce_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_reduce],
             pp_enabled=parallel_dims.pp_enabled,
-            cpu_offload=job_config.training.enable_cpu_offload,
-            reshard_after_forward_policy=job_config.parallelism.fsdp_reshard_after_forward,
+            job_config=job_config
         )
 
         if parallel_dims.dp_replicate_enabled:
@@ -256,8 +255,7 @@ def apply_fsdp(
     param_dtype: torch.dtype,
     reduce_dtype: torch.dtype,
     pp_enabled: bool,
-    cpu_offload: bool = False,
-    reshard_after_forward_policy: str = "default",
+    job_config: JobConfig,
 ):
     """
     Apply data parallelism (via FSDP2) to the model.
@@ -278,9 +276,10 @@ def apply_fsdp(
     """
     mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
     fsdp_config = {"mesh": dp_mesh, "mp_policy": mp_policy}
-    if cpu_offload:
+    if job_config.training.enable_cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
+    reshard_after_forward_policy = job_config.parallelism.fsdp_reshard_after_forward
     match reshard_after_forward_policy:
         case "always":
             reshard_after_forward = True
@@ -307,6 +306,7 @@ def apply_fsdp(
             **fsdp_config,
             reshard_after_forward=reshard_after_forward,
         )
+
     # As an optimization, do not reshard_after_forward the last layers by default
     # since FSDP would prefetch them immediately after the forward pass
     if model.norm is not None:
@@ -322,6 +322,30 @@ def apply_fsdp(
             reshard_after_forward=reshard_after_forward_policy == "always",
         )
     fully_shard(model, **fsdp_config)
+
+    if job_config.parallelism.prefetch_distance > 1:
+        dist = job_config.parallelism.prefetch_distance
+        layers = list(model.layers.values())
+
+        # forward prefetch
+        if model.tok_embeddings is not None:
+            model.tok_embeddings.set_modules_to_forward_prefetch(layers[:dist])
+        for i, layer in enumerate(layers):
+            layer.set_modules_to_forward_prefetch(
+                [layers[i + j] for j in range(1, dist + 1) if i + j < len(layers)]
+            )
+        layers[-1].set_modules_to_forward_prefetch(
+            [model.norm, model.output]
+        )
+
+        # backward prefetch
+        model.output.set_modules_to_backward_prefetch(
+            layers[-dist:]
+        )
+        for i, layer in enumerate(layers):
+            layer.set_modules_to_backward_prefetch(
+                [layers[i - j] for j in range(1, dist + 1) if i - j >= 0]
+            )
 
 
 def apply_ddp(

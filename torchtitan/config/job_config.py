@@ -292,6 +292,9 @@ class Parallelism:
     only `data_parallel_shard_degree` can be negative. 1 means disabled.
     """
 
+    prefetch_distance: int = 1
+    prefetch_before_data: bool = False
+
     fsdp_reshard_after_forward: Literal["default", "always", "never"] = "default"
     """
     `reshard_after_forward` specifies the policy for applying `reshard_after_forward`
