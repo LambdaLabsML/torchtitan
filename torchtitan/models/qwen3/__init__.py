@@ -165,17 +165,19 @@ qwen3_args = {
             score_before_experts=False,
         ),
     ),
-    "30B-A3B-gpu-optimal": Qwen3ModelArgs(
+    "opt-30B-A3B": Qwen3ModelArgs(
         vocab_size=151936,
         max_seq_len=262144,
         head_dim=128,
-        # DM: Was 2048
-        dim=3072,
-        # DM: Was 48
-        n_layers=32,
-        n_heads=32,
+        # DM: Was 2048, 4096 for best op
+        dim=4096,
+        # DM: Was 48, 24 for best op
+        n_layers=24,
+        # DM: Was 32, 8 for best op
+        n_heads=8,
         n_kv_heads=4,
-        qk_norm=True,
+        # DM: Was True
+        qk_norm=False,
         hidden_dim=6144,
         rope_theta=1000000,
         moe_enabled=True,
