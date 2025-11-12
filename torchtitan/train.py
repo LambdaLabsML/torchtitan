@@ -285,11 +285,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # Post optimizer step model converters hook.
         # e.g. calculate float8 dynamic amax/scale for all-parameter for FSDP2
         # where it issues a single all-reduce for all parameters at once for better performance
-        self.optimizers.register_step_post_hook(
-            lambda o, *args, **kwargs: model_converters.post_optimizer_hook(
-                o, *args, **kwargs
-            )
-        )
+        self.optimizers.register_step_post_hook(model_converters.post_optimizer_hook)
         self.metrics_processor.optimizers = self.optimizers
         self.metrics_processor.model_parts = self.model_parts
 
