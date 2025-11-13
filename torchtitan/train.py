@@ -720,9 +720,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.ntokens_seen = state_dict["ntokens_seen"]
 
     def close(self) -> None:
-        if self.checkpointer:
+        if hasattr(self, "checkpointer") and self.checkpointer:
             self.checkpointer.close()
-        if self.metrics_processor:
+        if hasattr(self, "metrics_processor") and self.metrics_processor:
             self.metrics_processor.close()
 
 
@@ -757,7 +757,8 @@ def main(trainer_class: type[Trainer]) -> None:
         raise
     else:
         trainer.close()
-        torch.distributed.destroy_process_group()
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
         logger.info("Process group destroyed")
 
 
