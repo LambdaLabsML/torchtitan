@@ -25,6 +25,14 @@ torchrun --nproc-per-node=gpu -m torchtitan.train <config file>
 
 Optimized config files can be found under [./configs](./configs)
 
+In order to run 16xB200 configurations, instead use run_train_c0.sh and run_train_c1.sh in the torchtitan directory.
+Run the following command on both nodes AT THE SAME TIME, running run_train_c0.sh on node-001 and run_train_c1.sh on node-002:
+```bash
+./run_train_c<0 or 1, depending on the node you are on>.sh --config <config file you want to use for multi-node setup>
+```
+
+The 16xB200 config files can also be found under [./configs](./configs).
+
 ## Running baselines
 
 ```
