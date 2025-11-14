@@ -3,7 +3,7 @@ dump_folder = "./outputs"
 description = "Llama 3 8B training"
 
 [metrics]
-log_freq = 5
+log_freq = 10
 enable_tensorboard = false
 save_tb_folder = "tb"
 
@@ -14,7 +14,7 @@ hf_assets_path = "./assets/hf/Llama-3.1-8B"
 converters = []
 
 [training]
-local_batch_size = 1
+local_batch_size = 2
 seq_len = 16384
 max_norm = 1.0  # grad norm clipping
 steps = 1000
@@ -25,6 +25,8 @@ mixed_precision_reduce = "bfloat16"
 [parallelism]
 data_parallel_replicate_degree = 1
 data_parallel_shard_degree = 8
+prefetch_before_data = true
+prefetch_distance = 4
 tensor_parallel_degree = 1
 pipeline_parallel_degree = 1
 context_parallel_degree = 1
@@ -39,6 +41,7 @@ lr = 3e-4
 eps = 1e-8
 implementation = "fused"
 early_step_in_backward = true
+follow_fsdp_groups = true
 
 [profiling]
 enable_profiling = false
