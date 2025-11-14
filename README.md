@@ -1,5 +1,19 @@
 # Lambda torchtitan fork
 
+## Set up
+
+Install torch, use
+```
+pip install torch --index-url https://download.pytorch.org/whl/cu130
+```
+
+```
+cd torchtitan
+pip install -r requirements.txt
+pip install torchao
+pip install -e .
+```
+
 ## Running lambda fork
 
 ```
