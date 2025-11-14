@@ -28,6 +28,8 @@ data_parallel_shard_degree = 16
 tensor_parallel_degree = 1
 pipeline_parallel_degree = 1
 context_parallel_degree = 1
+prefetch_before_data = true
+# prefetch_distance = 4
 
 [activation_checkpoint]
 mode = "full"  # ["none", "selective", "full"]
