@@ -47,3 +47,4 @@ Sessionx.vim
 .claude
 
 .venv*
+*.out
