@@ -265,7 +265,7 @@ def init_distributed(
     ranks: list[int] | None = None,
 ):
     def _warn_overwrite_env(env, val):
-        if env in os.environ:
+        if env in os.environ and os.environ[env] != val:
             logger.warning(
                 f"ENV[{env}] = {os.environ[env]} will be overridden to {val} based on job config"
             )
@@ -303,11 +303,29 @@ def init_distributed(
         os.makedirs(dump_dir, exist_ok=True)
         _warn_overwrite_env(TRACE_FILE, f"{dump_dir}/{prefix}")
 
+    rank = int(os.getenv("RANK", "-1"))
+    local_rank = None
+    if "LOCAL_RANK" in os.environ:
+        local_rank = int(os.getenv("LOCAL_RANK"))
+    else:
+        num_devices = torch.cuda.device_count()
+        logger.warning(f"$LOCAL_RANK missing - falling back to rank ({rank}) % device count ({num_devices})")
+        local_rank = rank % num_devices
+
+    import socket
+    host = socket.gethostname()
+
+    logger.info(f"Process {rank} (local={local_rank}) on {host} joining process group...")
+    torch.cuda.set_device(f"cuda:{local_rank}")
     torch.distributed.init_process_group(
         backend=_get_distributed_backend(enable_cpu_backend),
         timeout=timedelta(seconds=comm_config.init_timeout_seconds),
+        rank=rank,
+        device_id=local_rank,
         # _ranks=ranks if ranks is not None else [],
     )
+    torch.distributed.barrier()
+    logger.info("All ranks initialized!")
 
 
 def set_pg_timeouts(timeout, world_mesh):
