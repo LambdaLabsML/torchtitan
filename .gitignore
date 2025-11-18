@@ -45,3 +45,5 @@ Sessionx.vim
 
 # Vibe coding
 .claude
+
+.venv*
