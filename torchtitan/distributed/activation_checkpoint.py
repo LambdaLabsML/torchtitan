@@ -7,6 +7,7 @@
 # This file provides the util functions to apply activation checkpointing to the model.
 # Technically, this is not a part of distributed, but distributed module is the best place to put it.
 
+import functools
 import os
 from collections import defaultdict
 
@@ -135,6 +136,67 @@ def _apply_op_sac(
         debug=ac_config.debug,
     )
 
+_LOGGED = {}
+_NUM_RECOMPUTED = {}
+
+def _apply_policy_ac(
+    model: nn.Module,
+    ac_config: ACConfig,
+) -> nn.Module:
+    keep_ratios = {
+        name.replace("-", "."): ratio
+        for name, ratio in ac_config.keep_ratios.items()
+    }
+
+    totals = {name: 0 for name, _ in keep_ratios.items()}
+    def _count(parent, name, fqn, submodule):
+        assert getattr(parent, name) == submodule
+        target_pqn = None
+        for pqn, _ in keep_ratios.items():
+            if (pqn in fqn or pqn in submodule.__class__.__name__):
+                target_pqn = pqn
+                break
+        if target_pqn is not None:
+            totals[target_pqn] += 1
+        for child_name, child in submodule.named_children():
+            _count(submodule, child_name, fqn + "." + child_name, child)
+    for name, child in model.named_children():
+        _count(model, name, name, child)
+
+    num_recomputes = {
+        pqn: totals[pqn] - int(ratio * totals[pqn])
+        for pqn, ratio in keep_ratios.items()
+    }
+
+    logger.info(f"AC Recompute First N Policy: {num_recomputes}")
+
+    def _apply_module_ac(parent, name, fqn, submodule):
+        assert getattr(parent, name) == submodule
+
+        target_pqn = None
+        for pqn, num in num_recomputes.items():
+            if (pqn in fqn or pqn in submodule.__class__.__name__) and num > 0:
+                target_pqn = pqn
+                break
+        
+        if target_pqn is not None:
+            if torch.distributed.get_rank() == 0:
+                logger.info(f"Checkpointing `{fqn}` (via `{target_pqn}`)")
+            num_recomputes[target_pqn] -= 1
+            submodule = ptd_checkpoint_wrapper(
+                submodule,
+                preserve_rng_state=ac_config.preserve_rng_state,
+                determinism_check=ac_config.determinism_check,
+                early_stop=ac_config.early_stop,
+                debug=ac_config.debug,
+            )
+            parent.register_module(name, submodule)
+        else:
+            for child_name, child in submodule.named_children():
+                _apply_module_ac(submodule, child_name, fqn + "." + child_name, child)
+
+    for name, child in model.named_children():
+        _apply_module_ac(model, name, name, child)
 
 def _apply_full_ac(module: nn.Module, ac_config: ACConfig) -> nn.Module:
     """Apply full activation checkpointing to the module.
@@ -238,8 +300,9 @@ def _apply_ac_to_transformer_block(
     model_compile_enabled: bool = False,
     use_flex_attn: bool = False,
     op_sac_save_list: set[torch._ops.OpOverload] | None = None,
+    num_layers: int | None = None
 ) -> nn.Module:
-    valid_ac_modes = ("full", "selective")
+    valid_ac_modes = ("full", "selective", "policy")
     if ac_config.mode not in valid_ac_modes:
         raise ValueError(
             f"Invalid AC mode: {ac_config.mode}. Valid modes: {valid_ac_modes}"
@@ -247,6 +310,9 @@ def _apply_ac_to_transformer_block(
 
     if ac_config.mode == "full":
         return _apply_full_ac(module, ac_config)
+
+    if ac_config.mode == "policy":
+        return _apply_policy_ac(module, ac_config, num_layers)
 
     assert ac_config.mode == "selective", f"{ac_config.mode}"
     use_op_sac = ac_config.selective_ac_option == "op"
@@ -308,7 +374,9 @@ def apply_ac(
     Returns:
         None
     """
-    if ac_config.mode == "memory_budget":
+    if ac_config.mode == "policy":
+        _apply_policy_ac(model, ac_config)
+    elif ac_config.mode == "memory_budget":
         assert model_compile_enabled, "Memory budget mode requires model to be compiled"
         if ac_config.visualize_memory_budget_pareto:
             pareto_dir = os.path.join(base_folder, "memory_budget_pareto")
@@ -320,6 +388,7 @@ def apply_ac(
         torch._functorch.config.activation_memory_budget = ac_config.memory_budget
         logger.info(f"Selected {ac_config.memory_budget} budget option")
     else:
+        num_layers = len(model.layers)
         for layer_id, transformer_block in model.layers.named_children():
             transformer_block = _apply_ac_to_transformer_block(
                 transformer_block,
@@ -328,6 +397,7 @@ def apply_ac(
                 model_compile_enabled=model_compile_enabled,
                 use_flex_attn=use_flex_attn,
                 op_sac_save_list=op_sac_save_list,
+                num_layers=num_layers
             )
             model.layers.register_module(layer_id, transformer_block)
 

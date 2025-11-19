@@ -590,7 +590,7 @@ class Checkpoint:
 
 @dataclass
 class ActivationCheckpoint:
-    mode: Literal["selective", "full", "memory_budget", "none"] = "selective"
+    mode: Literal["selective", "full", "memory_budget", "policy", "none"] = "selective"
     """Type of activation checkpointing to use"""
 
     selective_ac_option: str = "2"
@@ -656,6 +656,8 @@ class ActivationCheckpoint:
     Capture ac debug information. Will be slower. See
     https://docs.pytorch.org/docs/stable/checkpoint.html for details.
     """
+
+    keep_ratios: dict[str, float] = field(default_factory=lambda: {})
 
 
 @dataclass
