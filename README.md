@@ -39,7 +39,11 @@ Run the following command on both nodes AT THE SAME TIME, running run_train_c0.s
 ```
 
 The 16xB200 config files can also be found under [./configs](./configs). For configurations larger than this,
-it is ideal to create a slurm file to run all these concurrently.
+it is ideal to create a slurm file to run all these concurrently. We have train.sbatch that has been configured
+for multi-node use; simply run the following from the torchtitan directory:
+```
+sbatch --nodes <# of nodes> train.sbatch --job.config-file ./configs/<config file>
+```
 
 ## Running baselines
 
