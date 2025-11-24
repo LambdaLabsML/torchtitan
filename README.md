@@ -2,9 +2,15 @@
 
 ## Set up
 
+First, set up a python virtual environment in order to set up everything correctly.
+```
+python -m venv venv-torchtitan
+source venv-torchtitan/bin/activate
+```
+
 Install torch, use
 ```
-pip install torch --index-url https://download.pytorch.org/whl/cu130
+pip install torch --index-url https://download.pytorch.org/whl/cu128
 ```
 
 ```
@@ -28,10 +34,16 @@ Optimized config files can be found under [./configs](./configs)
 In order to run 16xB200 configurations, instead use run_train_c0.sh and run_train_c1.sh in the torchtitan directory.
 Run the following command on both nodes AT THE SAME TIME, running run_train_c0.sh on node-001 and run_train_c1.sh on node-002:
 ```bash
-./run_train_c<0 or 1, depending on the node you are on>.sh --config <config file you want to use for multi-node setup>
+./run_train_c0.sh --config <config file you want to use for multi-node setup>              # RUN THIS ON NODE 1
+./run_train_c1.sh --config <config file you want to use for multi-node setup>              # RUN THIS ON NODE 2
 ```
 
-The 16xB200 config files can also be found under [./configs](./configs).
+The 16xB200 config files can also be found under [./configs](./configs). For configurations larger than this,
+it is ideal to create a slurm file to run all these concurrently. We have train.sbatch that has been configured
+for multi-node use; simply run the following from the torchtitan directory:
+```
+sbatch --nodes <# of nodes> train.sbatch --job.config-file ./configs/<config file>
+```
 
 ## Running baselines
 
