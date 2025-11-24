@@ -25,6 +25,20 @@ def _load_c4_dataset(dataset_path: str, split: str):
     """Load C4 dataset with default configuration."""
     return load_dataset(dataset_path, name="en", split=split, streaming=True)
 
+def _load_c4_local(data_dir: str, split: str):
+    """
+    Stream C4 shards from local disk using the JSON builder.
+    Expects c4-*.json.gz files under: {data_dir}/en/
+    """
+    if split == "train":
+        pattern = f"{data_dir}/en/c4-train.*.json.gz"
+    elif split == "validation":
+        pattern = f"{data_dir}/en/c4-validation.*.json.gz"
+    else:
+        raise ValueError(f"Unsupported split: {split}")
+    # Use the JSON builder; C4 shards are jsonlines.gz with a "text" field.
+    return load_dataset("json", data_files=pattern, split="train", streaming=True)
+
 
 def _process_c4_text(sample: dict[str, Any]) -> str:
     """Process C4 dataset sample text."""
@@ -46,6 +60,16 @@ DATASETS = {
     "c4_validation": DatasetConfig(
         path="allenai/c4",
         loader=partial(_load_c4_dataset, split="validation"),
+        sample_processor=_process_c4_text,
+    ),
+    "c4_local": DatasetConfig(
+        path="/sharedfs/mfu/lambda-torchtitan/torchtitan/hf_datasets",   # default root; you can override via dataset_path
+        loader=partial(_load_c4_local, split="train"),
+        sample_processor=_process_c4_text,
+    ),
+    "c4_local_validation": DatasetConfig(
+        path="/sharedfs/mfu/lambda-torchtitan/torchtitan/hf_datasets",
+        loader=partial(_load_c4_local, split="validation"),
         sample_processor=_process_c4_text,
     ),
 }

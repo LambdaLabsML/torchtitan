@@ -319,7 +319,7 @@ def init_distributed(
     node_rank = os.getenv("SLURM_NODEID")
     procid = os.getenv("SLURM_PROCID")
 
-    logger.info(f"Process {rank} (local={local_rank}) on {host} ({node_rank=} {procid=}) joining process group...")
+    logger.debug(f"Process {rank} (local={local_rank}) on {host} ({node_rank=} {procid=}) joining process group...")
     # torch.cuda.set_device(f"cuda:{local_rank}")
     torch.distributed.init_process_group(
         backend=_get_distributed_backend(enable_cpu_backend),

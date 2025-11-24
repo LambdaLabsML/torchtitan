@@ -122,20 +122,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
         self.train_spec = train_spec_module.get_train_spec(job_config.model.name)
 
-        # build tokenizer and dataloader
-        self.tokenizer = (
-            self.train_spec.build_tokenizer_fn(job_config)
-            if self.train_spec.build_tokenizer_fn is not None
-            else None
-        )
-
-        self.dataloader = self.train_spec.build_dataloader_fn(
-            dp_world_size=dp_degree,
-            dp_rank=dp_rank,
-            tokenizer=self.tokenizer,
-            job_config=job_config,
-        )
-
         # build model (using meta init)
         model_args = self.train_spec.model_args[job_config.model.flavor]
         # set the model args from training job configs
@@ -296,6 +282,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # These attributes must be initialized before checkpoint loading.
         self.step = 0
         self.ntokens_seen = 0
+
+        # build tokenizer and dataloader
+        self.tokenizer = (
+            self.train_spec.build_tokenizer_fn(job_config)
+            if self.train_spec.build_tokenizer_fn is not None
+            else None
+        )
+
+        self.dataloader = self.train_spec.build_dataloader_fn(
+            dp_world_size=dp_degree,
+            dp_rank=dp_rank,
+            tokenizer=self.tokenizer,
+            job_config=job_config,
+        )
 
         self.checkpointer = CheckpointManager(
             dataloader=self.dataloader,
