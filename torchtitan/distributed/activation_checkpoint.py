@@ -7,6 +7,7 @@
 # This file provides the util functions to apply activation checkpointing to the model.
 # Technically, this is not a part of distributed, but distributed module is the best place to put it.
 
+import functools
 import os
 from collections import defaultdict
 
@@ -33,18 +34,21 @@ def _apply_layer_sac(module: nn.Module, ac_config: ACConfig) -> nn.Module:
     Returns:
         nn.Module: The module with layer selective activation checkpointing applied.
     """
+    ckpt = functools.partial(
+        ptd_checkpoint_wrapper,
+        preserve_rng_state=ac_config.preserve_rng_state,
+        determinism_check=ac_config.determinism_check,
+        early_stop=ac_config.early_stop,
+        debug=ac_config.debug,
+    )
     global _layer_sac_count
     _layer_sac_count += 1
     ac_freq = int(ac_config.selective_ac_option)
     if not ac_freq or _layer_sac_count % ac_freq == 0:
-        return ptd_checkpoint_wrapper(
-            module,
-            preserve_rng_state=ac_config.preserve_rng_state,
-            determinism_check=ac_config.determinism_check,
-            early_stop=ac_config.early_stop,
-            debug=ac_config.debug,
-        )
+        return ckpt(module)
     else:
+        module.register_module("attention_norm", ckpt(module.attention_norm))
+        module.register_module("ffn_norm", ckpt(module.ffn_norm))
         return module
 
 
