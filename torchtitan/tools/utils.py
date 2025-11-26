@@ -94,7 +94,9 @@ def get_peak_flops(device_name: str) -> int:
     elif "H200" in device_name:
         # data from https://www.nvidia.com/en-us/data-center/h200/
         return 989e12
-    elif "B200" in device_name or "GB300" in device_name:
+    elif "GB300" in device_name:
+        return 2.5e15
+    elif "B200" in device_name:
         # data from https://nvdam.widen.net/s/wwnsxrhm2w/blackwell-datasheet-3384703
         return 2.25e15
     elif "MI355X" in device_name:

@@ -91,7 +91,7 @@ def main():
     world_size = int(os.environ["WORLD_SIZE"])
 
     logging.basicConfig(
-        format=f"[%(asctime)s] [rank={rank:03}] %(message)s",
+        format=f"[%(asctime)s] %(message)s",
         level=logging.INFO,
     )
 
@@ -100,17 +100,33 @@ def main():
     dist.init_process_group(backend="nccl", device_id=device)
 
     device_name = torch.cuda.get_device_name(device).split(" ")[1]
+    num_local_gpus = torch.cuda.device_count()
     host = socket.gethostname()
     if rank == 0:
         LOGGER.info("=== Node Assignments ===")
     dist.barrier()
 
-    LOGGER.info(f"Joined from {host}")
+    LOGGER.debug(f"Joined from {host}")
 
     torch.set_default_device(device)
     torch.set_default_dtype(torch.bfloat16)
 
     dist.barrier()
+
+    host_assignments = [{} for _ in range(world_size)]
+    dist.all_gather_object(host_assignments, {rank: host})
+    hosts_by_rank = {rank: host}
+    for assignment in host_assignments:
+        for a_rank, a_host in assignment.items():
+            hosts_by_rank[a_rank] = a_host
+    ranks_by_host = {}
+    for a_rank, a_host in hosts_by_rank.items():
+        if a_host not in ranks_by_host:
+            ranks_by_host[a_host] = list()
+        ranks_by_host[a_host].append(a_rank)
+    if rank == 0:
+        for a_host, a_ranks in ranks_by_host.items():
+            LOGGER.info(f"{a_host} has ranks {_ranks_str(a_ranks)}")
 
     model = MODELS[args.model]
 
@@ -131,10 +147,21 @@ def main():
     tokens_per_s = args.num_iters * b / seconds
     flops_per_s = flops_per_token * tokens_per_s
     tflops = flops_per_s * 1e-12
-    LOGGER.info(f"{tokens_per_s:.0f} tokens/s/gpu ({tflops:>8.1f} tflops)")
+    LOGGER.debug(f"{tflops:>6.1f} tflops")
+
+    all_tflops = [{} for _ in range(world_size)]
+    dist.all_gather_object(all_tflops, {rank: tflops})
+    tflops_by_host = {a_host: [0] * num_local_gpus for a_host in ranks_by_host}
+    for details in all_tflops:
+        for a_rank, a_tflops in details.items():
+            tflops_by_host[hosts_by_rank[a_rank]][a_rank % num_local_gpus] = a_tflops
+
     cluster_tflops, tflops_stddev = cluster_mean_std(tflops)
     dist.barrier()
     if rank == 0:
+        for a_host, a_tflops in tflops_by_host.items():
+            tflops_display = ','.join(map(lambda x: f"{x:>6.1f}", sorted(a_tflops, reverse=True)))
+            LOGGER.info(f"{a_host}: {tflops_display}")
         LOGGER.info(f"Mean TFLOPS is {cluster_tflops:.1f} ± {tflops_stddev:.3f}")
 
     layer.to("meta")
