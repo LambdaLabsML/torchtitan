@@ -1,5 +1,5 @@
 #!/bin/bash
-# SBATCH --ntasks-per-node=1
+#SBATCH --ntasks-per-node=1
 
 export HEAD_IP=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 export HEAD_PORT=$(expr 5000 + $(echo -n ${SLURM_JOBID} | tail -c 4))
