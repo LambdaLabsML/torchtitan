@@ -20,6 +20,10 @@ from torchtitan.config import JobConfig
 from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.tools.logging import logger
 
+import torch.distributed as dist
+import random
+import time
+import os
 
 def _load_c4_dataset(dataset_path: str, split: str):
     """Load C4 dataset with default configuration."""
@@ -45,12 +49,39 @@ def _process_c4_text(sample: dict[str, Any]) -> str:
     return sample["text"]
 
 
+def _load_c4_small_dataset(dataset_path: str, split: str):
+    """Load C4 Small dataset with default configuration."""
+    return load_dataset(dataset_path, name="default", split=split, streaming=True)
+
+def _load_c4_small_local(data_dir: str, split: str):
+    """
+    Stream C4 small shards from local disk using the JSON builder.
+    Expects parquet files under: {data_dir}/
+    """
+    if split == "train":
+        pattern = f"{data_dir}/train-*.parquet"
+    elif split == "validation":
+        pattern = f"{data_dir}/validation-*.parquet"
+    else:
+        raise ValueError(f"Unsupported split: {split}")
+    # Use the JSON builder; C4 shards are jsonlines.gz with a "text" field.
+    return load_dataset("parquet", data_files=pattern, split="train", streaming=True)
+
+def _process_c4_small_text(sample: dict[str, Any]) -> str:
+    """Process C4 Small dataset sample text."""
+    return sample["text"]
+
 # Add your dataset here - more information at docs/datasets.md
 DATASETS = {
     "c4": DatasetConfig(
         path="allenai/c4",
         loader=partial(_load_c4_dataset, split="train"),
         sample_processor=_process_c4_text,
+    ),
+    "c4_small": DatasetConfig(
+        path="brando/small-c4-dataset",
+        loader=partial(_load_c4_small_dataset, split="train"),
+        sample_processor=_process_c4_small_text,
     ),
     "c4_test": DatasetConfig(
         path="tests/assets/c4_test",
@@ -66,6 +97,11 @@ DATASETS = {
         path="/sharedfs/mfu/lambda-torchtitan/torchtitan/hf_datasets",   # default root; you can override via dataset_path
         loader=partial(_load_c4_local, split="train"),
         sample_processor=_process_c4_text,
+    ),
+    "c4_small_local": DatasetConfig(
+        path="/sharedfs/hf/hub/datasets--brando--small-c4-dataset/snapshots/a1e57e00812378ce2e8cce052a63d841d596c0dc/data",   # default root; you can override via dataset_path
+        loader=partial(_load_c4_small_local, split="train"),
+        sample_processor=_process_c4_small_text,
     ),
     "c4_local_validation": DatasetConfig(
         path="/sharedfs/mfu/lambda-torchtitan/torchtitan/hf_datasets",
@@ -108,6 +144,7 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         path, dataset_loader, text_processor = _validate_dataset(
             dataset_name, dataset_path
         )
+
         ds = dataset_loader(path)
 
         self.dataset_name = dataset_name
@@ -159,7 +196,7 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
             else:
                 # Reset offset for the next iteration
                 self._sample_idx = 0
-                logger.warning(f"Dataset {self.dataset_name} is being re-looped")
+                logger.debug(f"Dataset {self.dataset_name} is being re-looped")
                 # Ensures re-looping a dataset loaded from a checkpoint works correctly
                 if not isinstance(self._data, Dataset):
                     if hasattr(self._data, "set_epoch") and hasattr(

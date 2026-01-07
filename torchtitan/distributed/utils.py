@@ -285,7 +285,7 @@ def init_distributed(
     TRACE_FILE = "TORCH_FR_DUMP_TEMP_FILE"
     DUMP_ON_TIMEOUT = "TORCH_NCCL_DUMP_ON_TIMEOUT"
     ASYNC_ERROR_HANDLING = "TORCH_NCCL_ASYNC_ERROR_HANDLING"
-    SKIP_CLEANUP = "3"
+    SKIP_CLEANUP = "1"
 
     # FlightRecorder is incompatible with =1 mode where watchdog aborts work, must use =3 (skipcleanup)
     # to get flight recorder dumps. See https://github.com/pytorch/pytorch/issues/121055

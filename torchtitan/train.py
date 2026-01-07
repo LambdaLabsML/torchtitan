@@ -506,14 +506,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         **extra_kwargs,
                         target=targets,
                         losses=losses,
-                        return_outputs=False,
+                        # return_outputs=False,
                     )
                 else:
                     self.pp_schedule.step(
                         **extra_kwargs,
                         target=targets,
                         losses=losses,
-                        return_outputs=False,
+                        # return_outputs=False,
                     )
 
             # accumulate losses across pipeline microbatches
