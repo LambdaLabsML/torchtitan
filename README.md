@@ -1,18 +1,19 @@
-# Lambda torchtitan fork
+# LambdaLabsML/torchtitan
 
-## Set up
+## Virtual Environment set up
 
-First, set up a python virtual environment in order to set up everything correctly.
+Create your venv:
 ```
-python -m venv venv-torchtitan
-source venv-torchtitan/bin/activate
+python -m venv .venv
+source .venv/bin/activate
 ```
 
-Install torch, use
+Install torch:
 ```
 pip install torch --index-url https://download.pytorch.org/whl/cu128
 ```
 
+Install dependencies & torchtitan:
 ```
 cd torchtitan
 pip install -r requirements.txt
@@ -23,7 +24,6 @@ pip install -e .
 ## Running lambda fork
 
 ```
-git checkout main
 sudo nvidia-smi boost-slider --vboost 1
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 torchrun --nproc-per-node=gpu -m torchtitan.train <config file>
@@ -31,28 +31,19 @@ torchrun --nproc-per-node=gpu -m torchtitan.train <config file>
 
 Optimized config files can be found under [./configs](./configs)
 
-In order to run 16xB200 configurations, instead use run_train_c0.sh and run_train_c1.sh in the torchtitan directory.
-Run the following command on both nodes AT THE SAME TIME, running run_train_c0.sh on node-001 and run_train_c1.sh on node-002:
-```bash
-./run_train_c0.sh --config <config file you want to use for multi-node setup>              # RUN THIS ON NODE 1
-./run_train_c1.sh --config <config file you want to use for multi-node setup>              # RUN THIS ON NODE 2
-```
-
-The 16xB200 config files can also be found under [./configs](./configs). For configurations larger than this,
-it is ideal to create a slurm file to run all these concurrently. We have train.sbatch that has been configured
-for multi-node use; simply run the following from the torchtitan directory:
-```
-sbatch --nodes <# of nodes> train.sbatch --job.config-file ./configs/<config file>
-```
-
-## Running baselines
+The config files under this directory are generally named like:
 
 ```
-git checkout torchtitan-e7ee95a
-sudo nvidia-smi boost-slider --vboost 0
-export PYTORCH_ALLOC_CONF=expandable_segments:True
-torchrun --nproc-per-node=gpu -m torchtitan.train <config file>
+<model type>_<size>-<num gpus>x<gpu type>-<seq len>.toml
 ```
 
-Config files for baselines can be found under: [./torchtitan/models/llama3/train_configs](./torchtitan/models/llama3/train_configs)
+Here are a couple examples:
+- `llama3_405b-32xgb300-8k.toml`: the Llama 405b recipe for 32 GB300 training on 8k sequence length.
+- `llama3_70b-16xb200-64k.toml`: Llama 70b recipe for 16 B200 gpus with 64k sequence length
 
+## Submitting to a slurm cluster
+
+We provide our `train.sbatch` to launch jobs on slurm clusters, here's a command to launch the training job:
+```
+sbatch --nodes <num nodes> train.sbatch --job.config-file <config file>
+```
