@@ -4,6 +4,7 @@
 export HEAD_IP=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 export HEAD_PORT=$(expr 5000 + $(echo -n ${SLURM_JOBID} | tail -c 4))
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 export PYTORCH_ALLOC_CONF="expandable_segments:True"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=3
 export UCX_TLS=dc,ud,shm,tcp
