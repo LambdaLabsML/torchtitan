@@ -38,8 +38,8 @@ The config files under this directory are generally named like:
 ```
 
 Here are a couple examples:
-- `llama3_405b-32xgb300-8k.toml`: the Llama 405b recipe for 32 GB300 training on 8k sequence length.
-- `llama3_70b-16xb200-64k.toml`: Llama 70b recipe for 16 B200 gpus with 64k sequence length
+- `./configs/llama3_405b-32xgb300-8k.toml`: the Llama 405b recipe for 32 GB300 training on 8k sequence length.
+- `./configs/llama3_70b-16xb200-64k.toml`: Llama 70b recipe for 16 B200 gpus with 64k sequence length
 
 ## Submitting to a slurm cluster
 
