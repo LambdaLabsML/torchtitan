@@ -9,9 +9,14 @@ from torchtitan.components.loss import ChunkedCELoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.quantization import (
+    Float8GroupedExpertsConverter,
+    Float8LinearConverter,
+)
 from torchtitan.components.validate import Validator
 from torchtitan.config import (
     ActivationCheckpointConfig,
+    CompileConfig,
     ParallelismConfig,
     TrainingConfig,
 )
@@ -88,6 +93,48 @@ def gpt_oss_20b() -> Trainer.Config:
         ),
         checkpoint=CheckpointManager.Config(interval=500),
         activation_checkpoint=ActivationCheckpointConfig(mode="full"),
+    )
+
+
+def gpt_oss_20b_fp8() -> Trainer.Config:
+    """gpt_oss_20b + selective AC + rowwise fp8 linears + fp8 grouped-expert GEMMs."""
+    compile_config = CompileConfig(enable=True, components=["model", "loss"])
+    model_compile_enabled = (
+        compile_config.enable and "model" in compile_config.components
+    )
+    converters = [
+        Float8LinearConverter.Config(
+            recipe_name="rowwise",
+            filter_fqns=["output", "router.gate"],
+            model_compile_enabled=model_compile_enabled,
+        ),
+        Float8GroupedExpertsConverter.Config(
+            model_compile_enabled=model_compile_enabled,
+        ),
+    ]
+    return Trainer.Config(
+        loss=ChunkedCELoss.Config(),
+        hf_assets_path="./assets/hf/gpt-oss-20b",
+        model_spec=model_registry("20b", converters=converters),
+        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4"),
+        optimizer=OptimizersContainer.Config(lr=8e-4),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=2000,
+            decay_ratio=0.8,
+            decay_type="cosine",
+            min_lr_factor=0.1,
+        ),
+        training=TrainingConfig(
+            local_batch_size=20,
+            seq_len=8192,
+            steps=10000,
+        ),
+        parallelism=ParallelismConfig(
+            expert_parallel_degree=1,
+        ),
+        compile=compile_config,
+        checkpoint=CheckpointManager.Config(interval=500),
+        activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
     )
 
 

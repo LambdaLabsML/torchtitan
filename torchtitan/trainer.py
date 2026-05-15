@@ -753,6 +753,67 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             )
             accumulated_losses.append(loss.detach())
 
+        # DEBUG (caia): verify backward produced grads for selected params.
+        # Must run after all loss.backward() calls and before clip/optimizer step.
+        if self.step == 1 or self.step % 50 == 0:
+            def _local_norm(g):
+                if g is None:
+                    return None
+                t = g.to_local() if hasattr(g, "to_local") else g
+                return float(t.float().norm().item())
+
+            try:
+                labels = ["attn_wq", "attn_wo", "expert_mlp1", "expert_mlp2"]
+                probes: dict[str, torch.nn.Parameter | None] = {
+                    k: None for k in labels
+                }
+
+                for name, p in self.model_parts[0].named_parameters():
+                    if "layers.0." not in name:
+                        continue
+
+                    # Attention names vary by model: qwen3 uses qkv_linear.wq;
+                    # gpt_oss/llama-style uses attention.wq.
+                    if probes["attn_wq"] is None and (
+                        name.endswith("qkv_linear.wq.weight")
+                        or name.endswith("attention.wq.weight")
+                    ):
+                        probes["attn_wq"] = p
+                    elif probes["attn_wo"] is None and name.endswith("attention.wo.weight"):
+                        probes["attn_wo"] = p
+                    # Expert MLP names: qwen3/deepseek expose `experts.w1` /
+                    # `experts.w2`; gpt_oss exposes `experts.mlp1_weight` /
+                    # `experts.mlp2_weight` (gate_up vs down proj).
+                    elif probes["expert_mlp1"] is None and (
+                        name.endswith("experts.w1")
+                        or name.endswith("experts.mlp1_weight")
+                    ):
+                        probes["expert_mlp1"] = p
+                    elif probes["expert_mlp2"] is None and (
+                        name.endswith("experts.w2")
+                        or name.endswith("experts.mlp2_weight")
+                    ):
+                        probes["expert_mlp2"] = p
+
+                parts = []
+                for k in labels:
+                    p = probes[k]
+                    if p is None:
+                        parts.append(f"{k}=None")
+                    else:
+                        n = _local_norm(p.grad)
+                        parts.append(f"{k}=None" if n is None else f"{k}={n:.4f}")
+
+                print(
+                    f"[GRAD-PROBE step={self.step}] {' '.join(parts)}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(
+                    f"[GRAD-PROBE step={self.step}] error: {type(e).__name__}: {e}",
+                    flush=True,
+                )
+                
         with sl.log_trace_span("optim"):
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for m in self.model_parts for p in m.parameters()],

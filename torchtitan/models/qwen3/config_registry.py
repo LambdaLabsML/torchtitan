@@ -9,8 +9,13 @@ from torchtitan.components.loss import ChunkedCELoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
+from torchtitan.components.quantization import (
+    Float8GroupedExpertsConverter,
+    Float8LinearConverter,
+)
 from torchtitan.config import (
     ActivationCheckpointConfig,
+    CompileConfig,
     ParallelismConfig,
     TrainingConfig,
 )
@@ -362,3 +367,70 @@ def sft_qwen3_8b_math() -> Trainer.Config:
             mode="selective",
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Qwen3-30B-A3B baselines (pytorch/torchtitan main)
+# ---------------------------------------------------------------------------
+
+
+def _qwen3_30b_base(
+    *,
+    fp8: bool,
+    local_batch_size: int,
+) -> Trainer.Config:
+    # Compile is always on for the 30B configs we run; the CLI may still flip
+    # `--compile.enable=False` for ablations.
+    compile_config = CompileConfig(enable=True, components=["model", "loss"])
+    model_compile_enabled = (
+        compile_config.enable and "model" in compile_config.components
+    )
+
+    converters = None
+    if fp8:
+        # Order matters: linear converter first so the grouped-expert converter
+        # sees a model config with linears already swapped.
+        converters = [
+            Float8LinearConverter.Config(
+                recipe_name="rowwise",
+                filter_fqns=["output", "router.gate"],
+                model_compile_enabled=model_compile_enabled,
+            ),
+            Float8GroupedExpertsConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+            ),
+        ]
+
+    return Trainer.Config(
+        loss=ChunkedCELoss.Config(),
+        hf_assets_path="./assets/hf/Qwen3-30B-A3B",
+        model_spec=model_registry("30B-A3B", converters=converters),
+        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4"),
+        optimizer=OptimizersContainer.Config(lr=3e-4),
+        lr_scheduler=LRSchedulersContainer.Config(warmup_steps=600),
+        training=TrainingConfig(
+            local_batch_size=local_batch_size,
+            seq_len=8192,
+            steps=3000,
+        ),
+        parallelism=ParallelismConfig(
+            data_parallel_shard_degree=-1,
+            tensor_parallel_degree=1,
+            expert_parallel_degree=1,
+            pipeline_parallel_degree=1,
+            fsdp_reshard_after_forward="default",
+        ),
+        compile=compile_config,
+        checkpoint=CheckpointManager.Config(interval=500),
+        activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
+    )
+
+
+def qwen3_30b() -> Trainer.Config:
+    """bf16 + compile + selective AC. local_batch_size overridable via CLI."""
+    return _qwen3_30b_base(fp8=False, local_batch_size=12)
+
+
+def qwen3_30b_fp8() -> Trainer.Config:
+    """rowwise fp8 linears + fp8 grouped-expert GEMMs, on top of qwen3_30b."""
+    return _qwen3_30b_base(fp8=True, local_batch_size=12)
