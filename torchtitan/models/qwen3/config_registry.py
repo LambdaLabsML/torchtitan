@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.loss import ChunkedCELoss
+from torchtitan.components.loss import ChunkedCELoss, CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
@@ -13,6 +13,7 @@ from torchtitan.config import (
     ActivationCheckpointConfig,
     ParallelismConfig,
     TrainingConfig,
+    CompileConfig
 )
 from torchtitan.hf_datasets.text_datasets import (
     ChatDataLoader,
@@ -305,6 +306,30 @@ def qwen3_moe_debug() -> Trainer.Config:
         activation_checkpoint=ActivationCheckpointConfig(
             mode="selective",
         ),
+    )
+
+def qwen3_30b_a3b() -> Trainer.Config:
+    return Trainer.Config(
+        loss=CrossEntropyLoss.Config(),
+        hf_assets_path="./assets/hf/Qwen3-30B-A3B",
+        metrics=MetricsProcessor.Config(log_freq=10),
+        model_spec=model_registry("30B-A3B"),
+        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4", pin_memory=True, num_workers=1, prefetch_factor=2),
+        optimizer=OptimizersContainer.Config(lr=8e-4),
+        lr_scheduler=LRSchedulersContainer.Config(warmup_steps=2),
+        training=TrainingConfig(
+            local_batch_size=2,
+            seq_len=8192,
+            steps=100,
+        ),
+        parallelism=ParallelismConfig(
+            expert_parallel_degree=1,
+        ),
+        checkpoint=CheckpointManager.Config(interval=500),
+        activation_checkpoint=ActivationCheckpointConfig(
+            mode="full"
+        ),
+        compile=CompileConfig(enable=True),
     )
 
 

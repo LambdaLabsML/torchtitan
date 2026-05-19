@@ -4,8 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from torchtitan.components.quantization import Float8LinearConverter, Float8GroupedExpertsConverter
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.loss import ChunkedCELoss
+from torchtitan.components.loss import ChunkedCELoss, CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer
@@ -14,6 +15,7 @@ from torchtitan.config import (
     ActivationCheckpointConfig,
     ParallelismConfig,
     TrainingConfig,
+    CompileConfig,
 )
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.trainer import Trainer
@@ -67,10 +69,18 @@ def gpt_oss_debugmodel_ep() -> Trainer.Config:
 
 def gpt_oss_20b() -> Trainer.Config:
     return Trainer.Config(
-        loss=ChunkedCELoss.Config(),
+        loss=CrossEntropyLoss.Config(),
         hf_assets_path="./assets/hf/gpt-oss-20b",
-        model_spec=model_registry("20b"),
-        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4"),
+        model_spec=model_registry("20b", converters=[
+            Float8LinearConverter.Config(
+                model_compile_enabled=True,
+                filter_fqns=["output", "router.gate"],
+            ),
+            Float8GroupedExpertsConverter.Config(
+                model_compile_enabled=True,
+            )
+        ]),
+        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4", pin_memory=True, num_workers=1, prefetch_factor=2),
         optimizer=OptimizersContainer.Config(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2000,
@@ -79,7 +89,7 @@ def gpt_oss_20b() -> Trainer.Config:
             min_lr_factor=0.1,
         ),
         training=TrainingConfig(
-            local_batch_size=1,
+            local_batch_size=2,
             seq_len=8192,
             steps=10000,
         ),
@@ -88,6 +98,7 @@ def gpt_oss_20b() -> Trainer.Config:
         ),
         checkpoint=CheckpointManager.Config(interval=500),
         activation_checkpoint=ActivationCheckpointConfig(mode="full"),
+        compile=CompileConfig(enable=True),
     )
 
 
