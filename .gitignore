@@ -8,7 +8,12 @@ dist/*
 .vscode
 .vs
 
+.venv
+venv
+
 # data
+logs
+slurm_logs
 data
 out
 wandb

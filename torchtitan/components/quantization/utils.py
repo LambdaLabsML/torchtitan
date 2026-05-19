@@ -10,6 +10,7 @@ from torchtitan.models.common.token_dispatcher import (
     AllToAllTokenDispatcher,
     DeepEPTokenDispatcher,
     TorchAOTokenDispatcher,
+    LocalTokenDispatcher,
 )
 
 
@@ -37,7 +38,9 @@ def swap_token_dispatcher(config, pad_multiple: int) -> None:
     DeepEP hybridep). Raises ValueError if the dispatcher doesn't support it.
     """
     td = config.token_dispatcher
-    if isinstance(td, AllToAllTokenDispatcher.Config) and not isinstance(
+    if isinstance(td, LocalTokenDispatcher.Config):
+        pass
+    elif isinstance(td, AllToAllTokenDispatcher.Config) and not isinstance(
         td, TorchAOTokenDispatcher.Config
     ):
         config.token_dispatcher = TorchAOTokenDispatcher.Config(
