@@ -44,6 +44,19 @@ export PYTHONFAULTHANDLER=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600
 
+# --- WandB ----------------------------------------------------------------
+# torchtitan's WandBLogger reads these env vars (see components/metrics.py).
+# Logging is enabled only if the wandb package is importable; otherwise the
+# --metrics.enable_wandb flag is omitted to avoid a hard failure.
+export WANDB_PROJECT="mfu-b200"
+export WANDB_RUN_NAME="bf16-compile-qwen3-b8-${SLURM_JOB_ID}"
+export WANDB_TEAM="${WANDB_TEAM:-caia-costello-lambd}"
+WANDB_FLAG=""
+if python -c "import wandb" 2>/dev/null; then
+  WANDB_FLAG="--metrics.enable_wandb"
+fi
+# --------------------------------------------------------------------------
+
 echo "=== Qwen3-30B-A3B: BF16 + compile + bs=4 ==="
 echo "Job ID:  $SLURM_JOB_ID"
 echo "Nodes:   $SLURM_NNODES"
@@ -62,3 +75,4 @@ srun --export=ALL torchrun \
     --module qwen3 \
     --config qwen3_30b \
     --training.local_batch_size=8 \
+    $WANDB_FLAG
