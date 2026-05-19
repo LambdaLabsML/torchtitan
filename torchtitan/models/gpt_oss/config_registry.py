@@ -96,6 +96,37 @@ def gpt_oss_20b() -> Trainer.Config:
     )
 
 
+def gpt_oss_20b_fp32() -> Trainer.Config:
+    """gpt_oss_20b in full fp32: params, grads, and optimizer state all fp32.
+    Memory-heavy (20B fp32 weights = ~80 GB even before activations); defaults
+    to bs=1. Selective AC + compile."""
+    return Trainer.Config(
+        loss=ChunkedCELoss.Config(),
+        hf_assets_path="./assets/hf/gpt-oss-20b",
+        model_spec=model_registry("20b"),
+        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4"),
+        optimizer=OptimizersContainer.Config(lr=8e-4),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=2000,
+            decay_ratio=0.8,
+            decay_type="cosine",
+            min_lr_factor=0.1,
+        ),
+        training=TrainingConfig(
+            local_batch_size=1,
+            seq_len=8192,
+            steps=10000,
+            dtype="float32",
+        ),
+        parallelism=ParallelismConfig(
+            expert_parallel_degree=1,
+        ),
+        compile=CompileConfig(enable=True, components=["model", "loss"]),
+        checkpoint=CheckpointManager.Config(interval=500),
+        activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
+    )
+
+
 def gpt_oss_20b_fp8() -> Trainer.Config:
     """gpt_oss_20b + selective AC + rowwise fp8 linears + fp8 grouped-expert GEMMs."""
     compile_config = CompileConfig(enable=True, components=["model", "loss"])
@@ -130,7 +161,10 @@ def gpt_oss_20b_fp8() -> Trainer.Config:
             steps=10000,
         ),
         parallelism=ParallelismConfig(
-            expert_parallel_degree=1,
+            # Float8GroupedExpertsConverter -> TorchAOTokenDispatcher requires
+            # EP>1 (padded token groups for quantized grouped GEMMs). With 8
+            # GPUs and EP=2, FSDP shard fans out to the remaining 4.
+            expert_parallel_degree=2,
         ),
         compile=compile_config,
         checkpoint=CheckpointManager.Config(interval=500),

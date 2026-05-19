@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=tt-gptoss-20b-bf16-compile-b8
+#SBATCH --job-name=tt-gptoss-20b-base-compile-b8
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=64
 #SBATCH --time=00:30:00
-#SBATCH --output=/data/cc/torchtitan/logs/bf16-compile-oss-b8-%j.out
-#SBATCH --error=/data/cc/torchtitan/logs/bf16-compile-oss-b8-%j.err
+#SBATCH --output=/data/cc/torchtitan/logs/base-compile-oss-b8-%j.out
+#SBATCH --error=/data/cc/torchtitan/logs/base-compile-oss-b8-%j.err
 #SBATCH --partition=dev
 #SBATCH --qos=dev
 #SBATCH --account=ubuntu

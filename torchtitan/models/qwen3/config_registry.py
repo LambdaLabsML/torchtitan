@@ -387,6 +387,10 @@ def _qwen3_30b_base(
     )
 
     converters = None
+    # Float8GroupedExpertsConverter swaps in TorchAOTokenDispatcher, which
+    # requires EP>1 (padded token groups for quantized grouped GEMMs). When fp8
+    # is on we promote EP to 2; remaining 4 GPUs fan out as FSDP shard.
+    expert_parallel_degree = 2 if fp8 else 1
     if fp8:
         # Order matters: linear converter first so the grouped-expert converter
         # sees a model config with linears already swapped.
@@ -416,7 +420,7 @@ def _qwen3_30b_base(
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=-1,
             tensor_parallel_degree=1,
-            expert_parallel_degree=1,
+            expert_parallel_degree=expert_parallel_degree,
             pipeline_parallel_degree=1,
             fsdp_reshard_after_forward="default",
         ),

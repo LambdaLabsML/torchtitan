@@ -64,5 +64,4 @@ srun --export=ALL torchrun \
     -m torchtitan.train \
         --module gpt_oss \
         --config gpt_oss_20b_fp8 \
-        --training.dtype=bfloat16 \
         --training.local_batch_size="${LOCAL_BS}"
