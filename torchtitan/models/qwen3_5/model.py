@@ -142,9 +142,23 @@ class OffsetRMSNorm(Module):
 
 
 class RMSNormGated(Module):
-    """Gated RMSNorm: ``silu(gate) * weight * norm(x)``.
+    """Gated RMSNorm: ``silu(gate) * (1 + weight) * norm(x)``.
 
-    Takes ``(x, gate)`` separately. Weight is ones-initialized.
+    Takes ``(x, gate)`` separately. Weight is ZERO-initialized (zero-centered
+    parameterization, ``gamma = omega + 1``), matching ``OffsetRMSNorm``.
+
+    Why zero-centered (https://www.ceramic.ai/blog/zerocentered): every
+    parameter here is subject to the catch-all ``weight_decay=0.1`` in
+    ``default_adamw`` -- qwen3_5 defines no param-group exclusion for norms. With
+    the previous ``weight * norm(x)`` and ones-init, weight decay pulled gamma
+    toward **0**, i.e. toward annihilating the GatedDeltaNet output norm in all
+    36 GDN layers. Storing the deviation from identity instead makes decay pull
+    gamma toward **1.0**, the actual identity operation, which is the paper's
+    argument for why zero-centering is the more principled regularization target.
+
+    Mathematically identical at initialization (gamma = 1 either way) and the
+    gradient w.r.t. omega equals the gradient w.r.t. the old weight, since d(1+w)
+    /dw = 1. The ONLY behavioural difference is the direction weight decay pulls.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -166,7 +180,7 @@ class RMSNormGated(Module):
         # again at the end, so dropping it would change results.
         input_dtype = x.dtype
         x = F.rms_norm(
-            x.float(), (x.shape[-1],), self.weight.float(), self.eps
+            x.float(), (x.shape[-1],), 1.0 + self.weight.float(), self.eps
         ).to(input_dtype)
         x = x * F.silu(gate.float())
         return x.to(input_dtype)

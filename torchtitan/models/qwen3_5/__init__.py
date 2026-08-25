@@ -305,7 +305,11 @@ def _qwen35_deltanet_config(
         norm=RMSNormGated.Config(
             dim=value_head_dim,
             eps=1e-6,
-            param_init={"weight": nn.init.ones_},
+            # Zero-centered: RMSNormGated computes (1 + weight) * norm(x), so
+            # omega starts at 0 and gamma starts at 1. Same value at init as the
+            # previous ones_ init, but weight decay now pulls gamma toward 1.0
+            # instead of 0.0. See RMSNormGated's docstring.
+            param_init=_OFFSET_NORM_INIT,
         ),
         out_proj=_proj(value_dim, dim, _depth_init(layer_id)),
         param_init={
