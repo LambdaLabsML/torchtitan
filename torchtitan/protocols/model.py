@@ -6,6 +6,7 @@
 
 from abc import abstractmethod
 from dataclasses import dataclass
+from typing import Any
 
 from torchtitan.config import Configurable
 
@@ -91,3 +92,16 @@ class BaseModel(Module):
         @abstractmethod
         def get_nparams_and_flops(self, model: Module, seq_len: int) -> tuple[int, int]:
             pass
+
+        def get_extra_flops_per_batch(self, input_dict: dict[str, Any]) -> float:
+            """FLOPs this batch that are NOT proportional to decoder tokens.
+
+            ``get_nparams_and_flops`` returns a per-token constant, which cannot
+            express work that scales with something else. For VLMs the vision
+            encoder and patch merger scale with image PATCHES, and the patch
+            count varies per batch, so it has to be measured per step from the
+            batch itself. Returns fwd+bwd FLOPs for one rank's local batch.
+
+            Text-only models have no such term and inherit this 0.
+            """
+            return 0.0

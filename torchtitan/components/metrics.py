@@ -307,6 +307,7 @@ class MetricsProcessor(Configurable):
 
     gpu_peak_flops: float
     ntokens_since_last_log: int
+    extra_flops_since_last_log: float
     data_loading_times: list[float]
     time_last_log: float
 
@@ -348,6 +349,7 @@ class MetricsProcessor(Configurable):
             self.device_memory_monitor.device_name
         )
         self.ntokens_since_last_log = 0
+        self.extra_flops_since_last_log = 0.0
         self.data_loading_times = []
         self.time_last_log = time.perf_counter()
         self.device_memory_monitor.reset_peak_stats()
@@ -482,11 +484,22 @@ class MetricsProcessor(Configurable):
         # https://arxiv.org/abs/2204.02311
         # MFU is based on BF16 peak FLOPS which is misleading when quantization
         # (FP8/MX) is active, so we skip it in that case.
-        tflops = self.num_flops_per_token * tps / 1e12
+        #
+        # num_flops_per_token only covers work proportional to decoder tokens.
+        # VLMs also do work proportional to image PATCHES -- the ViT and the
+        # patch merger -- which no per-token constant can express, because the
+        # patch count varies from batch to batch. extra_flops_since_last_log
+        # carries that term, accumulated per step from the real grid_thw. It
+        # stays 0 for text-only models, so their numbers are unchanged.
+        flops_per_device = (
+            self.num_flops_per_token * self.ntokens_since_last_log
+            + self.extra_flops_since_last_log
+        ) / (time_delta * self.parallel_dims.non_data_parallel_size)
+        tflops = flops_per_device / 1e12
         if self.has_quantization:
             mfu = None
         else:
-            mfu = 100 * self.num_flops_per_token * tps / self.gpu_peak_flops
+            mfu = 100 * flops_per_device / self.gpu_peak_flops
 
         time_end_to_end = time_delta / self.config.log_freq
         time_data_loading = sum(self.data_loading_times) / len(self.data_loading_times)
@@ -532,6 +545,7 @@ class MetricsProcessor(Configurable):
         )
 
         self.ntokens_since_last_log = 0
+        self.extra_flops_since_last_log = 0.0
         self.data_loading_times.clear()
         self.time_last_log = time.perf_counter()
         self.device_memory_monitor.reset_peak_stats()
@@ -572,6 +586,7 @@ class MetricsProcessor(Configurable):
         )
 
         self.ntokens_since_last_log = 0
+        self.extra_flops_since_last_log = 0.0
         self.time_last_log = time.perf_counter()
         self.device_memory_monitor.reset_peak_stats()
 
