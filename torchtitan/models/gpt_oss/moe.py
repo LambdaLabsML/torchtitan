@@ -157,6 +157,25 @@ class GptOssGroupedExperts(GroupedExperts):
             [num_tokens_per_expert_E, tail_slack]
         ).long()
 
+        # Per-row expert id, shape (R,). Expanding the *index* rather than the
+        # bias itself keeps this repeat_interleave's output at one int64 per row
+        # instead of one whole bias vector per row. The expanded-bias tensors the
+        # previous version built were each exactly the size of the grouped-mm
+        # output they were added to -- (R, 2F) for mlp1 and (R, D) for mlp2 --
+        # so at bs=8 the mlp1 one alone was ~3GB of writes per layer, 24 layers
+        # per step, purely to add a per-expert vector.
+        #
+        # Indexing the bias inside the add instead lets inductor fold the gather
+        # into the pointwise epilogue (and, for mlp1, into the swiglu that
+        # immediately follows), so no expanded bias is materialized at all under
+        # compile. output_size is still passed for the same reason as below: it
+        # keeps the output statically shaped and avoids a D2H sync.
+        expert_idx_R = torch.arange(
+            num_tokens_per_expert_long.shape[0], device=x_RD.device
+        ).repeat_interleave(
+            num_tokens_per_expert_long, dim=0, output_size=x_RD.shape[0]
+        )
+
         # G = gate+up dimension (2*F)
         h_RG = self._grouped_mm(
             A=x_RD.bfloat16(),
@@ -167,10 +186,7 @@ class GptOssGroupedExperts(GroupedExperts):
         b1 = torch.cat(
             [mlp1_bias_EG, mlp1_bias_EG.new_zeros(1, mlp1_bias_EG.shape[-1])]
         )
-        b1_RG = b1.repeat_interleave(
-            num_tokens_per_expert_long, dim=0, output_size=x_RD.shape[0]
-        )
-        h_RG = h_RG + b1_RG.to(h_RG.dtype)
+        h_RG = h_RG + b1[expert_idx_R].to(h_RG.dtype)
 
         h_RF = swiglu(h_RG, limit=self.swiglu_limit)
         h_RD = self._grouped_mm(
@@ -181,10 +197,15 @@ class GptOssGroupedExperts(GroupedExperts):
         b2 = torch.cat(
             [mlp2_bias_ED, mlp2_bias_ED.new_zeros(1, mlp2_bias_ED.shape[-1])]
         )
-        b2_RD = b2.repeat_interleave(
-            num_tokens_per_expert_long, dim=0, output_size=x_RD.shape[0]
-        )
-        b2_RD = ScaleBiasForward.apply(b2_RD, tp_degree, h_RD.dtype)
+        # ScaleBiasForward is an autograd.Function, so its input is a real tensor
+        # either way -- the gather cannot be folded away here the way it is for
+        # mlp1. This still drops one full-size (R, D) write, since previously
+        # repeat_interleave materialized the expanded bias and the .to(dtype)
+        # inside ScaleBiasForward then wrote it out a second time. The function is
+        # kept rather than skipped at tp_degree == 1 (where it reduces to a cast)
+        # because it is spmd-registered and its typecheck_forward asserts types
+        # that the spmd_types backend relies on.
+        b2_RD = ScaleBiasForward.apply(b2[expert_idx_R], tp_degree, h_RD.dtype)
         return h_RD + b2_RD
 
 
