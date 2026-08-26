@@ -1269,6 +1269,131 @@ def gptoss20b_fused_noac_noreshard() -> Trainer.Config:
     return config
 
 
+def gptoss20b_mxfp8() -> Trainer.Config:
+    """MXFP8 on the dense linears (attention). Experts stay bf16 -- see below.
+
+    IMPORTANT, and the reason this config does not touch the experts: the MXFP8
+    grouped-GEMM path is architecturally unusable on gpt_oss. The CuTeDSL
+    quantization kernel on sm_100 requires the contraction dim K % 128 == 0, and
+    gpt_oss has dim = hidden_dim = 2880, where 2880 % 128 == 64. Both expert
+    GEMMs are blocked. MXFP8GroupedExpertsConverter.Config.pad_multiple does not
+    help -- it pads per-expert *token groups* (the M dimension), not K. This is
+    the same wall gpt_oss_120b_mxfp8 hit ("AssertionError: K must be divisible by
+    128"), and the 20b has identical dims, so it transfers exactly.
+    gptoss20b_mxfp8_experts exists to verify that rather than assume it.
+
+    What MXFP8 *can* reach is the dense linears. torchao's MXFP8Linear uses 1x32
+    block scaling, so it needs only K % 32 == 0: qkv K=2880, wo K=4096 and
+    lm_head K=2880 all satisfy that.
+
+    That is worth more than it sounds. Because only 4 of 32 experts fire per
+    token, the dense weights are 1.80B of the 4.19B *active* parameters --
+    42.9% of the per-token GEMM work, against the experts' 57.1%. So quantizing
+    attention alone addresses a large minority of the FLOPs even with the MoE
+    left in bf16.
+
+    fqns=["attention"] follows the gpt_oss_120b_mxfp8 precedent and deliberately
+    excludes two things: the router gate, because quantizing it perturbs expert
+    assignment, and lm_head, whose 201,088-wide output feeds the loss directly.
+    gptoss20b_mxfp8_lmhead tests adding lm_head.
+
+    READ THE RESULT ON TOKENS/SEC, NOT MFU. MFU here divides by the bf16 dense
+    peak (2.25e15, from tools/utils.py), but MXFP8 GEMMs run against a higher
+    hardware peak, so any MXFP8 run reports an inflated MFU that is not
+    comparable to the bf16 numbers in RESULTS_GPTOSS20B.md. The control to beat
+    is gptoss20b_noreshard_membudget at 25,673 tok/s/GPU (reported 35.60%, job
+    1024, with the fused-bias commit).
+
+    Memory expectation is modest, not the halving the datatype name suggests.
+    These converters do *dynamic* quantization: master weights stay fp32 and are
+    quantized per step, so parameter and optimizer memory are unchanged. What
+    shrinks is quantized activations and GEMM operands.
+    """
+    config = gptoss20b_noreshard_membudget()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.model_spec = model_registry(
+        "20b",
+        converters=[
+            MXFP8LinearConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=["attention"],
+            ),
+        ],
+    )
+    return config
+
+
+def gptoss20b_mxfp8_lmhead() -> Trainer.Config:
+    """gptoss20b_mxfp8 plus MXFP8 on lm_head.
+
+    lm_head is dim 2880 -> vocab 201,088, which the fused-CE sizing put at
+    227.7 TFLOP per step per rank -- 10.5% of step time and the single largest
+    dense GEMM in the model. K=2880 satisfies MXFP8Linear's K % 32 == 0, so
+    unlike the experts it is reachable.
+
+    Split from gptoss20b_mxfp8 rather than folded in because it carries a
+    numerics risk the attention linears do not: lm_head's output goes straight
+    into the cross entropy, so quantization error there lands directly on the
+    loss and its gradient. gpt_oss_120b_fp8 excluded lm_head for exactly this
+    reason. Watch the loss curve against the control (step 25 loss ~8.0 across
+    every healthy run in this campaign) and treat a visibly higher loss as
+    grounds to reject even if tokens/sec improves.
+
+    Router gate stays bf16 -- attention and lm_head only.
+    """
+    config = gptoss20b_noreshard_membudget()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.model_spec = model_registry(
+        "20b",
+        converters=[
+            MXFP8LinearConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=["attention", "lm_head"],
+            ),
+        ],
+    )
+    return config
+
+
+def gptoss20b_mxfp8_experts() -> Trainer.Config:
+    """MXFP8 grouped experts. EXPECTED TO FAIL -- this verifies the K%128 wall.
+
+    Run to confirm empirically that the 120b's "AssertionError: K must be
+    divisible by 128" reproduces on the 20b rather than inferring it from
+    matching dims. If it somehow runs, the experts are 57.1% of active FLOPs and
+    this becomes the most valuable config in the registry; if it raises inside
+    torchao/prototype/moe_training/kernels/mxfp8/cutedsl_quantize_2d_1x32.py as
+    predicted, the MoE MXFP8 path is closed for this architecture and the
+    remaining low-precision option is Float8, which needs only 16-element
+    alignment (2880 % 16 == 0) -- the route gpt_oss_120b_fp8 takes.
+
+    pad_multiple=128 matches the kernel's M-dimension requirement on sm_100, so
+    a failure here is specifically about K and not about token-group padding.
+    """
+    config = gptoss20b_noreshard_membudget()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.model_spec = model_registry(
+        "20b",
+        converters=[
+            MXFP8LinearConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=["attention"],
+            ),
+            MXFP8GroupedExpertsConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                pad_multiple=128,
+            ),
+        ],
+    )
+    return config
+
+
 def gptoss20b_selac_compile_flex() -> Trainer.Config:
     """selac_compile with FlexAttention instead of varlen.
 
