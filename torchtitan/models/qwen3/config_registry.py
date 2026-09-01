@@ -893,6 +893,90 @@ def qwen3_30b_a3b_8k_bs10_selac_compile() -> Trainer.Config:
     return config
 
 
+def qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce() -> Trainer.Config:
+    """Best config with the FSDP gradient reduce-scatter in bf16 instead of fp32.
+
+    The only change from qwen3_30b_a3b_8k_bs10_selac_compile (job 1206: 26.72%
+    MFU, 601.17 TF/GPU, 127,983 tok/s/node) is
+    training.mixed_precision_reduce float32 -> bfloat16.
+
+    NEVER TESTED IN THIS SWEEP. mixed_precision_reduce is not set by any qwen3
+    config, so it resolved to "float32" in every job from 1152 to 1312. This is
+    the last untried lever with a documented, quantified target.
+
+    WHY IT SHOULD BE THE BIGGEST REMAINING ONE. This field only exists in this
+    fork, and configs.py:85 explains why it was added: on Qwen3.5-122B the fp32
+    gradient reduce-scatter measured 1,230ms of a 4,838ms step -- ~25% of the
+    step and 65% of all NCCL time. Halving those bytes is a communication win, so
+    unlike batch size it does not need more work per step to pay off, and unlike
+    the AC and fusion experiments it does not touch compute at all. Nothing
+    measured in this sweep has targeted gradient communication: no-AC and
+    MemoryBudgetAC moved recompute, fsdp_reshard_after_forward="never" targeted
+    the backward all-gather (and lost, because holding 56.87GiB of unsharded
+    params forced the batch down), and MXFP8 moved GEMM precision.
+
+    Expect a smaller share than the 122B figure. That measurement was on a much
+    larger model where gradients are proportionally more expensive to reduce;
+    30.5B params sharded over 8 ranks is a smaller reduce-scatter. Treat ~25% as
+    an upper bound on the addressable fraction, not a prediction.
+
+    THIS CHANGES TRAINING NUMERICS, and the field's own docstring is blunt about
+    it: "Gradients reduce-scattered across 8 shards in bf16 accumulate rounding
+    error that fp32 reduction is specifically there to avoid. Do not use it for a
+    real run without comparing loss curves against a float32 control at the same
+    --debug.seed." If this shows a throughput win, that seeded comparison is
+    mandatory before use, not optional -- and the risk is higher here than for
+    MXFP8 GEMMs, because reduction error compounds across steps rather than being
+    re-quantized fresh each forward. Pair it with
+    qwen3_30b_a3b_8k_bs10_selac_compile_seed42 as the fp32 control.
+
+    MEASURED, AND IT IS THE ONE TO ADOPT. Matched 144-step window (13-156):
+        job 1206  unseeded fp32 reduce   601.17 TF/GPU  26.72% MFU  161.77GiB
+        job 1336  SEEDED   fp32 reduce   601.22 TF/GPU  26.72% MFU  161.77GiB
+        job 1327  unseeded bf16 reduce   612.98 TF/GPU  27.24% MFU  160.78GiB
+        job 1337  SEEDED   bf16 reduce   610.79 TF/GPU  27.15% MFU  160.78GiB
+    So +1.6% tokens/sec and 26.72% -> 27.15% MFU, plus ~1GiB. Note how tightly
+    the two fp32 controls agree (601.17 vs 601.22, both 26.72%) despite different
+    seeds -- run-to-run throughput variation on this config is ~0.01%, so the
+    gain is far outside noise.
+
+    IT KEEPS MFU QUOTABLE, which the MXFP8 configs do not. mixed_precision_reduce
+    does not set has_quantization, so metrics.py still divides by the bf16 peak
+    legitimately -- nothing here changes GEMM precision. The MXFP8 wins are
+    larger in tokens/sec but can only ever be reported as throughput. This is the
+    only lever in the sweep that raises the headline MFU number.
+
+    NUMERICS: CLEAN, and verified the way the field's own docstring demands. At
+    seed=42, bf16 reduce against the fp32 control (jobs 1337 vs 1336):
+        step  fp32      bf16      delta
+          25  8.14452   8.12560   -0.019
+          50  7.36861   7.41060   +0.042
+          75  6.86892   6.86823   -0.001
+         100  6.53468   6.48054   -0.054
+         125  6.28686   6.36283   +0.076
+         150  6.09964   6.17250   +0.073
+    The sign alternates and there is no trend -- unbiased chaotic divergence from
+    perturbed gradients, not systematic degradation. Contrast the MXFP8 configs,
+    whose UNSEEDED gaps were monotonic and widening; those two signatures look
+    genuinely different, which is why the seeded control was worth running.
+    """
+    config = qwen3_30b_a3b_8k_bs10_selac_compile()
+    config.training.mixed_precision_reduce = "bfloat16"
+    return config
+
+
+def qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_seed42() -> Trainer.Config:
+    """bf16 gradient reduce-scatter at seed=42, for the numerics comparison.
+
+    Pairs with qwen3_30b_a3b_8k_bs10_selac_compile_seed42 (the fp32 control at
+    the same seed). Reduction error compounds across steps, so this is the pair
+    that actually prices the risk the field's docstring warns about.
+    """
+    config = qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce()
+    config.debug.seed = 42
+    return config
+
+
 # ---------------------------------------------------------------------------
 # MXFP8 on Qwen3-30B-A3B, branch qwen3_30b_a3b_mxfp8.
 #
