@@ -965,6 +965,86 @@ def qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce() -> Trainer.Config:
     return config
 
 
+def qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead() -> Trainer.Config:
+    """Both winning levers stacked: bf16 gradient reduce-scatter AND MXFP8 on the
+    attention linears + lm_head.
+
+    THE TWO ATTACK DIFFERENT MECHANISMS, which is why they should compose rather
+    than overlap:
+      - mixed_precision_reduce="bfloat16" halves the bytes of the FSDP gradient
+        reduce-scatter. Pure communication; touches no GEMM.
+      - MXFP8 on attention + lm_head halves the bytes of the dense GEMM operands.
+        Pure compute precision; touches no collective.
+    Measured separately over the matched 144-step window (steps 13-156):
+        bf16 baseline                (1206/1336)  601.2 TF/GPU  26.72% MFU
+        + bf16 reduce                (1327/1337)  610.8 TF/GPU  27.15% MFU  +1.6%
+        + MXFP8 attn                 (1306/1338)  614.8 TF/GPU  N/A         +2.4%
+        + MXFP8 attn+lm_head         (1310)       620.9 TF/GPU  N/A         +3.3%
+    If they compose additively this lands near +5% tokens/sec, roughly
+    632 TF/GPU. Sub-additive is the likelier outcome -- both ultimately relieve
+    memory-bandwidth and NCCL pressure, so some of the win may be the same win
+    counted twice.
+
+    MFU IS NOT REPORTABLE for this config. Stacking gives up the one advantage
+    bf16reduce had on its own: any MXFP8 converter sets has_quantization, so
+    metrics.py prints "mfu: N/A" and only TFLOPs/tokens-per-sec are comparable.
+    If the deliverable is an MFU number, qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce
+    (27.15%) remains the config to quote; this one is for maximum throughput.
+
+    MEASURED: FASTEST AND LIGHTEST, BUT THE NUMERICS INTERACTION IS REAL.
+    Matched 144-step window (steps 13-156), TFLOPs/GPU and peak memory:
+        bf16 baseline        (1336)  601.22  161.77GiB (90.71%)
+        + bf16 reduce        (1337)  610.79  160.78GiB (90.15%)
+        + MXFP8 attn         (1338)  614.78  161.52GiB (90.56%)
+        + MXFP8 attn+lm_head (1310)  620.85  161.52GiB (90.56%)
+        STACKED              (1340)  631.84  159.88GiB (89.64%)
+        STACKED seed=42      (1341)  622.73  159.88GiB (89.64%)
+    Best on both metrics. Memory is the cleanest result -- 159.88GiB in BOTH
+    stacked runs, the lowest of anything tested, because bf16reduce shrinks the
+    gradient reduce-scatter buffers while MXFP8 shrinks the dense weights and
+    those are independent.
+
+    THROUGHPUT REPRODUCIBILITY IS WORSE HERE THAN ELSEWHERE, so quote the range
+    not the peak. The two stacked runs differ by 9.1 TFLOPs (631.84 vs 622.73,
+    1.5%) despite being the same config. For contrast the two fp32 baselines
+    agreed to 0.01% (601.17 vs 601.22). Against MXFP8 attn+lm_head alone
+    (620.85) the stack is therefore somewhere between +0.3% and +1.8% -- the
+    additive prediction was ~630.4, so run 1340 landed exactly additive and run
+    1341 clearly sub-additive. Do not claim a precise composition factor from
+    two runs.
+
+    NUMERICS: THE STACK IS MEASURABLY WORSE THAN EITHER COMPONENT ALONE. Seeded
+    against the fp32 control (seed=42, steps 25-150, n=126 unless noted):
+        bf16 reduce        mean delta +0.0208  mean|d| 0.0341  range -0.128..+0.081
+        MXFP8 attn         mean delta +0.0199  mean|d| 0.0363  range -0.140..+0.126
+        MXFP8 attn+lm_head mean delta +0.0016  mean|d| 0.0255  range -0.111..+0.072 (n=92)
+        STACKED            mean delta +0.0850  mean|d| 0.0908  range -0.059..+0.237
+    Each component on its own is indistinguishable from the control -- mean
+    deltas of +0.02, +0.02, +0.00 against a +-0.13 step-to-step wobble. Stacked,
+    the mean delta is 4x larger and the range turns asymmetric: the minimum
+    barely goes negative (-0.059) while the maximum reaches +0.237. That is the
+    interaction this docstring previously flagged as unmeasured, and it is not
+    nothing. It is still small in absolute terms over 126 steps, but it is the
+    only configuration in this sweep whose loss is consistently worse rather than
+    wobbling around zero.
+
+    RECOMMENDATION: use this for a throughput number. For real training prefer
+    qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce or
+    ..._mxfp8_attn_lmhead, both of which are verified clean, unless a longer run
+    shows the stack's +0.085 does not compound.
+    """
+    config = qwen3_30b_a3b_8k_bs10_selac_compile_mxfp8_attn_lmhead()
+    config.training.mixed_precision_reduce = "bfloat16"
+    return config
+
+
+def qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_seed42() -> Trainer.Config:
+    """The stacked config at seed=42, for the numerics comparison its parent needs."""
+    config = qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead()
+    config.debug.seed = 42
+    return config
+
+
 def qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_seed42() -> Trainer.Config:
     """bf16 gradient reduce-scatter at seed=42, for the numerics comparison.
 
