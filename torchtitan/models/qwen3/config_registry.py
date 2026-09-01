@@ -16,6 +16,7 @@ from torchtitan.components.optimizer import (
     ParamGroupConfig,
 )
 from torchtitan.components.quantization import (
+    Float8GroupedExpertsConverter,
     MXFP8GroupedExpertsConverter,
     MXFP8LinearConverter,
     NVFP4LinearConverter,
@@ -994,6 +995,190 @@ def qwen3_30b_a3b_8k_bs10_selac_compile_mxfp8_attn() -> Trainer.Config:
             MXFP8LinearConverter.Config(
                 model_compile_enabled=model_compile_enabled,
                 fqns=["attention"],
+            ),
+        ],
+    )
+    return config
+
+
+def qwen3_30b_a3b_8k_bs10_selac_compile_mxfp8_attn_lmhead() -> Trainer.Config:
+    """MXFP8 on the attention linears AND lm_head. Extends the current best.
+
+    qwen3_30b_a3b_8k_bs10_selac_compile_mxfp8_attn (job 1306) measured
+    615.76 TF/GPU and 131,087 tok/s/node over a matched 144-step window, +2.4%
+    over the bf16 best (job 1206, 601.17 TF/GPU, 26.72% MFU). This adds the one
+    remaining dense GEMM it left in bf16.
+
+    Enumerating every Linear.Config in this model gives four kinds:
+        model.layers.N.attention.qkv_linear.wqkv   48   2048 x   5,120  = 503M
+        model.layers.N.attention.wo                48   4096 x   2,048  = 403M
+        model.lm_head                               1   2048 x 151,936  = 311M
+        model.layers.N.moe.router.gate             48   2048 x     128  =  13M
+    fqns=["attention"] reaches the first two, i.e. 906M of the 1,217M of dense
+    Linear work. lm_head is the other 26% and is currently bf16. The router gate
+    stays bf16 deliberately: it is 1% of the dense work and quantizing it
+    perturbs expert assignment.
+
+    THIS IS DIRECTLY EVIDENCED, not a guess. RESULTS_GPTOSS20B.md measured the
+    same two steps on gpt_oss 20b:
+        gptoss20b_mxfp8         MXFP8 attn            814.21 TF/GPU  +1.66%
+        gptoss20b_mxfp8_lmhead  MXFP8 attn + lm_head  828.97 TF/GPU  +3.50%
+    "lm_head roughly doubles the gain over attention alone, consistent with it
+    being the largest dense GEMM." Loss was not degraded there (7.994 vs the
+    control's 8.037 -- slightly better).
+
+    Expect a SMALLER incremental gain here than gpt_oss's doubling, because the
+    proportions differ. On gpt_oss the lm_head (2880 x 201,088 = 579M) was ~48%
+    of dense Linear work; here it is 26%. So if the effect scales with share,
+    +2.4% should become roughly +3.0-3.5%, not +4.8%.
+
+    MEASURED (job 1310), matched 144-step window (steps 13-156) against the other
+    two, which is the only fair comparison since job 1206 was cancelled at 144:
+        bf16 baseline      (1206)  601.17 TF/GPU  127,983 tok/s/node    --
+        MXFP8 attn         (1306)  615.76 TF/GPU  131,087 tok/s/node  +2.4%
+        MXFP8 attn+lm_head (1310)  620.85 TF/GPU  132,171 tok/s/node  +3.3%
+    So +3.3% over bf16 and +0.83% incremental over attention alone -- close to
+    the +3.0-3.5% predicted from lm_head being 26% of dense Linear work here vs
+    ~48% on gpt_oss.
+
+    THE LOSS PENALTY IS THE OPEN QUESTION, AND IT IS NOT YET SETTLED. At matched
+    steps the ordering is monotonic and the gap WIDENS with training:
+        step  bf16      MXFP8 attn        MXFP8 attn+lm_head
+          50  7.44559   7.46557 (+0.020)  7.50940 (+0.064)
+         100  6.51796   6.54482 (+0.027)  6.58182 (+0.064)
+         150  5.99936   6.04280 (+0.043)  6.08667 (+0.087)
+    lm_head's penalty runs about 2x attention-only's throughout. That is the
+    shape of slow drift rather than noise -- but debug.seed defaults to None
+    (config/configs.py:349) and none of these runs set it, so the three jobs had
+    different init and data order and part of the gap may be run-to-run
+    variation. One run per config cannot separate the two. See the *_seed42
+    configs below, which hold the seed fixed so any residual gap is
+    attributable. Do not adopt this config for real training until that control
+    has been read.
+    """
+    config = qwen3_30b_a3b_8k_bs10_selac_compile()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.model_spec = model_registry(
+        "30B-A3B",
+        converters=[
+            MXFP8LinearConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=["attention", "lm_head"],
+            ),
+        ],
+    )
+    return config
+
+
+# ---------------------------------------------------------------------------
+# SEEDED CONTROLS for the MXFP8 loss question.
+#
+# debug.seed defaults to None (config/configs.py:349), so jobs 1206, 1306 and
+# 1310 each had different random init and data ordering. Their loss gaps
+# (+0.020 -> +0.043 for attn, +0.064 -> +0.087 for attn+lm_head, both widening
+# with training) are therefore CONFOUNDED: the ordering is consistent enough to
+# look like real quantization drift, but one unseeded run per config cannot
+# separate drift from run-to-run variation.
+#
+# These three hold seed=42 fixed and are otherwise identical to their parents,
+# so any residual loss gap between them is attributable to precision alone.
+# Throughput conclusions do not need them -- seed does not affect tokens/sec --
+# they exist purely to price the quality cost of the +2.4% and +3.3% wins.
+#
+# Run all three to the same step count and compare loss at matched steps.
+# ---------------------------------------------------------------------------
+
+
+def qwen3_30b_a3b_8k_bs10_selac_compile_seed42() -> Trainer.Config:
+    """bf16 control at seed=42. Reference for the two MXFP8 seeded configs."""
+    config = qwen3_30b_a3b_8k_bs10_selac_compile()
+    config.debug.seed = 42
+    return config
+
+
+def qwen3_30b_a3b_8k_bs10_selac_compile_mxfp8_attn_seed42() -> Trainer.Config:
+    """MXFP8 attention at seed=42. Pairs with qwen3_30b_a3b_8k_bs10_selac_compile_seed42."""
+    config = qwen3_30b_a3b_8k_bs10_selac_compile_mxfp8_attn()
+    config.debug.seed = 42
+    return config
+
+
+def qwen3_30b_a3b_8k_bs10_selac_compile_mxfp8_attn_lmhead_seed42() -> Trainer.Config:
+    """MXFP8 attention + lm_head at seed=42. The config whose loss cost is in question."""
+    config = qwen3_30b_a3b_8k_bs10_selac_compile_mxfp8_attn_lmhead()
+    config.debug.seed = 42
+    return config
+
+
+def qwen3_30b_a3b_8k_bs10_selac_compile_fp8_experts() -> Trainer.Config:
+    """Float8 rowwise on the EXPERT grouped GEMMs. The big untouched prize.
+
+    The experts are ~67% of this model's active matmul work (1.81B of 2.72B
+    active params -- MoE activates 8 of 128 experts), and nothing has ever
+    reached them below bf16. Attention-only MXFP8 bought +2.4% from the other
+    33%; this targets the rest.
+
+    Attention deliberately stays bf16 so this is single-variable against the
+    bf16 best (job 1206, 601.17 TF/GPU, 26.72% MFU). If it works, stacking it
+    with MXFP8 attn+lm_head is the obvious follow-up.
+
+    WHY FLOAT8 AND NOT MXFP8 for the experts. The MXFP8 route is closed by a
+    torchao/CuTeDSL TMA-alignment bug that no shape avoids -- job 1307 hit it
+    here, and RESULTS_KIMI3_MXFP8.md proved it across 12 shapes including
+    K=2048, across cutlass-dsl versions, and for the whole CuTeDSL quantize path
+    rather than just the grouped variant. Float8 is a DIFFERENT code path:
+    Float8GroupedExpertsConverter needs only 16-element alignment
+    (PAD_MULTIPLE = 16, "16 byte alignment / 1 byte per elem") and dispatches
+    through aten _scaled_grouped_mm, not the CuTeDSL quantize kernel.
+    2048 % 16 == 0 and 768 % 16 == 0, so the shapes qualify.
+
+    MEASURED: IT FAILS, AND THE ROUTE IS CLOSED. Job 1311 died at 0 steps with an
+    async "CUDA error: unspecified launch failure"; job 1312 reran it under
+    CUDA_LAUNCH_BLOCKING=1 and resolved it to
+        RuntimeError: cutlass cannot run, error 7
+    out of the aten _scaled_grouped_mm dispatch -- byte-identical to what
+    RESULTS_GPTOSS20B.md recorded for gpt_oss. Conversion itself succeeds and
+    logs "Converted GroupedExperts to use dynamic float8 rowwise quantization
+    with scaled grouped GEMMs", so every documented pre-check passes and the
+    failure is at execution.
+
+    THIS GENERALISES THE PRIOR FINDING. RESULTS_GPTOSS20B.md scoped it to
+    "gpt_oss's expert grouped-GEMM shapes" (K = 2880, not a power of two). The
+    hypothesis here was that Qwen3's K = 2048 and 768 -- both powers of two --
+    would land on a supported CUTLASS configuration. They do not:
+        gpt_oss 20b        expert K=2880  N=2880   error 7
+        Qwen3-30B-A3B      expert K=2048  N=768    error 7
+    Two independent shape families, power-of-two and not, fail identically. The
+    honest conclusion is that the Float8 grouped-GEMM path is broken on this
+    stack (torch 2.15.0.dev20260817 / torchao 0.18.0) irrespective of shape, not
+    that particular shapes are unsupported.
+
+    KEPT AS A MINIMAL REPRODUCER rather than deleted. Both low-precision routes
+    to the experts are now closed by two unrelated bugs -- MXFP8 by the CuTeDSL
+    TMA-alignment failure above, Float8 by this -- which leaves 67% of the
+    model's active matmul work at bf16. RESULTS_GPTOSS20B.md already names
+    reporting this to torchao as the reasonable next step; this config plus job
+    1312's log is the second data point for that report. Run it only to
+    reproduce the bug, never expecting throughput.
+
+    Note EP is NOT required, despite what gpt_oss_120b_fp8's docstring claims.
+    Float8GroupedExpertsConverter.__init__ checks only torchao and SM89+; the
+    RESULTS_GPTOSS20B "Correction to the 120b notes" section says the same. That
+    matters because EP costs 3.78 points on this model (job 1212).
+
+    MEASURED 2026-09-01: fails at 0 steps (jobs 1311, 1312).
+    """
+    config = qwen3_30b_a3b_8k_bs10_selac_compile()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.model_spec = model_registry(
+        "30B-A3B",
+        converters=[
+            Float8GroupedExpertsConverter.Config(
+                model_compile_enabled=model_compile_enabled,
             ),
         ],
     )
