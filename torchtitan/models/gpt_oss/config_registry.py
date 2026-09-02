@@ -1394,6 +1394,142 @@ def gptoss20b_mxfp8_experts() -> Trainer.Config:
     return config
 
 
+def gptoss20b_fp8_experts() -> Trainer.Config:
+    """Float8 on the expert grouped GEMMs, bf16 dense. Isolates the expert half.
+
+    MXFP8 cannot reach the experts on gpt_oss -- the CuTeDSL kernel needs
+    K % 128 == 0 and dim = hidden_dim = 2880 leaves remainder 64 (verified, job
+    1049). Float8GroupedExpertsConverter needs only 16-element alignment
+    (PAD_MULTIPLE = 16, "16 byte alignment / 1 byte per elem") and 2880 % 16 == 0,
+    so it reaches exactly the GEMMs MXFP8 could not.
+
+    This is the larger half of the model: the 4 active experts are 2.39B of the
+    4.19B active parameters, 57.1% of per-token GEMM work, against the dense
+    side's 42.9%.
+
+    Notably it does NOT require expert parallelism. Float8GroupedExpertsConverter
+    checks only for torchao and SM89+ (B200 is SM100); compile is a warning, not
+    a requirement. The gpt_oss_120b_fp8 docstring asserts "EP is required by the
+    grouped-experts converter anyway" -- that is not what the converter does, and
+    it matters here because ep=8 was an 18-point regression on the 20b (15.28%
+    against 33.60%, job 1041). Running Float8 experts at ep=1 avoids paying that.
+
+    Dense linears stay bf16 so this attributes the expert contribution on its
+    own. gptoss20b_mxfp8_fp8_full stacks it with the measured MXFP8 dense win.
+
+    Control to beat (all bf16, job 1024): 800.91 TFLOPs/GPU, 25,577 tok/s/GPU,
+    loss 8.037 at step 25. Read tokens/sec and TFLOPs, not MFU -- torchtitan
+    reports "mfu: N/A" once any GEMM is low-precision.
+
+    Watch the loss. Float8 on the experts perturbs the largest share of the
+    compute, and unlike MXFP8-on-attention there is no measurement yet saying it
+    is numerically benign on this model. Every healthy run in this campaign sits
+    near 8.0 at step 25.
+    """
+    config = gptoss20b_noreshard_membudget()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.model_spec = model_registry(
+        "20b",
+        converters=[
+            Float8GroupedExpertsConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+            ),
+        ],
+    )
+    return config
+
+
+def gptoss20b_fp8_experts_nocompile() -> Trainer.Config:
+    """Float8 experts WITHOUT compile. Diagnostic for "cutlass cannot run, error 7".
+
+    gptoss20b_fp8_experts converts cleanly ("Converted GroupedExperts to use
+    dynamic float8 rowwise") and then dies before step 1. With
+    CUDA_LAUNCH_BLOCKING=1 the async "CUDA error: unspecified launch failure"
+    resolves to:
+
+        RuntimeError: cutlass cannot run, error 7
+
+    raised from the aten _scaled_grouped_mm dispatch (torch/_ops.py:916) reached
+    through AOTAutograd's runtime wrapper -- i.e. CUTLASS itself refuses to
+    execute, inside the compiled region. Note this is a different class of
+    failure from MXFP8's: MXFP8 failed a clean Python-level shape assertion
+    ("K must be divisible by 128"), which is a documented constraint. A CUTLASS
+    execution failure is either an unsupported configuration the wrapper does not
+    pre-check, or a bug.
+
+    This config removes compile as a variable. If Float8 experts run eagerly, the
+    kernel handles these shapes and the problem is in the compiled path
+    (inductor's chosen layouts/strides for the grouped mm, or the AOTAutograd
+    wrapper). If it fails identically, the kernel cannot do gpt_oss's expert
+    shapes at all and the Float8 MoE path is closed here the way MXFP8's is.
+
+    SelectiveAC rather than MemoryBudgetAC because Trainer.Config requires
+    compile for MemoryBudgetAC, so the no-compile control cannot use it. That
+    makes this config slow -- gptoss20b_selac measured 20.38% uncompiled -- but
+    it is a correctness probe, not a performance measurement. Read only whether
+    it reaches step 1.
+    """
+    config = gptoss20b_selac()
+    model_compile_enabled = False
+    config.model_spec = model_registry(
+        "20b",
+        converters=[
+            Float8GroupedExpertsConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+            ),
+        ],
+    )
+    return config
+
+
+def gptoss20b_mxfp8_fp8_full() -> Trainer.Config:
+    """Both halves in low precision: MXFP8 dense + Float8 experts.
+
+    The point of the exercise -- every GEMM in the model quantized by whichever
+    format can reach it:
+
+        attention qkv/wo, lm_head   42.9% of active FLOPs   MXFP8 (K % 32)
+        expert grouped GEMMs        57.1% of active FLOPs   Float8 (K % 16)
+        router gate                 0.0006%                 bf16, deliberately
+
+    Two formats rather than one because neither covers everything: MXFP8's
+    grouped kernel is blocked by K % 128 on 2880, and while Float8Linear could
+    handle the dense side too, MXFP8 there is already measured at +3.50%
+    tokens/sec (828.97 TFLOPs/GPU, job 1048) and there is no reason to give that
+    up untested.
+
+    Expected to be roughly additive if the two halves compose -- MXFP8 dense
+    contributed +3.50% over the bf16 control, so a similar-magnitude expert
+    contribution would land in the high single digits. That is a guess, not a
+    projection: the expert GEMMs are grouped and token-routed rather than dense,
+    so their speedup from halving operand bytes need not track the dense case,
+    and the token dispatcher gets swapped to pad groups to 16 which changes the
+    dispatch path itself.
+
+    If gptoss20b_fp8_experts shows a loss regression, this config inherits it --
+    check that one first.
+    """
+    config = gptoss20b_noreshard_membudget()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.model_spec = model_registry(
+        "20b",
+        converters=[
+            MXFP8LinearConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=["attention", "lm_head"],
+            ),
+            Float8GroupedExpertsConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+            ),
+        ],
+    )
+    return config
+
+
 def gptoss20b_selac_compile_flex() -> Trainer.Config:
     """selac_compile with FlexAttention instead of varlen.
 
@@ -1544,4 +1680,133 @@ def gptoss20b_membudget() -> Trainer.Config:
     config = gptoss20b_selac()
     config.activation_checkpoint = MemoryBudgetAC.Config(memory_budget=0.5)
     config.compile = CompileConfig(enable=True, components=["model", "loss"])
+    return config
+
+
+def _gpt_oss_120b_mxfp8(fqns: list[str]) -> Trainer.Config:
+    """MXFP8 on the dense linears of the best 120b config. Experts stay bf16.
+
+    Base is gpt_oss_120b_ep8_compile_bs_increase (EP=8, compile+inductor,
+    SelectiveAC, bs=2), the best measured 120b config: 27.58% MFU / 620.54
+    TFLOPs/GPU / 13,701 tok/s/GPU sustained over steps 481-620 (job 208).
+
+    Why the experts are untouched. The MXFP8 grouped-GEMM path is architecturally
+    unusable on gpt_oss: the CuTeDSL quantize kernel asserts K % 128 == 0
+    (torchao/prototype/moe_training/kernels/mxfp8/cutedsl_quantize_2d_1x32.py:998)
+    and gpt_oss has dim = hidden_dim = 2880, remainder 64. Verified twice --
+    job 192 on the 120b, job 1049 on the 20b. pad_multiple pads per-expert token
+    groups (M), not K, so it cannot fix this.
+
+    torchao also ships a parallel flydsl_* MXFP8 kernel family with no such
+    assertion, which would have been the way out. It is unreachable: it needs a
+    runtime package named "flydsl" (_missing_flydsl_runtime_packages() reports
+    it missing), and the "flydsl" on PyPI is "FlyDSL - ROCm Domain Specific
+    Language", an AMD project, not the NVIDIA one torchao expects. Do not install
+    it on this box.
+
+    MXFP8Linear needs only K % 32 == 0 (1x32 block scaling), which every dense
+    GEMM here satisfies: qkv K=2880, wo K=4096, lm_head K=2880.
+
+    Expected upside, sized honestly. Of the 5.71B active params, attention is
+    ~955M (36 layers x (wqkv 5120x2880 + wo 4096x2880)) and the 4 active experts
+    are ~3.59B, so fqns=["attention"] reaches only ~21% of per-token GEMM work.
+    Adding lm_head (2880 x 201,088) reaches roughly another ~11%. Note this is
+    NOT the "42.9% dense" figure from the 20b docstring -- that counts embeddings
+    and lm_head, and embeddings are a lookup, not a GEMM. The 20b measured +3.50%
+    tok/s from the attention-only version; expect the same order here.
+
+    The router gate is deliberately never quantized: perturbing it changes expert
+    assignment, which is a correctness risk rather than a speed tradeoff.
+
+    READ TOKENS/SEC, NOT MFU. torchtitan computes MFU against the bf16 dense peak
+    (2.25e15, tools/utils.py), so any low-precision run reports an inflated or
+    N/A MFU that is not comparable to the bf16 line of results. The number to
+    beat is 13,701 tok/s/GPU (620.54 TFLOPs/GPU), job 208.
+
+    Memory goes UP, not down -- do not expect the datatype name to save memory.
+    These converters do *dynamic* quantization: master weights stay bf16 and are
+    re-quantized every step, so the fp8 data (1 B/elem) plus its e8m0 scales (one
+    per 32 elems) are allocated *in addition to* the bf16 tensors, which must
+    persist for the optimizer and for autograd. Nothing is replaced. Measured at
+    bs=1 (job 1304 vs 1305): model memory at init is byte-identical at 30.07GiB
+    and step 1 matches within 0.02GiB, but steady state is 146.52 vs 145.02GiB,
+    +1.50GiB -- entirely per-step transients. That is the expected size: the
+    ~955M attention params MXFP8 touches are ~0.96GiB of fp8 copies plus scales,
+    and quantized activations account for the rest. A memory win would require
+    persistently storing weights in fp8, which is a different technique.
+    """
+    config = gpt_oss_120b_ep8_compile_bs_increase()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.model_spec = model_registry(
+        "120b",
+        converters=[
+            MXFP8LinearConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=fqns,
+            ),
+        ],
+    )
+    return config
+
+
+def gpt_oss_120b_mxfp8_linears() -> Trainer.Config:
+    """Direct port of the proven gptoss20b_mxfp8 recipe (+3.50% tok/s) to 120b."""
+    return _gpt_oss_120b_mxfp8(["attention"])
+
+
+def gpt_oss_120b_mxfp8_linears_lmhead() -> Trainer.Config:
+    """gpt_oss_120b_mxfp8_linears plus lm_head, mirroring gptoss20b_mxfp8_lmhead.
+
+    lm_head is 2880 -> 201,088 applied to every token, so it is worth roughly as
+    much again as attention. It feeds the loss directly, which is why it is split
+    out from the attention-only config rather than bundled in.
+    """
+    return _gpt_oss_120b_mxfp8(["attention", "lm_head"])
+
+
+def gpt_oss_120b_mxfp8_linears_bs1() -> Trainer.Config:
+    """MXFP8 dense linears at bs=1, to test the memory-pressure hypothesis.
+
+    gpt_oss_120b_mxfp8_linears (bs=2) was a 22.5% throughput regression: 9,728
+    vs 12,551 tok/s/GPU mean over steps 200-340 (job 1300 vs job 208), with the
+    MXFP8 run oscillating 8.4k-10.6k while bf16 held a smooth 12.9-13.3k. It ran
+    at 95.85% memory and logged 7 expandable_segments mapping failures against
+    bf16's 3, with zero recompiles -- so the instability is allocator contention,
+    not Dynamo thrash.
+
+    The suspicion is that dynamic quantization needs scratch space the bs=2 config
+    does not have. Supporting evidence: the 20b recipe this was ported from
+    (+3.50% tok/s) ran on gptoss20b_noreshard_membudget at 131.39GiB peak, with
+    real headroom, whereas the 120b bs=2 best sits at 172.58GiB / 96.77%.
+
+    So this drops to bs=1, where gpt_oss_120b_ep8_compile measured 144.96GiB
+    (81.28%) -- roughly 33GiB of headroom. If MXFP8 turns positive here while
+    negative at bs=2, memory pressure is the cause and MXFP8 is only usable on
+    120b in configurations with slack. If it is still negative, the quantize
+    overhead simply exceeds the GEMM saving on this model's ~21% dense GEMM share,
+    and MXFP8 is not worth pursuing on the 120b at all.
+
+    Must be compared against gpt_oss_120b_ep8_compile run to the SAME step count.
+    The existing bs=1 datapoint (job 193) stopped at step 60 -- 13.52% MFU at step
+    50, still climbing to 14.34% at step 60 -- which is far too early to compare
+    against a 400-step run on this model.
+
+    Read tokens/sec, not MFU: torchtitan reports mfu N/A once any GEMM is
+    low-precision.
+    """
+    config = gpt_oss_120b_ep8_compile()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.model_spec = model_registry(
+        "120b",
+        converters=[
+            MXFP8LinearConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=["attention"],
+            ),
+        ],
+    )
     return config
