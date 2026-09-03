@@ -82,10 +82,20 @@ class TrainingConfig:
     and no other parallelism is enabled, i.e. under DDP or single-device training.
     """
 
-    mixed_precision_reduce: Literal["float32"] = "float32"
+    mixed_precision_reduce: Literal["float32", "bfloat16"] = "float32"
     """
     torch dtype to use for reductions when applying mixed precision via FSDP.
     This feature only takes effect when data_parallel_shard_degree > 1
+
+    "float32" is the default and the only value upstream allows. "bfloat16" was
+    added here as an EXPERIMENT: on Qwen3.5-122B the fp32 gradient
+    reduce-scatter is ~25% of the step (1,230 ms of a 4,838 ms step, 65% of all
+    NCCL time), so halving those bytes is the largest remaining lever.
+
+    This CHANGES TRAINING NUMERICS. Gradients reduce-scattered across 8 shards
+    in bf16 accumulate rounding error that fp32 reduction is specifically there
+    to avoid. Do not use it for a real run without comparing loss curves against
+    a float32 control at the same --debug.seed.
     """
 
     gc_freq: int = 50
