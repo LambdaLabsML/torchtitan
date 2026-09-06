@@ -8,25 +8,34 @@ sbatch gb300/gpt_oss_20b_64xgb300.slurm          # 50 steps
 STEPS=100 sbatch gb300/gpt_oss_20b_64xgb300.slurm
 ```
 
-## Result (job 38, 50 steps)
+## Result (job 39, 50 steps, stock defaults)
 
-Steady state = steps 3-49; steps 1-2 are warmup and step 50 includes teardown.
+Steady state = steps >=20.
 
 | | |
 | --- | --- |
-| per-GPU | **278.2 TFLOP/s** (min 270.4, max 284.3) |
-| per-GPU | 8,885 tokens/s |
-| **64 GPUs** | **17.81 PFLOP/s**, 568,635 tokens/s |
-| MFU | 11.1% |
+| per-GPU | **287.8 TFLOP/s** |
+| per-GPU | ~9,190 tokens/s |
+| **64 GPUs** | **18.42 PFLOP/s**, ~588,000 tokens/s |
+| MFU | 11.5% |
 | memory | 18.46 GiB/GPU (6.68%) |
-| loss | 12.74 -> 7.05 |
-| wall clock | ~50 s of stepping, ~0.92 s/step |
+| loss | 12.71 -> 7.10 |
+
+An earlier run (job 38) reported 277.4 TFLOP/s because it used
+`--metrics.log_freq 1` and `OMP_NUM_THREADS=8`. A third run isolated it:
+`log_freq=1` costs ~3.7% through per-step synchronisation, and OMP_NUM_THREADS is
+noise. Job 39 is the number to quote. See
+[DEBUG_FOR_BASELINE_64xGB300.md](DEBUG_FOR_BASELINE_64xGB300.md) §7.
+
+Note the LR schedule is auto-clamped at 50 steps (warmup 2000 -> 50, decay -> 0),
+so the whole run is warmup and **the loss curve is not on the real schedule**.
+Fine for throughput; do not read the loss descent as meaningful.
 
 `tflops` in the torchtitan log is **per GPU**: 278.2 / 0.1112 MFU = 2502 TFLOP/s,
 which is GB300 dense bf16 peak. Multiply by 64 for the cluster figure.
 
 Single node (4 GPUs) on the same config reaches 333.4 TFLOP/s/GPU (13.3% MFU), so
-scaling 4 -> 64 GPUs holds **83.5%** of per-GPU throughput.
+scaling 4 -> 64 GPUs holds **86.3%** of per-GPU throughput.
 
 Memory at 6.68% and MFU at 11% both say the same thing: this config is small for
 the hardware. `local_batch_size=1` at `seq_len=8192` is the stock setting and was

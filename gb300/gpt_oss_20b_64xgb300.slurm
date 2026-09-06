@@ -18,7 +18,7 @@ set -euo pipefail
 REPO=${REPO:-/mnt/dgxc/torchtitan}
 VENV=${VENV:-/mnt/dgxc/venvs/torchtitan}
 STEPS=${STEPS:-50}
-LOG_FREQ=${LOG_FREQ:-1}
+LOG_FREQ=${LOG_FREQ:-10}   # stock default; log_freq=1 costs ~3.7% (see DEBUG doc)
 NPROC=${NPROC:-4}
 
 mkdir -p /mnt/dgxc/runs
@@ -43,7 +43,10 @@ export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 
 export PYTORCH_ALLOC_CONF="expandable_segments:True"
 export PYTHONFAULTHANDLER=1
-export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
+# OMP_NUM_THREADS is deliberately NOT set: torchrun defaults it to 1 (with a
+# warning) and that is the stock behaviour a baseline should measure. Export it
+# before sbatch if you want to explore it.
+if [ -n "${OMP_NUM_THREADS:-}" ]; then export OMP_NUM_THREADS; fi
 
 # --- Config deviations from the stock gpt_oss_20b ----------------------------
 # --training.disable_cuda_graphs is REQUIRED, not a tuning choice. The stock
