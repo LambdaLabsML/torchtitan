@@ -21,6 +21,27 @@ Peak is GB300 dense bf16 ~2503 TFLOP/s/GPU, which is what MFU is against.
 Best: **942.3 TFLOP/s/GPU, 60.30 PFLOP/s across 64 GPUs, 37.7% MFU** — 3.35x the
 out-of-the-box baseline.
 
+### Chart — per-GPU TFLOP/s (250 steps, steady state)
+
+Bar length is proportional to throughput; `|` marks the 281.4 baseline.
+
+```
+                                                 baseline
+                                                    |
+noac_compile      bs6  77% ############################################################ 942.3
+noac_compile_nores bs4 66% ########################################################## 917.0
+noac              bs4  87% ##################################### 569.2
+noreshard         bs1  20% #####################| 322.2
+compile_loss_only bs1   7% ##################| 282.1
+BASELINE          bs1   7% ##################| 281.4
+noac_compile_maxbs bs8 99% ##########| 160.6
+                           0     200    400    600    800   1000
+```
+
+The two bars that matter are the top pair and the bottom one. Everything at or
+below `noreshard` is still leaving 80% of the GPU idle; the bottom bar is what
+happens when you take one step too many.
+
 ### Blocked
 
 | config | why |
