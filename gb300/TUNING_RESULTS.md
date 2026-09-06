@@ -23,24 +23,27 @@ out-of-the-box baseline.
 
 ### Chart — per-GPU TFLOP/s (250 steps, steady state)
 
-Bar length is proportional to throughput; `|` marks the 281.4 baseline.
+`R1`/`R2` = round. `|` marks the 281.4 baseline.
 
 ```
-                                                 baseline
-                                                    |
-noac_compile      bs6  77% ############################################################ 942.3
-noac_compile_nores bs4 66% ########################################################## 917.0
-noac              bs4  87% ##################################### 569.2
-noreshard         bs1  20% #####################| 322.2
-compile_loss_only bs1   7% ##################| 282.1
-BASELINE          bs1   7% ##################| 281.4
-noac_compile_maxbs bs8 99% ##########| 160.6
-                           0     200    400    600    800   1000
+                                                    baseline
+                                                       |
+R2 noac_compile_bs7        bs7  89% ############################################### 963.5
+R1 noac_compile            bs6  77% ############################################## 942.3
+R1 noac_compile_noreshard  bs4  66% ############################################ 917.0
+R2 noac_compile_noreshard  bs6  90% ########################################### 880.7
+R2 noac_compile_hsdp       bs4  81% ########################################## 864.3
+R2 sac_compile             bs8  27% ######################################### 859.6
+R1 noac                    bs4  87% ############################ 569.2
+R1 noreshard               bs1  20% ###############| 322.2
+R1 compile_loss_only       bs1   7% #############| 282.1
+R1 BASELINE                bs1   7% #############| 281.4
+R1 noac_compile_maxbs      bs8  99% #######| 160.6
+                                    0    200   400   600   800  1000
 ```
 
-The two bars that matter are the top pair and the bottom one. Everything at or
-below `noreshard` is still leaving 80% of the GPU idle; the bottom bar is what
-happens when you take one step too many.
+Note the memory column next to the bars: `sac_compile` reaches within 11% of the
+best result using **a quarter of the memory** the leaders need.
 
 ### Blocked
 
@@ -70,19 +73,47 @@ The two halves are not separable, which is why there is no `noac`-at-bs=1 row.
 memory — within 3% of the best result while using 11 points less memory. It buys
 back most of two steps of batch. Nothing has yet tried it at bs=6.
 
-## Round 2 — configs added, not yet run
+## Round 2 — measured (job 49, 250 steps)
 
-Chosen from the above.
+| config | bs | AC | reshard | shard | TFLOP/s/GPU | cluster | MFU | mem | vs base |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **`..._noac_compile_bs7`** | 7 | none | default | 64 | **963.5** | **61.66 PF** | **38.5%** | 88.9% | **+242%** |
+| `..._noac_compile_noreshard_bs6` | 6 | none | never | 64 | 880.7 | 56.36 PF | 35.2% | 90.2% | +213% |
+| `..._noac_compile_hsdp` | 4 | none | default | 4x16 | 864.3 | 55.32 PF | 34.6% | 80.8% | +207% |
+| `..._sac_compile` | 8 | Selective | default | 64 | 859.6 | 55.01 PF | 34.4% | **27.2%** | +206% |
 
-| config | hypothesis |
-| --- | --- |
-| `..._noac_compile_bs7` | Bisects the cliff (~88% mem). 942 at bs=6, 161 at bs=8 — nothing pins where the edge is, or whether 942 is the peak. |
-| `..._noac_compile_noreshard_bs6` | never-reshard reached 917 at bs=4/66.3%. That spare memory is the point; it has never been tried at bs=6. Highest upside of the four. |
-| `..._sac_compile` | Round 1 measured only the ends of the AC spectrum. Per-op SelectiveAC stores strictly less than no-AC, so it should buy batch without full-AC's recompute bill. bs=8 is an **estimate**, not measured. |
-| `..._noac_compile_hsdp` | Shard 4 within-node, replicate 16 across. Every config so far all-gathers across the whole rack; 20B is small for 64-way sharding, so the collective is likely latency-bound — the regime where narrowing the shard group wins. never-reshard helping is evidence communication matters. |
+All four ran; none OOMed, so both estimated batch sizes were viable.
 
-`MemoryBudgetAC` was considered and dropped: it overlaps SelectiveAC's space, and
-the never-reshard result was stronger evidence for where to spend a slot.
+**New best: 963.5 TFLOP/s/GPU, 61.66 PFLOP/s, 38.5% MFU** — 3.42x baseline.
+
+### What round 2 changed
+
+**The peak is bs=7, and it is a narrow ridge.** 942.3 at 77% -> 963.5 at 88.9%
+-> 160.6 at 98.7%. Only +2.3% was left above bs=6, and the drop beyond it is a
+factor of six. The cliff sits between 88.9% and 98.7%; bs=7 is close enough to it
+that a longer run or a different dataset shuffle could plausibly tip over. bs=6 at
+77% is the setting to hand someone who needs it to finish.
+
+**never-reshard stops helping under memory pressure.** It gave 917.0 at bs=4/66%
+in round 1; at bs=6/90% it gives 880.7 — worse than its own smaller-batch version
+and worse than plain FSDP at bs=7. Its benefit is real only while there is slack;
+near the ceiling, holding parameters gathered competes with the activations that
+are actually earning throughput.
+
+**HSDP did not help.** 864.3 against 963.5 for full 64-way sharding at a
+comparable batch. The hypothesis was that 20B is small enough for the all-gather
+to be latency-bound, so narrowing the shard group to one node would win. It does
+not, and the reason is the hardware: all 64 GPUs are one NVLink fabric
+(`cliqueSize 64`), so a 64-way all-gather is not paying a cross-node penalty
+worth avoiding. Useful negative result — on an IB-connected cluster this would
+likely go the other way.
+
+**SelectiveAC is the efficiency winner and the biggest remaining lever.** 859.6 —
+within 11% of the best — using **27.2% of memory**, where every other config near
+that throughput needs 80-90%. Per-op SAC recomputes so cheaply that bs=8 barely
+touches the GPU. Nothing has tried it at a batch that actually fills memory: on
+these numbers there is room for roughly 3x the batch before it reaches the ~89%
+where bs=7 peaks. That is the obvious next experiment.
 
 ## Supporting jobs
 
@@ -96,7 +127,10 @@ the never-reshard result was stronger evidence for where to spend a slot.
 | 43 | mxfp8 + compile retry | mxfp8 -> SM100 kernels absent; compile fails again |
 | 44 | compile isolation | `noac_compile` and `compile_loss_only` both work |
 | 45 | no-AC+compile batch probe | bs=6 77%, bs=8 98.8%, bs=10 OOM |
-| 46 | **the sweep** | 7 configs x 250 steps |
+| 46 | round 1 sweep | 7 configs x 250 steps |
+| 47 | 120B validation | ran clean, 6 steps |
+| 48 | **120B baseline** | 157.6 TFLOP/s, 250 steps - see README_120B.md |
+| 49 | round 2 sweep | 4 configs x 250 steps, all exit 0 |
 
 Baseline is quoted as 281.4 (job 46, 250 steps) rather than 287.8 (job 39, 50
 steps) so every row in the round-1 table is measured identically.
