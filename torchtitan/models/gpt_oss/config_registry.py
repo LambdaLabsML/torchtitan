@@ -397,3 +397,36 @@ def gpt_oss_20b_gb300_noac_compile_hsdp() -> Trainer.Config:
     config.parallelism.data_parallel_replicate_degree = 16
     config.training.local_batch_size = 4
     return config
+
+
+# --- SelectiveAC at batches that actually fill the GPU ----------------------
+#
+# Round 2 ran SelectiveAC at bs=8 and it reached 859.6 TFLOP/s in 27.2% of
+# memory, while every other config near that throughput needed 80-90%. Per-op
+# SAC costs ~7.7 GiB per batch unit against no-AC's ~33, so bs=8 was nowhere
+# near its ceiling. Measured at 8 steps:
+#     bs=16  48.4%   bs=24  70.8%   bs=28  82.8%   bs=32  93.9%
+# Nothing OOMed up to 32. These three bracket the 88.9% where no-AC peaked.
+
+
+def gpt_oss_20b_gb300_sac_compile_bs24() -> Trainer.Config:
+    """SelectiveAC at 70.8% memory - the conservative point."""
+    config = gpt_oss_20b_gb300_sac_compile()
+    config.training.local_batch_size = 24
+    return config
+
+
+def gpt_oss_20b_gb300_sac_compile_bs28() -> Trainer.Config:
+    """SelectiveAC at 82.8% memory - just under where no-AC peaked."""
+    config = gpt_oss_20b_gb300_sac_compile()
+    config.training.local_batch_size = 28
+    return config
+
+
+def gpt_oss_20b_gb300_sac_compile_bs32() -> Trainer.Config:
+    """SelectiveAC at 93.9% memory - past the no-AC peak, short of the 98.7%
+    that cratered. Whether this is the best config or another cliff casualty is
+    exactly the open question."""
+    config = gpt_oss_20b_gb300_sac_compile()
+    config.training.local_batch_size = 32
+    return config

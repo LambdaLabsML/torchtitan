@@ -115,6 +115,79 @@ touches the GPU. Nothing has tried it at a batch that actually fills memory: on
 these numbers there is room for roughly 3x the batch before it reaches the ~89%
 where bs=7 peaks. That is the obvious next experiment.
 
+## Round 3 — SelectiveAC at large batch: hit a DATA limit, not a compute one
+
+Round 2 left SelectiveAC as the open lever: 859.6 TFLOP/s in 27.2% of memory,
+where every other config near that throughput needed 80-90%. A probe (job 50, 8
+steps) confirmed the headroom — per-op SAC costs **~7.7 GiB per batch unit against
+no-AC's ~33**, about 4.4x cheaper, and nothing OOMed up to bs=32:
+
+| bs | 16 | 24 | 28 | 32 |
+| --- | --- | --- | --- | --- |
+| memory | 48.4% | 70.8% | 82.8% | 93.9% |
+
+All three 250-step runs (job 51) then **failed**, and the reason is worth reading
+carefully because it is not about SelectiveAC at all.
+
+| config | outcome | peak seen | mem |
+| --- | --- | --- | --- |
+| `..._sac_compile_bs24` | died at step ~50 | 922.3 TF/GPU (59.03 PF) | 70.8% |
+| `..._sac_compile_bs28` | died before step 1 | — | — |
+| `..._sac_compile_bs32` | died at step ~100 | 927.7 TF/GPU (59.37 PF) | 93.9% |
+
+**Those peaks are not results.** They are the throughput reached before the run
+fell over, on runs whose data pipeline was already degrading. They are recorded
+because they are suggestive, not because they are measurements.
+
+### Cause
+
+```
+Watchdog caught collective operation timeout: WorkNCCL(SeqNum=8697,
+OpType=ALLREDUCE, NumelIn=1, NumelOut=1, Timeout(ms)=100000)
+ran for 100023 milliseconds before timing out.
+```
+
+A **one-element** allreduce timed out after 100 s — the per-step sync. One rank
+never arrived. It is not memory (bs=24 died at 70.8% while running at 749-922
+TFLOP/s) and not SelectiveAC. It is the dataloader:
+
+| run | Retry | ConnectionError | HTTP 429 |
+| --- | --- | --- | --- |
+| baseline (bs1) | 0 | 0 | 0 |
+| `noac_compile` (bs6) | 0 | 0 | 1 |
+| `noac_compile_bs7` (bs7) | 0 | 1 | 0 |
+| `sac_compile` (bs8) | 0 | 0 | 20 |
+| `sac_compile_bs24` | **142** | **87** | 3 |
+| `sac_compile_bs32` | **99** | **32** | 3 |
+
+C4 is **streamed from HuggingFace at train time** (`streaming=True` in
+`hf_datasets/text_datasets.py`), unauthenticated. Token demand scales with batch:
+the bs=1 baseline pulls ~0.5M tokens/step across 64 ranks; bs=24 pulls ~12.6M.
+Somewhere above bs=8 that exceeds what the Hub will serve, ranks starve waiting
+for data, one misses the 100 s window, and the NCCL watchdog aborts the job.
+
+### What this means for the rest of the table
+
+**Everything at bs<=8 stands.** Those runs show 0-1 retries and no connection
+errors — 963.5 for `noac_compile_bs7` is a clean measurement. The throttling only
+appears above bs=8, and only the round-3 runs were affected.
+
+**Above bs=8 this cluster cannot currently benchmark at all**, regardless of
+config. That is an infrastructure ceiling, not a property of any tuning.
+
+### To get past it
+
+1. **Stage C4 locally.** 250 steps at bs=24 needs ~3.1B tokens, roughly 20 of
+   C4's 1024 shards (~7 GB gzipped) onto `/mnt/dgxc`, which has 3.3 TB free.
+   Needs a local dataset entry in `hf_datasets/text_datasets.py` alongside `c4`
+   and `c4_test` — a code change, not a config one.
+2. **Set `HF_TOKEN`.** The logs carry the Hub's own warning about unauthenticated
+   rate limits. Cheapest fix, but it makes the benchmark depend on a network path
+   that is outside the cluster and not reproducible run to run.
+
+Option 1 is the right one for a benchmark: a throughput number should not depend
+on someone else's rate limiter.
+
 ## Supporting jobs
 
 | job | purpose | outcome |
@@ -131,6 +204,8 @@ where bs=7 peaks. That is the obvious next experiment.
 | 47 | 120B validation | ran clean, 6 steps |
 | 48 | **120B baseline** | 157.6 TFLOP/s, 250 steps - see README_120B.md |
 | 49 | round 2 sweep | 4 configs x 250 steps, all exit 0 |
+| 50 | SAC batch probe | bs 16/24/28/32 all fit; 93.9% at bs=32 |
+| 51 | SAC 250-step sweep | all 3 killed by NCCL watchdog - HF rate limiting, see round 3 |
 
 Baseline is quoted as 281.4 (job 46, 250 steps) rather than 287.8 (job 39, 50
 steps) so every row in the round-1 table is measured identically.
