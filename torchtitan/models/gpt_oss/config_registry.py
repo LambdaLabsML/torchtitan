@@ -15,7 +15,7 @@ from torchtitan.components.quantization import (
 )
 from torchtitan.components.validate import Validator
 from torchtitan.config import ParallelismConfig, TrainingConfig
-from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.trainer import Trainer
@@ -307,4 +307,93 @@ def gpt_oss_20b_gb300_compile_loss_only() -> Trainer.Config:
     config = gpt_oss_20b()
     config.compile.enable = True
     config.compile.components = ["loss"]
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Round 2. Chosen from what round 1 measured (250 steps, 64x GB300):
+#
+#   baseline                    281.4 TFLOP/s   6.7% mem
+#   noreshard                   322.2           20.4%
+#   compile_loss_only           282.1           6.7%     (no effect)
+#   noac            bs=4        569.2           86.5%
+#   noac_compile    bs=6        942.3           77.0%    <- best
+#   noac_compile_maxbs bs=8     ~205            98.7%    <- fell off a cliff
+#
+# Two things drive everything here. Memory utilisation is the lever - the
+# baseline recomputes activations it had 93% of the GPU spare to keep. And there
+# is a sharp cliff near the top: bs=8 at 98.7% is 4.5x SLOWER than bs=6 at 77%,
+# because the allocator thrashes rather than because the work changed.
+#
+# So the interesting question is no longer "how much memory can we use" but
+# "how close to the cliff can we get, and can we get more useful work into the
+# memory we can safely use". These four attack that from different sides.
+# ---------------------------------------------------------------------------
+
+
+def gpt_oss_20b_gb300_noac_compile_bs7() -> Trainer.Config:
+    """Bisect the cliff: bs=6 gives 942 TFLOP/s at 77%, bs=8 gives ~205 at 98.7%.
+
+    bs=7 should land near 88%. This says whether 942 is the peak or whether
+    there is another step of batch to take before the allocator gives out - and
+    where the edge actually is, which nothing else in the sweep pins down.
+    """
+    config = gpt_oss_20b_gb300_noac_compile()
+    config.training.local_batch_size = 7
+    return config
+
+
+def gpt_oss_20b_gb300_sac_compile() -> Trainer.Config:
+    """Selective (per-op) AC instead of none, + compile, at a larger batch.
+
+    No-AC and full-AC are the two ends of a spectrum and round 1 only measured
+    the ends. SelectiveAC saves the ops that are expensive to recompute and
+    recomputes every second matmul, so it should sit well below no-AC's memory at
+    the same batch - buying batch back without paying full-AC's recompute bill.
+
+    bs=8 is an estimate, not a measurement: no-AC fit bs=8 at 98.8%, and SAC
+    stores strictly less, so this should land with headroom. If it OOMs, drop to
+    7 - do not conclude SAC is unviable.
+    """
+    config = gpt_oss_20b_gb300_noac_compile()
+    config.activation_checkpoint = SelectiveAC.Config()
+    config.training.local_batch_size = 8
+    return config
+
+
+def gpt_oss_20b_gb300_noac_compile_noreshard_bs6() -> Trainer.Config:
+    """The two strongest levers together, at the batch that worked best.
+
+    Round 1's compounded config held never-reshard at bs=4 and reached 917.0
+    TFLOP/s in 66.3% of memory - within 3% of the best result (942.3 at bs=6)
+    while using 11 points less memory. That spare memory is the whole point:
+    never-reshard was carrying bs=4 to nearly the same throughput as bs=6
+    without it, and nothing has yet tried it at bs=6.
+
+    Should land near 85-90% memory, so it is deliberately below the bs=7 probe -
+    if bs7 finds the cliff lower than expected, this is the config that has to
+    move.
+    """
+    config = gpt_oss_20b_gb300_noac_compile()
+    config.parallelism.fsdp_reshard_after_forward = "never"
+    config.training.local_batch_size = 6
+    return config
+
+
+def gpt_oss_20b_gb300_noac_compile_hsdp() -> Trainer.Config:
+    """HSDP: shard within a node (4), replicate across nodes (16).
+
+    Every config so far shards all 64 ranks, so each all-gather crosses the whole
+    rack. This confines the parameter all-gather to the 4 GPUs inside a node and
+    reduces the cross-node traffic to gradient all-reduce.
+
+    Worth testing precisely because 20B is small for 64-way sharding: the shards
+    are tiny and the collective is latency-bound, which is the regime where
+    narrowing the shard group usually wins. Costs memory (each node holds a full
+    replica's shard), so the batch backs off to 4.
+    """
+    config = gpt_oss_20b_gb300_noac_compile()
+    config.parallelism.data_parallel_shard_degree = 4
+    config.parallelism.data_parallel_replicate_degree = 16
+    config.training.local_batch_size = 4
     return config
