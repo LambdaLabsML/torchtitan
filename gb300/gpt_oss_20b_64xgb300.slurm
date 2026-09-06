@@ -18,6 +18,7 @@ set -euo pipefail
 REPO=${REPO:-/mnt/dgxc/torchtitan}
 VENV=${VENV:-/mnt/dgxc/venvs/torchtitan}
 STEPS=${STEPS:-50}
+CONFIG=${CONFIG:-gpt_oss_20b}       # any config in gpt_oss/config_registry.py
 LOG_FREQ=${LOG_FREQ:-10}   # stock default; log_freq=1 costs ~3.7% (see DEBUG doc)
 NPROC=${NPROC:-4}
 
@@ -67,7 +68,7 @@ srun --kill-on-bad-exit=1 torchrun \
   --role rank --tee 3 --local-ranks-filter 0 \
   -m torchtitan.train \
     --module gpt_oss \
-    --config gpt_oss_20b \
+    --config "$CONFIG" \
     --training.steps "$STEPS" \
     --training.disable_cuda_graphs \
     --metrics.log_freq "$LOG_FREQ" \

@@ -31,7 +31,7 @@ Note the LR schedule is auto-clamped at 50 steps (warmup 2000 -> 50, decay -> 0)
 so the whole run is warmup and **the loss curve is not on the real schedule**.
 Fine for throughput; do not read the loss descent as meaningful.
 
-`tflops` in the torchtitan log is **per GPU**: 278.2 / 0.1112 MFU = 2502 TFLOP/s,
+`tflops` in the torchtitan log is **per GPU**: 287.8 / 0.1150 MFU = 2503 TFLOP/s,
 which is GB300 dense bf16 peak. Multiply by 64 for the cluster figure.
 
 Single node (4 GPUs) on the same config reaches 333.4 TFLOP/s/GPU (13.3% MFU), so
