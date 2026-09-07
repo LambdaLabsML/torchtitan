@@ -399,6 +399,30 @@ def gpt_oss_20b_gb300_noac_compile_hsdp() -> Trainer.Config:
     return config
 
 
+
+# ---------------------------------------------------------------------------
+# Shared helpers for the large-batch runs
+# ---------------------------------------------------------------------------
+
+
+def _stage_local_data(config: Trainer.Config) -> Trainer.Config:
+    """Point the dataloader at locally staged C4, and loosen the watchdog.
+
+    Hub-streamed C4 cannot feed 64 GB300s above local_batch_size ~8. Past that
+    the Hub throttles (142 retries / 87 connection errors at bs=24), ranks
+    starve, one misses the 100 s collective window, and the NCCL watchdog aborts
+    - which additionally strands nodes in DRAIN with wedged GPUs needing a driver
+    reload. See TUNING_RESULTS.md round 3.
+
+    train_timeout_seconds is raised from 100 to 600 as a safety net, not a fix:
+    with local shards there should be no stall to absorb, but a watchdog abort at
+    this scale damages the cluster, so it is worth not tripping on a hiccup.
+    """
+    config.dataloader = HuggingFaceTextDataLoader.Config(dataset="c4_local")
+    config.comm.train_timeout_seconds = 600
+    return config
+
+
 # --- SelectiveAC at batches that actually fill the GPU ----------------------
 #
 # Round 2 ran SelectiveAC at bs=8 and it reached 859.6 TFLOP/s in 27.2% of
@@ -413,14 +437,14 @@ def gpt_oss_20b_gb300_sac_compile_bs24() -> Trainer.Config:
     """SelectiveAC at 70.8% memory - the conservative point."""
     config = gpt_oss_20b_gb300_sac_compile()
     config.training.local_batch_size = 24
-    return config
+    return _stage_local_data(config)
 
 
 def gpt_oss_20b_gb300_sac_compile_bs28() -> Trainer.Config:
     """SelectiveAC at 82.8% memory - just under where no-AC peaked."""
     config = gpt_oss_20b_gb300_sac_compile()
     config.training.local_batch_size = 28
-    return config
+    return _stage_local_data(config)
 
 
 def gpt_oss_20b_gb300_sac_compile_bs32() -> Trainer.Config:
@@ -429,4 +453,138 @@ def gpt_oss_20b_gb300_sac_compile_bs32() -> Trainer.Config:
     exactly the open question."""
     config = gpt_oss_20b_gb300_sac_compile()
     config.training.local_batch_size = 32
+    return _stage_local_data(config)
+
+
+def gpt_oss_20b_gb300_noac_compile_bs7_local() -> Trainer.Config:
+    """Control for the dataset change: bs=7 measured 963.5 TFLOP/s on Hub-streamed
+    C4 with essentially no throttling (0 retries, 1 connection error).
+
+    Re-running it on local shards should reproduce that. If it does, local vs
+    streamed is neutral at this batch and the large-batch SAC numbers are directly
+    comparable to the rest of the table. If it does not, every cross-dataset
+    comparison in this sweep needs re-examining - which is why this runs first.
+    """
+    return _stage_local_data(gpt_oss_20b_gb300_noac_compile_bs7())
+
+
+# ---------------------------------------------------------------------------
+# GB300 tuning sweep, 120B. Reasoned from the 20B results rather than repeating
+# them, because 120B sits in a different regime.
+#
+# What the 20B sweep established:
+#   - memory utilisation is the lever; the peak was ~89% and above ~94% it falls
+#     off a cliff (bs=8/98.7% ran 43% SLOWER than the baseline)
+#   - compile alone is worth +0.2%; its value is that it frees activation memory
+#     and so buys batch
+#   - never-reshard helps while memory is slack (+14.5% at bs=1) and HURTS near
+#     the ceiling (880.7 at 90% vs 917.0 at 66%)
+#   - per-op SelectiveAC costs ~7.7 GiB/batch-unit vs no-AC's ~33 - 4.4x cheaper
+#   - HSDP does not help: all 64 GPUs are one NVLink fabric, so 64-way sharding
+#     pays no cross-node penalty. Not repeated here.
+#
+# Why 120B differs:
+#   - the baseline already sits at 68.33 GiB (24.7%) against 20B's 18.46 (6.7%),
+#     so there is far less headroom to spend
+#   - 36 layers against 24 means ~1.5x the activation cost per batch unit, and
+#     activations are the part that does NOT shard
+#   - per-GPU throughput is 56% of 20B's at the same batch, i.e. 120B is more
+#     COMMUNICATION-bound: more parameters to all-gather per token of useful work
+#
+# Two predictions follow, and the configs below are built to test them:
+#   1. no-AC will barely raise the batch here (maybe to 2-3) because 120B's
+#      activations are already large - so the 20B winner may not transfer.
+#   2. SelectiveAC should matter MORE than on 20B, and never-reshard should help
+#      MORE, because the binding constraint is communication rather than compute.
+# ---------------------------------------------------------------------------
+
+
+def gpt_oss_120b_gb300_noreshard() -> Trainer.Config:
+    """never-reshard at the stock batch. Cheapest possible test of prediction 2.
+
+    On 20B this was +14.5% at bs=1 with memory slack to spare. 120B is more
+    communication-bound, and this is the one knob that directly removes a
+    collective (the backward re-all-gather), so it should do better here. If it
+    does not, the "more communication-bound" reading of the baseline is wrong.
+    """
+    config = gpt_oss_120b()
+    config.parallelism.fsdp_reshard_after_forward = "never"
+    return config
+
+
+def gpt_oss_120b_gb300_noac_compile() -> Trainer.Config:
+    """No AC + compile, batch from the probe. The 20B winner, ported.
+
+    local_batch_size is set from probe measurements; see TUNING_RESULTS.md. The
+    expectation is that this does far less here than the 3.35x it gave on 20B,
+    because 120B has ~1.5x the activation cost per batch unit and started with a
+    quarter of the memory free rather than 93%.
+    """
+    config = gpt_oss_120b()
+    config.activation_checkpoint = None
+    config.compile.enable = True
+    # Measured (8-step probe): bs=2 53.9%, bs=3 76.6%. bs=3 it is. Compare with
+    # 20B, where no-AC + compile reached bs=6-7 at similar occupancy - prediction
+    # 1 holds, 120B's activations leave far less room to buy batch with.
+    config.training.local_batch_size = 3
+    return _stage_local_data(config)
+
+
+def gpt_oss_120b_gb300_sac_compile() -> Trainer.Config:
+    """SelectiveAC + compile at a batch that fills the GPU.
+
+    The config prediction 2 is really about. Per-op SAC was 4.4x cheaper than
+    no-AC on 20B; scaled by 120B's 1.5x layer count that is ~11.6 GiB per batch
+    unit over ~60 GiB fixed, so ~85-90% memory should land near bs=16. That is
+    roughly 8x the batch no-AC can afford here, and batch is what pays.
+    """
+    config = gpt_oss_120b()
+    config.activation_checkpoint = SelectiveAC.Config()
+    config.compile.enable = True
+    # Measured (8-step probe): bs=12 63.1%, bs=16 79.4%, bs=20 95.0%.
+    # bs=16 is the pick: 20B peaked at 89% and fell off a cliff by 98.7%, so 95%
+    # is not somewhere to sit for a 250-step run. See _bs20 for that test.
+    # Prediction 2 holds on memory - SAC affords ~5x the batch no-AC can here.
+    config.training.local_batch_size = 16
+    return _stage_local_data(config)
+
+
+def gpt_oss_120b_gb300_sac_compile_noreshard() -> Trainer.Config:
+    """Both predictions together: SelectiveAC for batch, never-reshard for the
+    collective.
+
+    Batch backs off from the sac_compile setting because never-reshard holds
+    parameters gathered after forward, and on 20B stacking it near the ceiling
+    was actively worse than not.
+    """
+    config = gpt_oss_120b_gb300_sac_compile()
+    config.parallelism.fsdp_reshard_after_forward = "never"
+    # 12 measured at 63.1% without never-reshard; that leaves room for the
+    # gathered parameters this adds.
+    config.training.local_batch_size = 12
+    return config
+
+
+def gpt_oss_120b_gb300_sac_compile_bs20() -> Trainer.Config:
+    """SelectiveAC at 95.0% memory - deliberately past where 20B was safe.
+
+    Separate from sac_compile so the main config stays somewhere that finishes.
+    20B peaked at 88.9% and collapsed to 160.6 TFLOP/s by 98.7%; whether 95% is
+    over that edge on 120B is untested, and this is the test.
+    """
+    config = gpt_oss_120b_gb300_sac_compile()
+    config.training.local_batch_size = 20
+    return config
+
+
+def gpt_oss_120b_gb300_sac_compile_maxbs() -> Trainer.Config:
+    """SelectiveAC at bs=20, the largest that fit the probe: 95.0% of memory.
+
+    Kept separate from sac_compile rather than made the default. On 20B the cliff
+    sat between 88.9% (fine) and 98.7% (43% slower than baseline), and 95% is
+    inside that unmeasured gap. Worth one run to find out; not worth being the
+    setting someone inherits.
+    """
+    config = gpt_oss_120b_gb300_sac_compile()
+    config.training.local_batch_size = 20
     return config

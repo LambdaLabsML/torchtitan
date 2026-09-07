@@ -188,6 +188,41 @@ config. That is an infrastructure ceiling, not a property of any tuning.
 Option 1 is the right one for a benchmark: a throughput number should not depend
 on someone else's rate limiter.
 
+## Round 4 — the data fix worked (job 54, 250 steps)
+
+Round 3's failures were HuggingFace throttling, not SelectiveAC. Fix: 64 C4
+shards staged to `/mnt/dgxc/data/c4_local` (one per rank, 20.4 GB) plus a
+`c4_local` dataset entry, and `train_timeout_seconds` 100 -> 600 as a safety net.
+
+| config | bs | TFLOP/s/GPU | cluster | MFU | mem | steps | Retry/ConnErr |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **`..._noac_compile_bs7_local`** | 7 | **987.8** | **63.22 PF** | **39.5%** | 88.9% | 250/250 | 0 / 0 |
+| `..._sac_compile_bs24` | 24 | 922.0 | 59.01 PF | 36.9% | 70.8% | 250/250 | 0 / 0 |
+
+Both ran to completion with **zero retries and zero connection errors**, where the
+same SAC batch previously died at step ~50 with 142 retries and 87 connection
+errors. The fix is confirmed at the source.
+
+**The control validates the dataset change.** `noac_compile_bs7` measured 963.5 on
+Hub-streamed C4; on local shards it measures **987.8** — same config, same 88.9%
+memory footprint, +2.5%. Local is neutral-to-slightly-better, so large-batch
+numbers are directly comparable to the rest of the table. The +2.5% is most
+plausibly the last traces of throttling in the original run (which logged 1
+connection error).
+
+**New overall best: 987.8 TFLOP/s/GPU, 63.22 PFLOP/s, 39.5% MFU — 3.51x the
+281.4 baseline.**
+
+**SelectiveAC at bs=24 reaches 922.0 in 70.8% of memory.** That is 6.7% below the
+best while using 18 points less memory — the same shape as its bs=8 result, and it
+confirms SAC is the memory-efficient option rather than the fastest. Round 3's
+"peak seen" of 922.3 before the crash turned out to be almost exactly right, which
+is luck rather than vindication: it was sampled from a degrading run.
+
+Job 54 was cancelled after these two runs, deliberately. It packed 9 runs into one
+allocation, and cancelling to reach any one of them discards the rest. Remaining
+runs now go through `gb300/run_one.slurm` - one config per job.
+
 ## Supporting jobs
 
 | job | purpose | outcome |
@@ -206,6 +241,8 @@ on someone else's rate limiter.
 | 49 | round 2 sweep | 4 configs x 250 steps, all exit 0 |
 | 50 | SAC batch probe | bs 16/24/28/32 all fit; 93.9% at bs=32 |
 | 51 | SAC 250-step sweep | all 3 killed by NCCL watchdog - HF rate limiting, see round 3 |
+| 53 | 120B probes + c4_local validation | no-AC ceiling bs=3 (76.6%); SAC bs=20 (95.0%); c4_local OK |
+| 54 | round 4 (cancelled after 2 of 9) | bs7_local 987.8; sac_bs24 922.0; both 0 retries |
 
 Baseline is quoted as 281.4 (job 46, 250 steps) rather than 287.8 (job 39, 50
 steps) so every row in the round-1 table is measured identically.

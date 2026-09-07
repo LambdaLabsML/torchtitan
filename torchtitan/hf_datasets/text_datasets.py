@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
@@ -29,6 +30,35 @@ def _load_c4_dataset(dataset_path: str, split: str):
     return load_dataset(dataset_path, name="en", split=split, streaming=True)
 
 
+def _load_c4_local_dataset(dataset_path: str):
+    """Stream C4 from locally staged shards instead of the HuggingFace Hub.
+
+    The Hub-streamed "c4" cannot feed 64 GB300s above local_batch_size ~8: token
+    demand scales with batch (bs=1 pulls ~0.5M tokens/step across 64 ranks, bs=24
+    pulls ~12.6M), and past that the Hub throttles. Ranks then starve, one misses
+    the 100 s collective window, and the NCCL watchdog aborts the job - which also
+    strands nodes in DRAIN with stuck processes.
+
+    64 shards are staged so each of 64 ranks can take its own file:
+    split_dataset_by_node splits by shard when it can and otherwise falls back to
+    skipping examples, which wastes exactly the read bandwidth this is protecting.
+
+    Stage with scripts alongside the data: /mnt/dgxc/data/fetch_c4.py
+    """
+    import glob
+
+    files = sorted(glob.glob(os.path.join(dataset_path, "en", "*.json.gz")))
+    if not files:
+        raise FileNotFoundError(
+            f"No C4 shards under {dataset_path}/en. Stage them first "
+            "(see /mnt/dgxc/data/fetch_c4.py)."
+        )
+    logger.info("c4_local: streaming %d local shards from %s", len(files), dataset_path)
+    return load_dataset(
+        "json", data_files=files, split="train", streaming=True
+    )
+
+
 def _process_c4_text(sample: dict[str, Any]) -> str:
     """Process C4 dataset sample text."""
     return sample["text"]
@@ -44,6 +74,11 @@ DATASETS = {
     "c4_test": DatasetConfig(
         path="tests/assets/c4_test",
         loader=lambda path: load_dataset(path, split="train"),
+        sample_processor=_process_c4_text,
+    ),
+    "c4_local": DatasetConfig(
+        path="/mnt/dgxc/data/c4_local",
+        loader=_load_c4_local_dataset,
         sample_processor=_process_c4_text,
     ),
     "c4_validation": DatasetConfig(
