@@ -660,7 +660,28 @@ def gpt_oss_120b_gb300_sac_gmm_bs5() -> Trainer.Config:
     config = gpt_oss_120b_gb300_sac_compile()
     config.activation_checkpoint = SelectiveAC.Config(save_grouped_mm=True)
     config.training.local_batch_size = 5
-    return _stage_local_data(config)
+    config = _stage_local_data(config)
+    # Job 62 died here at the FIRST attempt, and the cause is worth recording
+    # because _stage_local_data does NOT protect against it.
+    #
+    #   Watchdog caught collective operation timeout: WorkNCCL(SeqNum=333,
+    #   OpType=_REDUCE_SCATTER_BASE, NumelIn=579133440, Timeout(ms)=300000)
+    #
+    # No OOM, no allocator stall, no dataloader retry - the log is clean on all
+    # three. NumelIn=579133440 is exactly 201088 x 2880, the lm_head gradient,
+    # i.e. the last reduce-scatter of step 1's backward. Some ranks posted it and
+    # waited 300 s for stragglers still compiling. 36 layers under torch.compile
+    # with a changed AC save set repartitions a much larger graph than
+    # sac_compile does, and the first backward is where that cost lands.
+    #
+    # The 300 s is init_timeout_seconds, NOT train_timeout_seconds:
+    # set_pg_timeouts only swaps in the tighter train timeout AFTER step 1
+    # (trainer.py, "Reduce timeout after the first train step"), so
+    # _stage_local_data raising train_timeout_seconds to 600 has no effect on the
+    # step that actually needs the headroom. Anything compile-heavy at this layer
+    # count needs the init timeout raised instead.
+    config.comm.init_timeout_seconds = 1800
+    return config
 
 
 def gpt_oss_20b_gb300_sac_gmm_bs11() -> Trainer.Config:
