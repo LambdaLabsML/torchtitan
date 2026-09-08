@@ -229,8 +229,27 @@ upstream's default (empty) `kernel_options`. Tile search at `D=512`:
 
 Inductor filters candidates by shared memory even when `kernel_options` names a
 tile explicitly, so larger tiles raise `NoValidChoicesError` rather than
-falling back. Exactly one tile runs, and `deepseek_v4_pro_64xgb300` pins it on
-all 61 layers.
+falling back. Exactly one forward tile runs.
+
+**The backward kernel needs its own tiles.** `BLOCK_M`/`BLOCK_N` govern only
+the forward, so with just the tile above the forward compiles (job 76 completed
+~25 forward autotunes) and the backward hard-crashes the GPU:
+
+> CUDA error: unspecified launch failure ... Sticky error detected
+
+Reproduced on one GB300 at this model's real attention shape -- `H=128`,
+`D=512`, `Q=4096`, `KV=5121` (KV exceeds Q because of `index_topk=1024`; the
+compressed path gives 4129). The earlier `D=512` probe missed it by using
+`H=8` and `Q=KV`:
+
+| backward kernel_options | result |
+|---|---|
+| none (upstream default) | forward OK, **backward launch failure** |
+| `BLOCK_M1=16, BLOCK_N1=32, BLOCK_M2=32, BLOCK_N2=16` | **OK** |
+| all four = 16 | OK |
+
+`deepseek_v4_pro_64xgb300` pins both the forward and backward tiles on all 61
+layers.
 
 This is a correctness requirement, not tuning: without it neither real V4
 flavor can complete a forward pass on GB300. It is also a *small* tile, so
