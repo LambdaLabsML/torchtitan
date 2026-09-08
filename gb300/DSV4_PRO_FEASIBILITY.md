@@ -288,10 +288,9 @@ Two things not to over-read from that table:
   reason `pro` fits, and it only shows up once the 1.573 T of parameters
   dominate the budget.
 
-**The 196.6 GB/GPU projection is confirmed on hardware.** Job 75 (16 nodes,
-64 GPUs) built the mesh exactly as designed and got through every memory
-milestone before failing in the first forward pass on the flex-attention tile
-above:
+**Partially confirmed on hardware.** Job 75 (16 nodes, 64 GPUs) built the mesh
+exactly as designed and materialized the model, then failed in the first
+forward pass on the flex-attention tile above:
 
 ```
 Building device mesh with parallelism: pp=1, dp_replicate=1, dp_shard=64, cp=1, tp=1, ep=64
@@ -302,14 +301,31 @@ Optimizer AdamW (model_part=0): 1833 params {'fused': True, 'lr': 0.0008, ...}
 Trainer is initialized with 4096 tokens per DP rank, 262144 tokens per train step
 ```
 
-So 1.573 T parameters materialized, FSDP sharded them 64 ways, and fused AdamW
-allocated its states -- no OOM. The measured parameter count
-(1,572,997,179,491) matches the meta-device estimate, and the 262144
-tokens/step matches 64 x 4096. The memory plan in this doc is therefore
-validated; what remained was the attention kernel.
+1.573 T parameters materialized and FSDP sharded them 64 ways with no OOM. The
+measured parameter count (1,572,997,179,491) matches the meta-device estimate
+and the 262144 tokens/step matches 64 x 4096.
 
-Still unverified: a completed step, and therefore TFLOP/s, expert all-to-all
-throughput over IB at EP=64, and whether activations fit in the ~101 GB left.
+**What is not yet validated is the full 196.6 GB/GPU.** Job 76 reports:
+
+```
+CUDA capacity: NVIDIA GB300 with 276.50GiB memory
+CUDA memory usage for model: 54.24GiB(19.62%)
+Peak FLOPS used for computing MFU: 2.500e+15
+```
+
+54.24 GiB is the bf16 *parameter* shard only (1.573 T x 2 / 64 = 49 GB, plus
+overhead). The optimizer is constructed at init -- 1833 param groups -- but
+PyTorch AdamW allocates `exp_avg` and `exp_avg_sq` lazily on the first
+`.step()`, which has not yet run. The projected total is params 49 GB +
+grads 49 GB + two bf16 moments 98 GB = ~196 GB, and only a completed step
+proves it.
+
+Note also that torchtitan reports **276.50 GiB** usable per GB300, not the
+277.55 GiB of raw HBM, which trims the headroom slightly.
+
+Still unverified: a completed step, and therefore the 196.6 GB/GPU total,
+TFLOP/s, expert all-to-all throughput over IB at EP=64, and whether
+activations fit in what remains.
 
 - `gb300/dsv4_smoke_1node.slurm` runs upstream's documented 4-GPU debugmodel
   test (FSDP2+TP2+EP2) as a cheap gate.
