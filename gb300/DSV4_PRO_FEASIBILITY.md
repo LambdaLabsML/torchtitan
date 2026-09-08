@@ -118,12 +118,64 @@ interface names and a worktree/PYTHONPATH guard. The recipe shape (FullAC,
 `disable_cuda_graphs`, EP) is modelled on upstream's `deepseek_v3_671b`, the
 nearest thing upstream has to a production DeepSeek run.
 
+## Two gotchas that block upstream main on GB300
+
+Both were caught by the 1-node smoke gate rather than by the 16-node run, which
+is the entire reason the gate exists.
+
+### 1. Upstream main requires a PyTorch nightly on GB300
+
+`torchtitan/distributed/utils.py:enable_fp32_matmul_emulation_with_bf16x9()` is
+called from `init_distributed()` on **every** run and hard-fails on any device
+with compute capability `>= (10, 0)`. GB300 reports **(10, 3)**, so it always
+fires. It sets:
+
+```python
+torch.backends.cuda.matmul.fp32_precision = "bfx9"
+```
+
+`torch==2.14.0+cu130` -- the build the GPT-OSS sweep runs on -- exposes that
+attribute but accepts only `tf32`, `ieee` and `none`, raising
+`RuntimeError: Unknown precision: bfx9`. Every run therefore died in trainer
+init, before the model was built:
+
+> ValueError: TorchTitan on NVIDIA GPUs with compute capability 10.0 or later
+> requires PyTorch with CUDA BFX9 matmul support (pytorch/pytorch#195301) and
+> CUDA 12.9 or later.
+
+`torch==2.15.0.dev20260907+cu130` accepts `bfx9` and runs fp32 matmuls on these
+GPUs. This matches upstream's README, which expects a nightly for a from-source
+install.
+
+**Consequence beyond this branch:** current upstream main cannot run on GB300
+with the torch build the rest of this cluster's work depends on. Any future
+rebase of the Lambda fork onto upstream inherits the nightly requirement.
+
+### 2. Upstream's own DeepSeek V4 smoke command is broken as written
+
+The command in `torchtitan/models/deepseek_v4/README.md` passes
+`--parallelism.expert_parallel_degree 2` but not
+`--training.disable-cuda-graphs`. `training.disable_cuda_graphs` defaults to
+`False`, and EP with the default `AllToAllTokenDispatcher` synchronizes with the
+host during dispatch, so config validation rejects the pair:
+
+> Error parsing Config: CUDA graphs support only expert parallel token
+> dispatcher configurations without CPU synchronization. [...] Unsupported
+> token dispatcher: AllToAllTokenDispatcher.Config.
+
+`gb300/dsv4_smoke_1node.slurm` adds the flag. `deepseek_v4_pro_64xgb300` sets
+`disable_cuda_graphs=True` in the config itself, so it was never affected --
+which is also why it passed `Trainer.Config.__post_init__` while the debugmodel
+did not.
+
 ## Environment
 
-Dedicated venv `/mnt/dgxc/venvs/dsv4` for upstream's new dependency set:
+Venvs, in build order. The runs use **`/mnt/dgxc/venvs/dsv4n`**
+(`torch==2.15.0.dev20260907+cu130`, required per the BFX9 gotcha above).
+`/mnt/dgxc/venvs/dsv4` is the same dependency set on `torch==2.14.0+cu130`,
+kept as a rollback; it cannot run on GB300. Both carry upstream's new set:
 `grain==0.2.18` (replacing `torchdata`), `spmd_types==0.2.5`,
-`attn-gym[linear]==0.0.8`, pinned `torch_remat`, `torch_checkpointing==0.1.0` --
-on the same `torch==2.14.0+cu130` already validated on these nodes.
+`attn-gym[linear]==0.0.8`, pinned `torch_remat`, `torch_checkpointing==0.1.0`.
 
 `/mnt/dgxc/venvs/torchtitan` was deliberately left untouched: it installs
 torchtitan in editable mode and is shared by the queued GPT-OSS jobs, so
