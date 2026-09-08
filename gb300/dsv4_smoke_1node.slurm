@@ -2,6 +2,12 @@
 # Upstream's documented DeepSeek V4 smoke test, on one GB300 node.
 # This is the run described in torchtitan/models/deepseek_v4/README.md:
 # debugmodel on 4 GPUs with FSDP2 + TP2 + EP2. Cheap gate to prove the merged
+#
+# NOTE: --training.disable-cuda-graphs is required and is MISSING from the
+# upstream README command, which therefore fails as written: CUDA graphs
+# default to on, and EP with the default AllToAllTokenDispatcher synchronizes
+# with the host during dispatch, so config validation rejects the combination.
+# The pro config sets disable_cuda_graphs itself, so it is unaffected.
 # code, the venv and the GB300 stack work before committing a 16-node slot to
 # the 1.573 T pro run.
 #
@@ -44,6 +50,7 @@ NGPU=4 LOG_RANK=0 MODULE=deepseek_v4 CONFIG=deepseek_v4_debugmodel \
     --parallelism.data-parallel-shard-degree 2 \
     --parallelism.tensor-parallel-degree 2 \
     --parallelism.expert-parallel-degree 2 \
+    --training.disable-cuda-graphs \
   > "$LOG" 2>&1
 rc=$?
 echo "###### SMOKE END exit=$rc $(date -u +%H:%M:%S) ######"
