@@ -225,12 +225,35 @@ upgrading it in place would have changed the code under a running sweep.
 - `deepseek_v4_pro_64xgb300` builds and passes `Trainer.Config.__post_init__`.
 - `ParallelDims` accepts the mesh at `world_size=64`.
 
-Verified on GB300 GPUs: the debugmodel trains in `pro`'s topology
-(FSDP=4, TP=1, EP=4, 4x GB300, microbatch 16384 tokens) -- 3 steps, exit 0,
-loss 8.29 -> 6.94 -> 5.13, 6.6 GiB/GPU. This exercises the torch nightly with
-`bfx9`, the `ModuleList` fix, FSDP+EP, and forward/backward/optimizer.
+Verified on GB300 GPUs. Every change `deepseek_v4_pro_64xgb300` makes was
+exercised at debug scale first, on 4x GB300 with `pro`'s topology
+(FSDP=4, TP=1, EP=4, microbatch 16384 tokens, 3 steps each):
 
-Not yet verified: the 16-node `pro` run itself.
+| run | dtype | AC | exit | loss | peak mem/GPU |
+|---|---|---|---|---|---|
+| baseline    | fp32 | none   | 0 | 8.29 -> 6.94 -> 5.13 | 6.61 GiB |
+| + FullAC    | fp32 | FullAC | 0 | 8.10 -> 6.64 -> 4.84 | 3.24 GiB |
+| + bf16 (= pro's shape) | bf16 | FullAC | 0 | 8.07 -> 6.71 -> 5.14 | 3.23 GiB |
+
+Together these exercise the torch nightly with `bfx9`, the `ModuleList` fix,
+FSDP + EP, `training.dtype=bfloat16`, `FullAC`, and forward/backward/optimizer.
+Loss falls in all three and throughput is unchanged by AC (11,016 vs 11,209
+tps), so FullAC costs essentially nothing here while halving activation memory.
+
+Two things not to over-read from that table:
+
+- **FullAC's 2.04x memory saving is an activation saving.** It is large at
+  debug scale because a 10 M-parameter model is all activations. At `pro` scale
+  weights and optimizer state dominate, so AC's job there is narrower: keeping
+  the 61-block activation stack inside the ~101 GB left after the weights.
+- **bf16 shows no memory win at debug scale** (3.24 -> 3.23 GiB) for the same
+  reason -- there are barely any weights to shrink. Its 2x saving is the whole
+  reason `pro` fits, and it only shows up once the 1.573 T of parameters
+  dominate the budget.
+
+Not yet verified: the 16-node `pro` run itself -- the only thing that can
+confirm the 196.6 GB/GPU projection, expert all-to-all over IB at EP=64, and
+materialization of 1.573 T parameters.
 
 - `gb300/dsv4_smoke_1node.slurm` runs upstream's documented 4-GPU debugmodel
   test (FSDP2+TP2+EP2) as a cheap gate.
