@@ -204,6 +204,43 @@ code** (two lines, matching V3). Without it nothing runs on any hardware. The
 CPU unit tests do not catch it because they never call
 `verify_module_protocol`.
 
+### 5. head_dim=512 exceeds Blackwell's shared memory in flex attention
+
+Both real V4 flavors use `head_dim=512` (`flash` and `pro`; the debugmodel uses
+256). On GB300 the Triton flex-attention kernel wants more shared memory than
+the hardware has, and the first forward pass dies:
+
+> No valid triton configs. OutOfMemoryError: out of resource:
+> triton_flex_attention Required: 294912 Hardware limit: 232448
+
+Reproduced on a single GB300 with a standalone `flex_attention` call at
+`D=512` plus a causal block mask -- the same `No valid triton configs` with
+upstream's default (empty) `kernel_options`. Tile search at `D=512`:
+
+| kernel_options | result |
+|---|---|
+| `{}` (upstream default) | FAIL -- No valid triton configs |
+| `BLOCK_M=64, BLOCK_N=64, stages=1, warps=4` | FAIL -- NoValidChoicesError |
+| `BLOCK_M=64, BLOCK_N=32, stages=1, warps=4` | FAIL -- NoValidChoicesError |
+| `BLOCK_M=128, BLOCK_N=32, stages=1, warps=4` | FAIL -- launch failure |
+| `BLOCK_M=32, BLOCK_N=64, stages=1, warps=4` | FAIL -- launch failure |
+| `BLOCK_M=32, BLOCK_N=32` (stages/warps unpinned) | FAIL -- launch failure |
+| **`BLOCK_M=32, BLOCK_N=32, stages=1, warps=4`** | **OK** |
+
+Inductor filters candidates by shared memory even when `kernel_options` names a
+tile explicitly, so larger tiles raise `NoValidChoicesError` rather than
+falling back. Exactly one tile runs, and `deepseek_v4_pro_64xgb300` pins it on
+all 61 layers.
+
+This is a correctness requirement, not tuning: without it neither real V4
+flavor can complete a forward pass on GB300. It is also a *small* tile, so
+attention throughput pays for it -- though `pro` is 1.55 T of its 1.573 T
+parameters in experts, so MoE, not attention, should dominate the step.
+
+It also explains why upstream validated only the 4-GPU debugmodel: at
+`head_dim=256` the default autotune sweep finds a config, so the bug is
+invisible there.
+
 ## Environment
 
 Venvs, in build order. The runs use **`/mnt/dgxc/venvs/dsv4n`**
@@ -251,9 +288,28 @@ Two things not to over-read from that table:
   reason `pro` fits, and it only shows up once the 1.573 T of parameters
   dominate the budget.
 
-Not yet verified: the 16-node `pro` run itself -- the only thing that can
-confirm the 196.6 GB/GPU projection, expert all-to-all over IB at EP=64, and
-materialization of 1.573 T parameters.
+**The 196.6 GB/GPU projection is confirmed on hardware.** Job 75 (16 nodes,
+64 GPUs) built the mesh exactly as designed and got through every memory
+milestone before failing in the first forward pass on the flex-attention tile
+above:
+
+```
+Building device mesh with parallelism: pp=1, dp_replicate=1, dp_shard=64, cp=1, tp=1, ep=64
+Model deepseek_v4 deepseek_v4_pro size: 1,572,997,179,491 total parameters
+Applied FullAC activation checkpointing to the model
+Applied FSDP to the model
+Optimizer AdamW (model_part=0): 1833 params {'fused': True, 'lr': 0.0008, ...}
+Trainer is initialized with 4096 tokens per DP rank, 262144 tokens per train step
+```
+
+So 1.573 T parameters materialized, FSDP sharded them 64 ways, and fused AdamW
+allocated its states -- no OOM. The measured parameter count
+(1,572,997,179,491) matches the meta-device estimate, and the 262144
+tokens/step matches 64 x 4096. The memory plan in this doc is therefore
+validated; what remained was the attention kernel.
+
+Still unverified: a completed step, and therefore TFLOP/s, expert all-to-all
+throughput over IB at EP=64, and whether activations fit in the ~101 GB left.
 
 - `gb300/dsv4_smoke_1node.slurm` runs upstream's documented 4-GPU debugmodel
   test (FSDP2+TP2+EP2) as a cheap gate.
