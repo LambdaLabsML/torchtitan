@@ -664,20 +664,38 @@ def gpt_oss_120b_gb300_sac_gmm_bs5() -> Trainer.Config:
 
 
 def gpt_oss_20b_gb300_sac_gmm_bs11() -> Trainer.Config:
-    """The same change at the batch that actually fills the GPU.
+    """Conservative follow-up to bs=8: ~82.5% memory, clear of the cliff.
 
-    `..._sac_gmm_bs8` isolates the mechanism; this is where the win would show up
-    if there is one. Sized from the SAC probe slope (bs=8 27.2%, bs=16 48.4%,
-    bs=24 70.8%, bs=32 93.9% -> ~2.78 points/bs-unit over ~5% fixed) plus the
-    ~13.6 GiB/bs-unit that saving mlp1+mlp2 outputs adds, i.e. ~4.79 points, so
-    ~7.57 points/bs-unit total:
+    Sizing is now MEASURED, not estimated. bs=8 came in at 169.52 GiB (61.31%)
+    against the SAC baseline's 75.12 GiB (27.17%), so saving mlp1+mlp2 outputs
+    costs (169.52 - 75.12) / 8 = 11.80 GiB per batch unit. On top of SAC's own
+    ~7.69 GiB/bs-unit that is ~19.49 GiB/bs-unit over ~13.6 GiB fixed -- and that
+    fixed term reproduces from both configs independently, so the model holds:
 
-        bs=8   ~66%      bs=11  ~88%      bs=12  ~96%
+        bs=8   61.3% (measured)    bs=11  ~82.5%    bs=12  ~89.5%    bs=13  ~96.6%
 
-    bs=11 lands on the 88.9% where no-AC peaked; bs=12 is inside the 94-99% band
-    that cratered in round 1. Run only after bs=8 reports its real memory - if the
-    estimate is off, this is the one that OOMs.
+    Use this one if bs=12 falls off the cliff.
     """
     config = gpt_oss_20b_gb300_sac_gmm_bs8()
     config.training.local_batch_size = 11
+    return config
+
+
+def gpt_oss_20b_gb300_sac_gmm_bs12() -> Trainer.Config:
+    """The real test: same memory footprint as the current best config, 71% more
+    batch.
+
+    bs=8 already reached 979.5 TFLOP/s at 61.31% memory -- within 0.8% of
+    noac_compile_bs7_local's 987.8, on 27.6 points less memory. That leaves the
+    interesting question: at EQUAL memory, which recipe wins? bs=12 lands at
+    ~89.5% by the measured slope above, against no-AC's 88.9%, so this is the
+    apples-to-apples comparison.
+
+    89.5% is marginally past the 88.9% that peaked in round 1, and the failure
+    mode there was soft rather than an OOM (bs=8 at 98.7% ran 43% SLOWER than the
+    baseline). If this degrades rather than OOMs, that is the cliff and bs=11 is
+    the answer.
+    """
+    config = gpt_oss_20b_gb300_sac_gmm_bs8()
+    config.training.local_batch_size = 12
     return config
