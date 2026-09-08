@@ -588,3 +588,96 @@ def gpt_oss_120b_gb300_sac_compile_maxbs() -> Trainer.Config:
     config = gpt_oss_120b_gb300_sac_compile()
     config.training.local_batch_size = 20
     return config
+
+
+# ---------------------------------------------------------------------------
+# EXPERIMENT: save the MoE expert GEMM under SelectiveAC.
+#
+# SelectiveAC's save set comes from torch's compute_intensive_ops (mm, bmm,
+# addmm, convolution, sdpa*, _scaled_mm) plus torchtitan's additions. Verified
+# against this venv:
+#
+#     torch_attn._varlen_attn.default        saved=True
+#     aten.linear.default                    saved=True
+#     aten._grouped_mm.default               saved=False   <-- the expert GEMM
+#
+# The policy defaults unlisted ops to PREFER_RECOMPUTE, so today per-op SAC
+# recomputes every expert GEMM in backward while faithfully saving the far
+# cheaper attention projections. Since aten.index and the pointwise ops are
+# recomputable too, SelectiveAC degenerates to full recompute inside the MoE --
+# which is where GPT-OSS spends 54% (20B) / 56% (120B) of its real FLOPs.
+#
+# That predicts both SAC numbers already in the table: the low memory (27.2% at
+# 20B bs=8) is activations being thrown away, and the throughput gap is the
+# recompute bill (+18% FLOPs in theory, 11% observed).
+# ---------------------------------------------------------------------------
+
+
+def gpt_oss_20b_gb300_sac_gmm_bs8() -> Trainer.Config:
+    """Controlled A/B against `sac_compile` (bs=8, measured 859.6 at 27.2%).
+
+    Same batch, same everything, one variable: aten._grouped_mm joins the save
+    set. Isolates the mechanism rather than chasing a headline number.
+
+    Memory estimate: saving mlp1 (R, 2F) + mlp2 (R, D) outputs costs ~566 MiB per
+    layer per batch unit, x24 layers = ~13.6 GiB/bs-unit on top of SAC's measured
+    ~7.7. At bs=8 that is ~65% of memory, well clear of the ~89% cliff.
+
+    Read it per-FLOP, not just as TFLOP/s: if this recovers most of the 11% gap
+    to no-AC while staying far below no-AC's 88.9% memory, the batch sweep that
+    follows is where the actual win is.
+    """
+    config = gpt_oss_20b_gb300_sac_compile()  # bs=8
+    config.activation_checkpoint = SelectiveAC.Config(save_grouped_mm=True)
+    return _stage_local_data(config)
+
+
+def gpt_oss_120b_gb300_sac_gmm_bs5() -> Trainer.Config:
+    """The same change where it matters most: SelectiveAC is the *winning* 120B
+    config (job 56, 250 steps: 810 TFLOP/s at 84.25% memory), so on the larger
+    model the best recipe is the one paying the recompute bill.
+
+    Not a controlled A/B -- saving the expert GEMMs at bs=16 cannot fit, so this
+    compares configs at each one's own batch, which is what the rest of this
+    sweep does anyway.
+
+    Sizing from job 56's MEASURED steady-state 232.96 GiB at bs=16, not from the
+    8-step probe: with the probe's ~11.3 GiB/bs-unit slope that implies ~52 GiB
+    fixed. Saving mlp1 (R, 2F) + mlp2 (R, D) adds 36 layers x ~566 MiB =
+    ~20.4 GiB/bs-unit, so the slope nearly triples to ~31.7 GiB/bs-unit:
+
+        bs=5  ~76%      bs=6  ~88%      bs=7  ~99%
+
+    bs=5 is the pick. bs=6 lands where 20B peaked, but the estimate carries real
+    uncertainty and round 1 showed the failure mode here is soft: bs=8 at 98.7%
+    ran 43% SLOWER than the baseline rather than OOMing, wasting the whole run.
+    A completed run at 76% is worth more than a coin flip at 88%; bs=6 is the
+    follow-up once this reports its real memory.
+
+    NOTE: TUNING_RESULTS_120B.md records job 56 as bs=18. The run log says
+    "local batch size 16" and the config says 16 -- the table is a typo.
+    """
+    config = gpt_oss_120b_gb300_sac_compile()
+    config.activation_checkpoint = SelectiveAC.Config(save_grouped_mm=True)
+    config.training.local_batch_size = 5
+    return _stage_local_data(config)
+
+
+def gpt_oss_20b_gb300_sac_gmm_bs11() -> Trainer.Config:
+    """The same change at the batch that actually fills the GPU.
+
+    `..._sac_gmm_bs8` isolates the mechanism; this is where the win would show up
+    if there is one. Sized from the SAC probe slope (bs=8 27.2%, bs=16 48.4%,
+    bs=24 70.8%, bs=32 93.9% -> ~2.78 points/bs-unit over ~5% fixed) plus the
+    ~13.6 GiB/bs-unit that saving mlp1+mlp2 outputs adds, i.e. ~4.79 points, so
+    ~7.57 points/bs-unit total:
+
+        bs=8   ~66%      bs=11  ~88%      bs=12  ~96%
+
+    bs=11 lands on the 88.9% where no-AC peaked; bs=12 is inside the 94-99% band
+    that cratered in round 1. Run only after bs=8 reports its real memory - if the
+    estimate is off, this is the one that OOMs.
+    """
+    config = gpt_oss_20b_gb300_sac_gmm_bs8()
+    config.training.local_batch_size = 11
+    return config

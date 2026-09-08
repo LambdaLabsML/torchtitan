@@ -28,7 +28,7 @@ from torchtitan.config import Configurable
 from torchtitan.tools.logging import logger
 
 
-def _get_default_save_ops() -> set:
+def _get_default_save_ops(save_grouped_mm: bool = False) -> set:
     """Returns the default set of ops whose activations should be saved
     (compute + comm).
 
@@ -91,6 +91,14 @@ def _get_default_save_ops() -> set:
     }
     save_ops.update(_resolve_ops(compute_ops))
     save_ops.update(_resolve_ops(comm_ops))
+    if save_grouped_mm:
+        # Grouped mm is the MoE expert GEMM. It is in neither torch's
+        # compute_intensive_ops nor the lists above, and SelectiveAC defaults
+        # unlisted ops to PREFER_RECOMPUTE -- so by default every expert GEMM is
+        # recomputed in backward while aten.linear (the far cheaper attention
+        # projections) is saved. For GPT-OSS the expert GEMMs are 54% (20B) /
+        # 56% (120B) of real model FLOPs, so the default is backwards for a MoE.
+        save_ops.add(torch.ops.aten._grouped_mm.default)
     return save_ops
 
 
@@ -206,10 +214,26 @@ class SelectiveAC(ActivationCheckpointing):
         ANY mm with shape matching (*, in) x (in, out) will be force recomputed.
         """
 
+        save_grouped_mm: bool = False
+        """
+        Save the outputs of ``aten._grouped_mm`` (the MoE expert GEMM) instead of
+        recomputing them. Off by default so existing runs are unchanged.
+
+        The default save set is inherited from torch's ``compute_intensive_ops``,
+        which predates grouped mm and does not list it; SelectiveAC's policy sends
+        every unlisted op to PREFER_RECOMPUTE. For a dense model that is harmless.
+        For an MoE it means the single most expensive op in the model is recomputed
+        in backward while the cheap attention projections are saved.
+
+        Costs memory: the mlp1 output is (num_routed_tokens, 2 * hidden_dim), the
+        largest activation in a GPT-OSS layer. Expect to lower local_batch_size.
+        """
+
     def get_save_ops(self) -> set:
         """Returns the set of ops whose activations should be saved. Override
         to customize the save set."""
-        return _get_default_save_ops()
+        config = cast("SelectiveAC.Config", self.config)
+        return _get_default_save_ops(save_grouped_mm=config.save_grouped_mm)
 
     def _wrap_block(
         self, module: nn.Module, *, base_fqn: str | None = None
