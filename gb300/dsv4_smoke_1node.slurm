@@ -22,7 +22,7 @@
 set -uo pipefail
 
 WORKTREE=${WORKTREE:-/mnt/dgxc/worktrees/dsv4-pro}
-VENV=${VENV:-/mnt/dgxc/venvs/dsv4}
+VENV=${VENV:-/mnt/dgxc/venvs/dsv4n}
 cd "$WORKTREE"
 source "$VENV/bin/activate"
 export PYTHONPATH="$WORKTREE"
