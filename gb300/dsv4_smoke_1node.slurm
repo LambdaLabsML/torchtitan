@@ -1,15 +1,25 @@
 #!/bin/bash
-# Upstream's documented DeepSeek V4 smoke test, on one GB300 node.
-# This is the run described in torchtitan/models/deepseek_v4/README.md:
-# debugmodel on 4 GPUs with FSDP2 + TP2 + EP2. Cheap gate to prove the merged
+# DeepSeek V4 debugmodel smoke test on one GB300 node. Cheap gate to prove the
+# merged code, the venv and the GB300 stack work before committing a 16-node
+# slot to the 1.573 T pro run.
 #
-# NOTE: --training.disable-cuda-graphs is required and is MISSING from the
-# upstream README command, which therefore fails as written: CUDA graphs
-# default to on, and EP with the default AllToAllTokenDispatcher synchronizes
-# with the host during dispatch, so config validation rejects the combination.
-# The pro config sets disable_cuda_graphs itself, so it is unaffected.
-# code, the venv and the GB300 stack work before committing a 16-node slot to
-# the 1.573 T pro run.
+# This deliberately does NOT run the command from
+# torchtitan/models/deepseek_v4/README.md, because that command cannot work:
+#
+#   1. It omits --training.disable-cuda-graphs. CUDA graphs default to on, and
+#      EP with the default AllToAllTokenDispatcher synchronizes with the host
+#      during dispatch, so config validation rejects the pair outright.
+#   2. It asks for TP2. deepseek_v4's MoE router is broken under tensor
+#      parallelism: at models/common/moe.py:341 the router returns full-length
+#      topk_expert_ids while scores_TE stays sequence-parallel-sharded, so the
+#      gather fails with "expected index [131072, 3] to be no larger than self
+#      [65536, 4]". The token dims differ by exactly the TP degree.
+#
+# So the gate mirrors the topology deepseek_v4_pro_64xgb300 actually uses --
+# TP=1, EP=world, FSDP=world -- which is the configuration verified to train.
+# The microbatch is capped at 1x context because the debugmodel's stock 8x
+# microbatch (131072 tokens) makes flex-attention autotuning take >10 min for
+# no added coverage; pro attends over 4096 tokens.
 #
 #SBATCH --job-name=dsv4_smoke
 #SBATCH --nodes=1
@@ -47,9 +57,10 @@ NGPU=4 LOG_RANK=0 MODULE=deepseek_v4 CONFIG=deepseek_v4_debugmodel \
   ./run_train.sh \
     --training.steps 5 \
     --metrics.log_freq 1 \
-    --parallelism.data-parallel-shard-degree 2 \
-    --parallelism.tensor-parallel-degree 2 \
-    --parallelism.expert-parallel-degree 2 \
+    --parallelism.data-parallel-shard-degree 4 \
+    --parallelism.tensor-parallel-degree 1 \
+    --parallelism.expert-parallel-degree 4 \
+    --training.num-tokens-per-microbatch-per-dp-rank 16384 \
     --training.disable-cuda-graphs \
   > "$LOG" 2>&1
 rc=$?

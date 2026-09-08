@@ -168,6 +168,42 @@ host during dispatch, so config validation rejects the pair:
 which is also why it passed `Trainer.Config.__post_init__` while the debugmodel
 did not.
 
+### 3. deepseek_v4's MoE router is broken under tensor parallelism
+
+`models/common/moe.py:341` does
+`topk_scores_TK = scores_TE.gather(dim=-1, index=topk_expert_ids_TK)`. Under
+TP with sequence parallelism the router returns full-length
+`topk_expert_ids_TK` while `scores_TE` stays token-sharded, so the gather
+fails:
+
+> RuntimeError: Size does not match at dimension 0 expected index
+> [131072, 3] to be no larger than self [65536, 4]
+
+The `E`/`K` dims are correct (debugmodel: `num_experts=4`, `top_k=3`); only the
+token dim is wrong, by exactly the TP degree. This is what makes upstream's
+recommended TP2+EP2 smoke config unrunnable.
+
+`deepseek_v4_pro_64xgb300` uses `tensor_parallel_degree=1`, chosen on hardware
+grounds (no NVSwitch, and memory does not require TP), which also avoids this
+path entirely.
+
+### 4. mtp_layers used a bare nn.ModuleList
+
+`DeepSeekV4Model.__init__` assigned `torch.nn.ModuleList`, which does not
+satisfy torchtitan's `Module` protocol, so `verify_module_protocol()` rejected
+**every** deepseek_v4 model at trainer init -- all three flavors, even at
+`n_mtp_layers=0`, since the empty list is assigned before the `None` check:
+
+> RuntimeError: The following modules do not satisfy the Module protocol:
+> 'mtp_layers' (ModuleList)
+
+torchtitan ships `torchtitan.protocols.module.ModuleList` for exactly this and
+the sibling `deepseek_v3/mtp.py:214` already uses it, so this is a port
+oversight in V4. **This is the one place this branch modifies upstream model
+code** (two lines, matching V3). Without it nothing runs on any hardware. The
+CPU unit tests do not catch it because they never call
+`verify_module_protocol`.
+
 ## Environment
 
 Venvs, in build order. The runs use **`/mnt/dgxc/venvs/dsv4n`**
@@ -189,7 +225,12 @@ upgrading it in place would have changed the code under a running sweep.
 - `deepseek_v4_pro_64xgb300` builds and passes `Trainer.Config.__post_init__`.
 - `ParallelDims` accepts the mesh at `world_size=64`.
 
-Not yet verified on GPU at the time of writing -- gated behind the smoke job:
+Verified on GB300 GPUs: the debugmodel trains in `pro`'s topology
+(FSDP=4, TP=1, EP=4, 4x GB300, microbatch 16384 tokens) -- 3 steps, exit 0,
+loss 8.29 -> 6.94 -> 5.13, 6.6 GiB/GPU. This exercises the torch nightly with
+`bfx9`, the `ModuleList` fix, FSDP+EP, and forward/backward/optimizer.
+
+Not yet verified: the 16-node `pro` run itself.
 
 - `gb300/dsv4_smoke_1node.slurm` runs upstream's documented 4-GPU debugmodel
   test (FSDP2+TP2+EP2) as a cheap gate.
