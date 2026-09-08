@@ -56,9 +56,16 @@ best result using **a quarter of the memory** the leaders need.
 
 **Memory utilisation is the whole game — until it isn't.** The baseline recomputes
 activations while sitting in 6.7% of the GPU. Spending that headroom is worth
-2-3.3x. But bs=8 at 98.7% is **43% slower than the baseline** and 5.9x slower than
-bs=6 at 77%: the allocator thrashes, and wall clock shows it (~20 min for that one
-config vs ~5-11 for the others). There is a cliff between 77% and 98.7%.
+2-3.5x. But `noac_compile` at bs=8/98.7% is **43% slower than the baseline** and
+5.9x slower than bs=6 at 77%: the allocator thrashes, and wall clock shows it
+(~20 min for that one config vs ~5-11 for the others).
+
+**Corrected by the 120B sweep:** this is NOT a simple "stay under ~90%" rule. On
+120B, SelectiveAC runs at 98.7% with no penalty whatsoever (786.1 vs 786.9 at
+84.2%). What thrashes the allocator is **large, no-AC-sized allocations near the
+ceiling**, not the percentage itself — SelectiveAC's per-step allocations are ~5x
+smaller and sit at 99% safely. 20B SAC at 93.9% also ran fine, which fits. See
+[TUNING_RESULTS_120B.md](TUNING_RESULTS_120B.md).
 
 **compile on its own is worth nothing** (+0.2%). Its entire value is second-order:
 it cuts activation memory enough to raise the no-AC batch from 4 to 6, and *that*
@@ -243,6 +250,7 @@ runs now go through `gb300/run_one.slurm` - one config per job.
 | 51 | SAC 250-step sweep | all 3 killed by NCCL watchdog - HF rate limiting, see round 3 |
 | 53 | 120B probes + c4_local validation | no-AC ceiling bs=3 (76.6%); SAC bs=20 (95.0%); c4_local OK |
 | 54 | round 4 (cancelled after 2 of 9) | bs7_local 987.8; sac_bs24 922.0; both 0 retries |
+| 56-60 | **120B tuning** | see TUNING_RESULTS_120B.md - best 786.9 (4.99x) |
 
 Baseline is quoted as 281.4 (job 46, 250 steps) rather than 287.8 (job 39, 50
 steps) so every row in the round-1 table is measured identically.
