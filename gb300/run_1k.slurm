@@ -31,6 +31,12 @@ STEPS=${STEPS:-100}
 TAG=${TAG:-$CONFIG}
 MXFP8=${MXFP8:-0}
 PROFILE=${PROFILE:-0}
+# Steady-state window start. 100 by default to match the window every number in
+# gb300/TUNING_RESULTS_120B.md uses, so rows stay comparable across run lengths.
+# 120B needs it: throughput is still ramping at step 60 (784) and dips as late as
+# step 100 (655 against a 790 neighbourhood), so a steps>=50 window measures the
+# ramp rather than the config.
+STEADY=${STEADY:-100}
 
 cd "$WORKTREE"
 source /mnt/dgxc/venvs/torchtitan/bin/activate
@@ -57,12 +63,20 @@ if not got.startswith(want.rstrip("/") + "/"):
     print(f"###### FATAL: expected import from {want}", flush=True)
     sys.exit(1)
 if mxfp8 == "1":
-    import torchao
-    from torchao.prototype.mx_formats.config import _SM100_KERNELS_AVAILABLE
+    import torch, torchao
+    from torchao.prototype.mx_formats.kernels import (
+        _mxfp8_cuda_kernels_available,
+        _triton_kernels_available,
+    )
+    # The failure this guards is silent: without the compiled _C_mxfp8 the ops
+    # are simply not registered for CUDA, and the run either raises deep in the
+    # first backward or quietly measures something that is not mxfp8.
+    has_op = hasattr(torch.ops.torchao, "mxfp8_quantize")
     print(f"###### torchao {torchao.__version__} -> {torchao.__file__}", flush=True)
-    print(f"###### _SM100_KERNELS_AVAILABLE={_SM100_KERNELS_AVAILABLE}", flush=True)
-    if not _SM100_KERNELS_AVAILABLE:
-        print("###### FATAL: mxfp8 kernels absent; run would measure emulation", flush=True)
+    print(f"###### cuda_kernels={_mxfp8_cuda_kernels_available} "
+          f"triton_kernels={_triton_kernels_available} mxfp8_quantize_op={has_op}", flush=True)
+    if not (_mxfp8_cuda_kernels_available and _triton_kernels_available and has_op):
+        print("###### FATAL: mxfp8 kernels absent; run would not measure mxfp8", flush=True)
         sys.exit(1)
 PY
 
@@ -100,16 +114,16 @@ echo "###### END $TAG exit=$rc $(date -u +%H:%M:%S) ######"
 # Steady-state mean, so rows are comparable. Steady state is the second half of
 # the run: warmup and compile dominate the first steps.
 sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -oE "step: +[0-9]+ .*" | \
-  awk -v s="$STEPS" '{
+  awk -v s="$STEADY" '{
     for(i=1;i<=NF;i++){
       if($i=="step:") st=$(i+1);
       if($i=="tflops:") tf=$(i+1);
       if($i=="memory:"){m=$(i+1); gsub(/GiB.*/,"",m)}
     }
-    if(st>=s/2){n++; sum+=tf; if(m+0>pk) pk=m+0}
+    if(st>=s){n++; sum+=tf; if(m+0>pk) pk=m+0}
     last=tf
   }
-  END{ if(n>0) printf "###### STEADY tflops_mean=%.1f over %d pts  cluster=%.2f PF  peak_mem=%.2f GiB (%.1f%%)  last=%.1f\n", sum/n, n, sum/n*64/1000, pk, pk/276.50*100, last;
+  END{ if(n>0) printf "###### STEADY(>=%d) tflops_mean=%.1f over %d pts  cluster=%.2f PF  peak_mem=%.2f GiB (%.1f%%)  last=%.1f\n", s, sum/n, n, sum/n*64/1000, pk, pk/276.50*100, last;
        else print "###### STEADY no steps logged" }'
 grep -c "Retry\|ConnectionError" "$LOG" | sed 's/^/###### dataloader retries+connerrs: /'
 grep -c "Cubin file saved by TritonBundler not found" "$LOG" | sed 's/^/###### triton cubin misses: /'

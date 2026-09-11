@@ -10,6 +10,8 @@ from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw
 from torchtitan.components.quantization import (
+    Float8GroupedExpertsConverter,
+    Float8LinearConverter,
     MXFP8GroupedExpertsConverter,
     MXFP8LinearConverter,
 )
@@ -820,3 +822,163 @@ def gpt_oss_debugmodel_1k_mxfp8() -> Trainer.Config:
     config.compile.enable = True
     config.activation_checkpoint = SelectiveAC.Config()
     return _20b_mxfp8(config, flavor="debugmodel")
+
+
+def gpt_oss_120b_1k_ref_profile() -> Trainer.Config:
+    """The reference config with the torch profiler on, active at step 12.
+
+    This runs FIRST, before any of the arms above, because the dsv4 sweep on this
+    cluster spent an entire overnight batch of 13 experiments tuning parts of the
+    step that turned out to cost nothing -- one kernel was 58% of GPU time and
+    the expert GEMMs it had been optimising were 1.6%. One profiling run would
+    have redirected all of them. The 120B step here is 31.5% MFU, so roughly
+    two-thirds of the machine is going somewhere, and which lever matters depends
+    entirely on where.
+
+    Step 12 is after compile has settled (first-step compile dominates) but
+    before the steady state this config reaches around step 60-80. It profiles a
+    step whose *shape* is representative even though its throughput is not yet;
+    the kernel mix is what is being read, not the rate.
+
+    Set as a config rather than via --profiler.* flags so there is no question
+    about nested-key CLI spelling, and so the profiled configuration is the same
+    object the reference arm runs.
+    """
+    config = _120b_ref()
+    config.profiler.enable_profiling = True
+    config.profiler.profile_freq = 12
+    config.profiler.save_traces_folder = "/mnt/dgxc/traces/ref_120b"
+    return config
+
+
+# ---------------------------------------------------------------------------
+# FP8 rowwise, after MXFP8 turned out to be unavailable at this model's shape
+#
+# The MXFP8 debug gate (job 246) failed in the first backward:
+#
+#     cutedsl_quantize_2d_1x32.py:907
+#     AssertionError: K must be divisible by 128
+#
+# K there is the GEMM contraction dim, which for every expert GEMM in gpt-oss is
+# `dim` = 2880, and 2880 % 128 = 64. `pad_multiple` does not help: it pads the
+# per-expert TOKEN groups (the M dim), not K. torchao's grouped-MXFP8 path calls
+# `mxfp8_quantize_2d_1x32_cutedsl` unconditionally -- there is no kernel
+# preference to fall back to a Triton cast, and the flydsl sibling is the ROCm
+# one. So MXFP8 on gpt-oss needs either a padded-K kernel or a model dimension
+# it does not have. This is a different blocker from the one TUNING_RESULTS.md
+# recorded (that one was "no aarch64 build", which IS fixed -- see
+# MXFP8_120B.md, the kernels load and register fine on sm_103/torch 2.14).
+#
+# FP8 rowwise reaches the same tensor cores with an alignment this model meets:
+# `Float8GroupedExpertsConverter.PAD_MULTIPLE` is 16, and 2880 % 16 == 0. It
+# also needs nothing built: the GEMM is torch's own `_scaled_grouped_mm`, which
+# ships compiled in the torch 2.14 wheel, and both `Float8TrainingOpConfig` and
+# `Float8LinearConfig.from_recipe_name` are present in the venv's stock torchao
+# 0.18.0. No overlay, no sm_103 build, nothing to go silently missing.
+# ---------------------------------------------------------------------------
+
+
+def _fp8_120b(config: Trainer.Config, experts_only: bool = False) -> Trainer.Config:
+    """FP8 rowwise on the expert grouped GEMMs, optionally also the dense Linears.
+
+    `filter_fqns` on the Linear converter is an EXCLUDE list (unlike the MXFP8
+    converter's include-list `fqns`), so the two exclusions carry the same
+    intent the MXFP8 helper expressed by including only "attention": keep the
+    router gate and the lm_head in bf16. The router decides expert assignment
+    from 128 logits, and quantising lm_head puts fp8 error straight into the
+    loss. `module_filter_fn` independently skips any Linear whose in/out
+    features are not multiples of 16, which is what excludes `attn_sink`
+    (in_features=1).
+    """
+    converters: list = [
+        Float8GroupedExpertsConverter.Config(
+            model_compile_enabled=config.compile.enable
+            and "model" in config.compile.components,
+        ),
+    ]
+    if not experts_only:
+        converters.append(
+            Float8LinearConverter.Config(
+                model_compile_enabled=config.compile.enable
+                and "model" in config.compile.components,
+                recipe_name="rowwise",
+                filter_fqns=["lm_head", "router"],
+            )
+        )
+    config.model_spec = model_registry("120b", converters=converters)
+    return config
+
+
+def gpt_oss_120b_1k_fp8_experts() -> Trainer.Config:
+    """FP8 rowwise on the expert grouped GEMMs only. The primary lever.
+
+    Experts alone are ~57% of this model's per-token FLOPs -- 36 layers x 4
+    active experts x 3 GEMMs of 2880x2880 -- so this is where fp8 pays. Run
+    before the combined arm on purpose: the grouped-GEMM swap also replaces the
+    token dispatcher (`swap_token_dispatcher`), which is the part most likely to
+    interact with SelectiveAC and compile, and isolating it means a failure
+    points at one change.
+    """
+    return _fp8_120b(_120b_ref(), experts_only=True)
+
+
+def gpt_oss_120b_1k_fp8() -> Trainer.Config:
+    """FP8 rowwise on the expert grouped GEMMs and the attention Linears.
+
+    Adds the attention projections (~15% of per-token FLOPs) on top of the
+    experts' ~57%, for ~72% of the arithmetic in fp8.
+    """
+    return _fp8_120b(_120b_ref())
+
+
+def gpt_oss_120b_1k_fp8_bf16reduce() -> Trainer.Config:
+    """FP8 rowwise + bf16 gradient reduce-scatter: the arithmetic lever and the
+    bytes-on-the-wire lever together. Prediction is near-additive."""
+    return _fp8_120b(gpt_oss_120b_1k_bf16reduce())
+
+
+def gpt_oss_120b_1k_fp8_ep8() -> Trainer.Config:
+    """FP8 rowwise + EP=8."""
+    return _fp8_120b(_120b_ep(8))
+
+
+def gpt_oss_120b_1k_fp8_all() -> Trainer.Config:
+    """FP8 rowwise + bf16 reduce + EP=8."""
+    config = _120b_ep(8)
+    config.training.mixed_precision_reduce = "bfloat16"
+    return _fp8_120b(config)
+
+
+def gpt_oss_120b_1k_fp8_bs24() -> Trainer.Config:
+    """FP8 rowwise at bs=24, for spending memory fp8 frees.
+
+    fp8 expert weights are half the bytes of bf16 in the GEMM operands, and the
+    saved activations for the expert GEMMs are fp8 too, so unlike MXFP8 on dsv4
+    (which cost no memory and freed none) this may actually open batch headroom.
+    Sized against the measured footprint of the bs=18 arm rather than assumed.
+    """
+    return _fp8_120b(_120b_ep(1, local_batch_size=24))
+
+
+def gpt_oss_debugmodel_1k_fp8() -> Trainer.Config:
+    """4-GPU gate for the fp8 path, same role as the MXFP8 gate that caught the
+    K%128 assert in three minutes.
+
+    Uses the 120B converter surface rather than a narrower one, for the reason
+    the dsv4 work learned the hard way: a gate whose fqn set is smaller than the
+    real config's can pass while the real run dies on a module the gate never
+    converted.
+    """
+    config = _gpt_oss_debugmodel()
+    config.compile.enable = True
+    config.activation_checkpoint = SelectiveAC.Config()
+    converters: list = [
+        Float8GroupedExpertsConverter.Config(model_compile_enabled=True),
+        Float8LinearConverter.Config(
+            model_compile_enabled=True,
+            recipe_name="rowwise",
+            filter_fqns=["lm_head", "router"],
+        ),
+    ]
+    config.model_spec = model_registry("debugmodel", converters=converters)
+    return config
