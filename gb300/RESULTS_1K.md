@@ -87,9 +87,78 @@ FP8 rowwise is the lever either way, because its alignment requirement is one
 this model meets: `PAD_MULTIPLE` 16, and 2880 % 16 == 0. It also needs nothing
 built -- `torch._scaled_grouped_mm` is compiled into the torch 2.14 wheel.
 
-## Profile of the reference step
+## Profile of the reference step (job 253) -- this inverted the plan
 
-_pending -- runs first, and aims everything below._
+15 steps, profiler active at step 12, all 64 ranks traced. Read on rank1 and
+re-read on rank33 (a different node) because a single rank could be atypical;
+the two agree to within 1%.
+
+**Streams, rank1.** The numbers that matter are not the kernel totals but which
+stream they are on and whether they overlap:
+
+| | busy | share of span |
+| --- | --- | --- |
+| compute stream | 9490 ms | **98.1%** |
+| NCCL streams | 5599 ms | 57.9% |
+| union of both | 9652 ms | 99.8% |
+| **exposed NCCL** | **158 ms** | **1.6%** |
+| GPU idle | 22 ms | 0.2% |
+
+**97% of all communication is hidden behind compute, and the GPU is idle 0.2% of
+the step.** GPT-OSS-120B at bs=18 is compute-bound.
+
+**This contradicts the reading in `TUNING_RESULTS_120B.md`**, which said 120B is
+"more COMMUNICATION-bound: more parameters to all-gather per token of useful
+work". That was inferred from 120B reaching 56% of 20B's per-GPU throughput at
+the same batch, not measured, and it is wrong at this operating point. The
+all-gather is real and large -- 3666 ms, the single biggest kernel total in the
+trace -- it is simply overlapped.
+
+**What is actually on the critical path**, compute stream only (9480 ms):
+
+| bucket | ms | % | what it is |
+| --- | --- | --- | --- |
+| **expert grouped GEMM** | 4708 | **49.7%** | the MoE FFN; cutlass `enable_3x_kernel_for_sm10*` |
+| MoE dispatch/combine movement | 1730 | 18.2% | `tma_scatter_add`, `chunk_cat`, `split_with_sizes_copy`, `indexing_backward` |
+| triton pointwise (fused) | 1121 | 11.8% | routing, norms, activations |
+| **dense GEMM** | 936 | 9.9% | attention projections + lm_head; `nvjet_sm103_*` |
+| attention | 481 | 5.1% | flash-attn-4 fwd+bwd |
+| triton reduction | 278 | 2.9% | |
+| other / elementwise | 227 | 2.4% | |
+
+### How the queue was re-aimed
+
+**Half the critical path is one thing, and fp8 is pointed straight at it.**
+Expert GEMMs plus dense GEMMs are **59.6%** of the compute stream. At 1.5-2x on
+those kernels that is +25% to +42% on the step, which spans the target.
+
+**Two arms were cancelled as aimed at nothing.** `bf16reduce` standalone (job
+256) halves a 1942 ms reduce-scatter that is 97% hidden, and `ep8`/`ep16` (258,
+260) trade a hidden all-gather for an all-to-all that would also be hidden. On
+this profile they cannot pay.
+
+**But bf16 reduce is kept in combination, and that is not a hedge.** Comm is
+hidden only while compute is long enough to hide it: 5599 ms of NCCL sits under
+9490 ms of compute today, and if fp8 takes ~30% off the compute stream that
+becomes ~6600 ms against the same 5599 ms. Comm stops being free at roughly that
+point, so `fp8_bf16reduce` (259) tests a knob that the profile predicts is
+worthless *now* and valuable *after* fp8. Ordering matters more than the knob.
+
+**EP is kept only in combination with fp8**, and for a different reason than it
+was first queued: not the comm it removes, but GEMM shape. At EP=1 each rank
+runs 128 expert groups of ~4.6 k rows; at EP=8 it runs 16 groups of ~37 k rows.
+Same arithmetic, fewer and larger GEMMs. That is a compute-stream argument, and
+it is the only version of the EP hypothesis this profile leaves standing.
+
+### Caveat on the profile
+
+Taken at step 12, where the run is at ~540 TFLOP/s against a steady 787 -- so
+the compute stream at steady state is shorter than the 9490 ms measured here
+while the NCCL bytes are unchanged. That makes comm *relatively* larger in
+steady state than this trace shows, which is the direction that matters for the
+argument above and is why the bf16-reduce combination is still on the list. The
+kernel *mix* is what was read from it, and mix is not what changes between step
+12 and step 120.
 
 ## Measured
 
