@@ -1180,3 +1180,88 @@ def gpt_oss_120b_1k_ref_noautotune() -> Trainer.Config:
     """
     _maybe_disable_pointwise_autotune()
     return _120b_ref()
+
+
+# ---------------------------------------------------------------------------
+# After fp8 grouped mm turned out to be unavailable on sm_103
+#
+# Probes 270 and 271 settled it. On GB300 (capability 10,3):
+#
+#   torch._scaled_mm      2D rowwise   OK     <- the Float8Linear path
+#   torch._grouped_mm     bf16         OK     <- 49.7% of the reference step
+#   torch._scaled_grouped_mm fp8       ABORTS <- "Arch conditional MMA
+#   torchao fp8 grouped wrapper        ABORTS    instruction used without
+#                                                targeting appropriate
+#                                                compute capability"
+#
+# and it aborts identically under torch 2.14 and the 2.15.0.dev nightly. CUTLASS
+# calls abort() rather than raising, which is why the failure killed the process
+# instead of surfacing as an exception -- and why the first 120B fp8 job blamed
+# the Inductor autotuner: the autotuner was simply the first thing to touch the
+# kernel.
+#
+# So the expert grouped GEMM -- half the critical path -- cannot be quantized on
+# this hardware with this software. MXFP8 needs K % 128 == 0 and K is 2880;
+# fp8 needs an sm_103 kernel that neither torch build ships. What remains
+# reachable is the 2D path, which is the attention projections and lm_head:
+# 9.9% of the compute stream.
+#
+# The levers below are therefore aimed at making the bf16 expert GEMM itself
+# cheaper rather than narrower. The profile says it runs at ~898 TFLOP/s
+# against a 2503 bf16 peak -- about 36% -- which is low for GEMMs of this size,
+# and the most likely reason is shape: at EP=1 each rank runs 128 expert groups
+# of ~4.1k rows each (bs=16: 16*8192*4/128). Expert parallelism makes them
+# fewer and larger without changing the arithmetic.
+# ---------------------------------------------------------------------------
+
+
+def gpt_oss_120b_1k_fp8_linear() -> Trainer.Config:
+    """fp8 rowwise on the dense Linears only. The one quantization that runs.
+
+    Uses `Float8LinearConverter` alone, with no grouped-experts converter, so it
+    never touches `_scaled_grouped_mm` and never calls `swap_token_dispatcher`
+    -- which also means, unlike the other fp8 arms, this one changes exactly one
+    thing.
+
+    Ceiling is small and known in advance: dense GEMMs are 9.9% of the compute
+    stream, so even at 2x on those the step only shortens ~5%. Worth a slot
+    because it is the only arithmetic lever left and it composes with the EP
+    arms, not because it can reach the target on its own.
+
+    lm_head is excluded along with the router. It is the largest single Linear
+    (2880 x 201088) so including it would raise the ceiling, but fp8 error there
+    lands directly in the loss, and `ChunkedLossWrapper` already splits it.
+    """
+    config = _120b_ref()
+    config.model_spec = model_registry(
+        "120b",
+        converters=[
+            Float8LinearConverter.Config(
+                model_compile_enabled=True,
+                recipe_name="rowwise",
+                filter_fqns=["lm_head", "router"],
+            )
+        ],
+    )
+    return config
+
+
+def gpt_oss_120b_1k_ep8_fp8_linear() -> Trainer.Config:
+    """EP=8 for expert-GEMM shape, plus fp8 on the dense Linears.
+
+    The two surviving levers together. They are disjoint -- one changes the
+    shape of the MoE GEMMs, the other the precision of the attention ones -- so
+    if both are positive this should be close to additive.
+    """
+    config = _120b_ep(8)
+    config.model_spec = model_registry(
+        "120b",
+        converters=[
+            Float8LinearConverter.Config(
+                model_compile_enabled=True,
+                recipe_name="rowwise",
+                filter_fqns=["lm_head", "router"],
+            )
+        ],
+    )
+    return config
