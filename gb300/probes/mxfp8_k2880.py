@@ -20,9 +20,15 @@ from torchao.prototype.moe_training.mxfp8_grouped_mm import (
     _to_mxfp8_then_scaled_grouped_mm as MX,
 )
 
-E, K, N = 8, 2880, 2880          # gpt-oss-120b: dim 2880 -> dim 2880 (w2)
-M_PER = 4096                     # bs=16 -> 16*8192*4/128 = 4096 tokens/expert
-print(f"shapes: A=({M_PER*E},{K})  B_t=({E},{K},{N})   K%128={K % 128}  K%32={K % 32}")
+import os
+# 128 groups is the real case: gpt-oss-120b has 128 experts and runs
+# expert_parallel_degree=1, so every rank sees all of them. The first version of
+# this probe used 8, which sat under the CUDA swizzle's num_groups<=32 cap and
+# therefore did not exercise what the 64-GPU run actually does.
+E = int(os.environ.get("PROBE_E", "128"))
+K = N = 2880
+M_PER = int(os.environ.get("PROBE_M_PER", "4096"))   # bs=16 -> 16*8192*4/128
+print(f"shapes: A=({M_PER*E},{K})  B_t=({E},{K},{N})  groups={E}  K%128={K % 128}")
 
 A = torch.randn(M_PER * E, K, device=dev, dtype=torch.bfloat16, requires_grad=True)
 B_nk = torch.randn(E, N, K, device=dev, dtype=torch.bfloat16) / (K ** 0.5)

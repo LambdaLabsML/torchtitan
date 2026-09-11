@@ -1,8 +1,8 @@
 diff --git a/torchao/prototype/moe_training/mxfp8_grouped_mm.py b/torchao/prototype/moe_training/mxfp8_grouped_mm.py
-index eaf3a1c..4c4af70 100644
+index eaf3a1c..8684992 100644
 --- a/torchao/prototype/moe_training/mxfp8_grouped_mm.py
 +++ b/torchao/prototype/moe_training/mxfp8_grouped_mm.py
-@@ -108,6 +108,35 @@ def _to_mxfp8_then_scaled_grouped_mm(
+@@ -108,6 +108,46 @@ def _to_mxfp8_then_scaled_grouped_mm(
      return output
  
  
@@ -25,20 +25,31 @@ index eaf3a1c..4c4af70 100644
 +    same function uses for the *weights*, so it is not a new dependency -- only
 +    the activations were routed through CuTeDSL.
 +
-+    `mx_block_rearrange_2d_M_groups_cuda` then produces the same swizzled scale
-+    layout the SM100 grouped GEMM expects; it is the conversion this function
-+    already applies on the pre-quantized `MXTensor` path.
++    The scales are then swizzled into the layout the SM100 grouped GEMM expects,
++    the same conversion this function already applies on its pre-quantized
++    `MXTensor` path -- but through the Triton kernel rather than the CUDA one,
++    because the CUDA one caps num_groups at 32 and this model has 128.
 +    """
 +    if x.shape[-1] % 128 == 0:
 +        return mxfp8_quantize_2d_1x32_cutedsl(x, scaling_mode=scaling_mode, offs=offs)
++
++    from torchao.prototype.moe_training.kernels.mxfp8.quant import (
++        triton_mx_block_rearrange_2d_M_groups,
++    )
++
 +    qdata, scales = triton_to_mxfp8_dim0(x.contiguous(), block_size, scaling_mode)
-+    return qdata, mx_block_rearrange_2d_M_groups_cuda(scales, offs)
++    # The Triton swizzle, not mx_block_rearrange_2d_M_groups_cuda: the CUDA one
++    # asserts num_groups <= 32 (mxfp8_extension.cpp:203) and GPT-OSS-120B runs
++    # 128 expert groups per rank at expert_parallel_degree=1. The Triton kernel
++    # has no such cap. (Its docstring lists a third `output_group_start_offsets`
++    # argument; the registered op takes only two, and passing three raises.)
++    return qdata, triton_mx_block_rearrange_2d_M_groups(scales, offs)
 +
 +
  class _MXFP8GroupedMM(torch.autograd.Function):
      """
      Differentiable implementation of grouped GEMM with dynamic MXFP8 quantization.
-@@ -525,10 +554,11 @@ def _compute_fwd_sm100(
+@@ -525,10 +565,11 @@ def _compute_fwd_sm100(
                  padded_input_act.scales, padded_group_end_offsets
              )
      else:
@@ -53,7 +64,7 @@ index eaf3a1c..4c4af70 100644
          )
  
      # Quantize weights along dim0 (after transposing from (E, K, N) to (E, N, K))
-@@ -625,10 +655,11 @@ def _compute_dgrad_sm100(
+@@ -625,10 +666,11 @@ def _compute_dgrad_sm100(
                  grad_output.scales, group_end_offsets
              )
      else:

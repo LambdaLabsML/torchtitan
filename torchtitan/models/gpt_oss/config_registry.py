@@ -1265,3 +1265,32 @@ def gpt_oss_120b_1k_ep8_fp8_linear() -> Trainer.Config:
         ],
     )
     return config
+
+
+def gpt_oss_120b_1k_mxfp8_experts() -> Trainer.Config:
+    """MXFP8 on the expert grouped GEMMs only. The primary quantization arm.
+
+    Experts-only rather than experts+Linears, because the fp8 measurement says
+    the dense half is where the risk is: `gpt_oss_120b_1k_fp8_linear` (job 281)
+    quantized *only* the attention projections and measured 618.8 TFLOP/s
+    against the bf16 control's 771.9 -- **-19.8%** -- while freeing 37 GiB.
+
+    A 9.9% share of the compute stream cannot lose 20% by itself, so the cost is
+    almost certainly not the GEMMs: `Float8LinearConverter` sets
+    `torch._inductor.config.emulate_precision_casts = True` globally
+    (float8.py:122), which changes codegen for the *whole* model. The MX
+    converters do not set it, so MXFP8 should not inherit that penalty -- but
+    the cheap way to find out is to not convert the Linears at all, and put the
+    arm on the 49.7% that actually matters.
+    """
+    config = _120b_ref()
+    config.model_spec = model_registry(
+        "120b",
+        converters=[
+            MXFP8GroupedExpertsConverter.Config(
+                model_compile_enabled=True,
+                pad_multiple=128,
+            )
+        ],
+    )
+    return config

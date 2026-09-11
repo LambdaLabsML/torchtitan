@@ -16,19 +16,22 @@ dev = "cuda"
 torch.manual_seed(0)
 print(f"torch {torch.__version__}  capability {torch.cuda.get_device_capability()}")
 
-E, M_PER = 8, 2048
+import os
+E = int(os.environ.get("PROBE_E", "128"))
+M_PER = int(os.environ.get("PROBE_M_PER", "1024"))
 orig = M._quantize_2d_1x32_blocked
 
 
 def force(which):
     def f(x, scaling_mode, offs, block_size=32):
         if which == "triton":
+            # Exactly what the patch does, so this compares the shipped path.
             from torchao.prototype.mx_formats.kernels import triton_to_mxfp8_dim0
-            from torchao.prototype.moe_training.kernels.mxfp8 import (
-                mx_block_rearrange_2d_M_groups_cuda,
+            from torchao.prototype.moe_training.kernels.mxfp8.quant import (
+                triton_mx_block_rearrange_2d_M_groups,
             )
             q, s = triton_to_mxfp8_dim0(x.contiguous(), block_size, scaling_mode)
-            return q, mx_block_rearrange_2d_M_groups_cuda(s, offs)
+            return q, triton_mx_block_rearrange_2d_M_groups(s, offs)
         from torchao.prototype.moe_training.kernels.mxfp8 import (
             mxfp8_quantize_2d_1x32_cutedsl,
         )
@@ -40,7 +43,7 @@ def rel(a, b):
     return ((a.float() - b.float()).norm() / b.float().norm().clamp(min=1e-12)).item()
 
 
-for K in (2944, 2816, 3072):
+for K in (2944, 2816):
     assert K % 128 == 0
     A0 = torch.randn(M_PER * E, K, device=dev, dtype=torch.bfloat16)
     B_nk = torch.randn(E, K, K, device=dev, dtype=torch.bfloat16) / (K ** 0.5)
@@ -56,6 +59,6 @@ for K in (2944, 2816, 3072):
         torch.cuda.synchronize()
         outs[which], grads[which] = o.detach(), A.grad.detach()
     M._quantize_2d_1x32_blocked = orig
-    print(f"  K={K:5d}  out rel {rel(outs['triton'], outs['cutedsl']):.8f}   "
+    print(f"  groups={E} K={K:5d}  out rel {rel(outs['triton'], outs['cutedsl']):.8f}   "
           f"d(A) rel {rel(grads['triton'], grads['cutedsl']):.8f}")
 print("done")
