@@ -982,3 +982,82 @@ def gpt_oss_debugmodel_1k_fp8() -> Trainer.Config:
     ]
     config.model_spec = model_registry("debugmodel", converters=converters)
     return config
+
+
+# ---------------------------------------------------------------------------
+# Wave 2: the remaining comms knob, and batch retunes for whatever frees memory
+# ---------------------------------------------------------------------------
+
+
+def gpt_oss_120b_1k_symmmem() -> Trainer.Config:
+    """FSDP all-gather over NVLink symmetric memory.
+
+    Worth a slot here for a reason it was not on dsv4, where it measured flat and
+    cost +8 GiB: at EP=1 this model all-gathers every layer's full 128-expert
+    weight stack, ~6.4 GB of bf16 per layer and ~229 GB per step, which is the
+    largest single thing FSDP does. dsv4 ran at EP=16 with experts already
+    rank-local, so there was far less all-gather for symmetric memory to
+    accelerate.
+
+    Requires compute capability >= 9.0; GB300 reports (10, 3).
+    """
+    config = _120b_ref()
+    config.parallelism.enable_fsdp_symm_mem = True
+    return config
+
+
+def gpt_oss_120b_1k_fp8_symmmem() -> Trainer.Config:
+    """fp8 arithmetic + symmetric-memory all-gather."""
+    config = _120b_ref()
+    config.parallelism.enable_fsdp_symm_mem = True
+    return _fp8_120b(config)
+
+
+def gpt_oss_120b_1k_fp8_bs20() -> Trainer.Config:
+    """fp8 at bs=20. One step of batch, for the case where fp8 frees a little.
+
+    Job 56 sits at 232.96 GiB of 276.50 (84.25%) with ~15 GiB spare, and
+    SelectiveAC costs ~10.8 GiB per batch unit -- so bs=20 is roughly the most
+    the reference footprint can absorb without a lever that frees memory.
+    On 120B, unlike 20B, SelectiveAC at 98.7% measured no penalty at all
+    (786.1 against 786.9 at 84.2%), so sitting high here is not the cliff risk
+    it was on the smaller model.
+    """
+    return _fp8_120b(_120b_ep(1, local_batch_size=20))
+
+
+def gpt_oss_120b_1k_fp8_bf16reduce_bs20() -> Trainer.Config:
+    """Everything positive, at the largest batch the reference footprint allows."""
+    config = _120b_ep(1, local_batch_size=20)
+    config.training.mixed_precision_reduce = "bfloat16"
+    return _fp8_120b(config)
+
+
+def gpt_oss_120b_1k_sac_gmm_bs6() -> Trainer.Config:
+    """SelectiveAC that also saves the expert GEMM, at the batch its memory allows.
+
+    Recorded and left UNQUEUED unless the primary levers fall short, because the
+    120B numbers already price this trade and it looks like a loss.
+
+    On 20B it was worth +13.9% at an identical batch (859.6 -> 979.5), by
+    removing the expert-GEMM recompute that per-op SelectiveAC does by default.
+    But it cost 11.80 GiB per batch unit there, which scales to ~17.7 on 120B's
+    36 layers, and with SelectiveAC's own ~10.8 that is ~28.5 GiB per batch unit
+    against a ~60 GiB fixed term -- about bs=6 at 90% of HBM, against the
+    reference's 18.
+
+    The 120B sweep already measured the two ends of exactly this trade-off:
+    saving everything (no-AC) affords bs=3 and gives 455.3, saving little
+    (SelectiveAC) affords bs=18 and gives 786.9. This config sits between them
+    at bs=6, and nothing in those two points suggests the middle wins. Two
+    earlier attempts at bs=5 (jobs 62 and 67) died at init with exit 137 before
+    producing a step, so it is also the riskiest use of a slot.
+
+    Needs `save_grouped_mm` on SelectiveAC.Config, which is on branch
+    perf/sac-save-grouped-mm and is NOT cherry-picked here -- so this function
+    will raise until it is. Left that way on purpose: the config records the
+    reasoning without implying the code is in place.
+    """
+    config = _120b_ep(1, local_batch_size=6)
+    config.activation_checkpoint = SelectiveAC.Config(save_grouped_mm=True)
+    return config
