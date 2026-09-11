@@ -198,6 +198,8 @@ inside this cluster's ~2% noise floor, so the launcher and worktree are sound.
 
 | job | arm | bs | TFLOP/s/GPU | cluster | mem | vs control | note |
 | --- | --- | --- | --- | --- | --- | --- | --- |
+| **296** | **`_1k_bf16reduce`, 250 steps** | 16 | **810.7** | **51.88 PF** | **80.6%** | **+5.0%** | **best; +3.0% vs job 56** |
+| 293 | `_1k_bf16reduce`, 200 steps | 16 | 794.2 | 50.83 PF | 80.6% | +2.9% | clean |
 | 56 | `sac_compile` (the reference) | 16 | 786.9 | 50.36 PF | 84.2% | +1.9% | 250 steps, prior sweep |
 | **263** | **`_1k_ref` (control)** | 16 | **771.9** | **49.40 PF** | **84.3%** | — | clean |
 | 254 | `_1k_ref_bs18` | 18 | 730.6 | 46.76 PF | 92.1% | -5.4% | **contaminated**, see below |
@@ -207,8 +209,22 @@ inside this cluster's ~2% noise floor, so the launcher and worktree are sound.
 | 286 | `_1k_mxfp8_experts` | 16 | — | — | — | — | **grad_norm NaN at step 1** |
 | 287 | `_1k_mxfp8` | 16 | — | — | — | — | cancelled after 286 |
 
-**Nothing beat the control.** The target was +29.6% over 771.9 (or +27.1% over
-job 56's 786.9) and the best measured arm is the control itself.
+**Best: `gpt_oss_120b_1k_bf16reduce` at 810.7 TFLOP/s/GPU, 51.88 PFLOP/s across
+64 GPUs, 32.4% MFU, 222.79 GiB (80.6%).** Against job 56 measured the same way
+-- 250 steps, steady state from step 100 -- that is **+3.0%**, and it uses 10 GiB
+less memory.
+
+**The 1000 target was not reached.** It needed +27.1% over job 56 and the only
+lever that moved gave +3.0%. Why, in one line: half the critical path is the
+bf16 expert grouped GEMM, and every route to quantizing it is blocked by an
+sm_103 kernel gap or an unresolved NaN -- see the section below.
+
+Note the run-length effect when comparing rows: this config reads 794.2 over
+200 steps and 810.7 over 250, because throughput is still climbing through the
+first ~100 steps and a longer run's steps>=100 window contains proportionally
+more of the settled region. Job 56's 786.9 is a 250-step number, so **810.7 is
+the row to compare it with**; 794.2 is the row to compare against the 200-step
+control's 771.9.
 
 ### fp8 on the dense Linears: -19.8%, and the reason is not the GEMMs
 
