@@ -1347,3 +1347,24 @@ def gpt_oss_120b_1k_bf16reduce_seeded() -> Trainer.Config:
     config = gpt_oss_120b_1k_bf16reduce()
     config.debug.seed = 42
     return config
+
+
+def gpt_oss_120b_1k_mxfp8_dbg_anomaly() -> Trainer.Config:
+    """MXFP8 experts at bs=4 with autograd anomaly detection.
+
+    Five mechanisms for the step-1 NaN have now been refuted by measurement
+    (zero-padded scales, wgrad over padding, Inductor lowering, swizzle
+    disagreement, and tail slack past the last offset), so guessing a sixth is
+    the wrong move. Anomaly detection names the operation that first emits a
+    non-finite gradient, which separates the two remaining candidates -- an
+    FSDP/DTensor interaction versus real activation magnitudes overflowing e4m3
+    -- without another round of hypothesis-first probing.
+
+    Deliberately uncompiled: anomaly detection reports little useful inside a
+    compiled region, and job 290 established the NaN does not need compile.
+    Expensive per step, which is why it is 12 steps at bs=4 -- the NaN appears
+    at step 1.
+    """
+    config = gpt_oss_120b_1k_mxfp8_dbg_bs4_nocompile()
+    config.debug.detect_anomaly = True
+    return config

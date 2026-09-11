@@ -344,22 +344,36 @@ Ruled out by measurement rather than argument:
 | Inductor lowers the mxfp8 path wrongly | same config with `compile.enable=False` | **refuted** -- NaN either way |
 | the patched swizzle disagrees with CuTeDSL | compare at K where both are legal | **refuted** -- bit-identical |
 
-What remains untested, and is where the next session should start:
+A fifth hypothesis was raised and then also refuted, which is worth recording
+because it was the most specific one:
 
-1. **`GptOssGroupedExperts` passes `offs` that do not cover all of `x_RD`.**
-   `offsets_E` is the cumsum of real token counts, while `x_RD` carries extra
-   `tail_slack` rows. The CuTeDSL cast is offset-aware; `triton_to_mxfp8_dim0`
-   is not -- it casts every row, and the swizzle then sizes itself from the full
-   row count rather than from `offs[-1]`. If the grouped GEMM expects a scale
-   layout sized by groups, that is a layout mismatch the isolated probes would
-   not reproduce, because they construct `offs` that cover exactly all rows.
-   **This is the leading hypothesis and it was not tested.**
-2. FSDP/DTensor interaction. `GptOssGroupedExperts.forward` calls `.to_local()`
-   on all four expert parameters; the dsv4 sweep hit a closely related failure
-   where an MXFP8 tensor subclass met a raw-weight read under FSDP.
-3. Per-parameter gradient inspection to name which tensor goes non-finite
-   first, which would settle 1 vs 2 immediately and needs one instrumented
-   12-step run.
+**`GptOssGroupedExperts` passes `offs` that do not cover all of `x_RD`.**
+`offsets_E` is the cumsum of real token counts while `x_RD` carries extra
+`tail_slack` rows, and the CuTeDSL cast is offset-aware where
+`triton_to_mxfp8_dim0` is not. Every earlier probe had built `offs` covering
+exactly all rows, so none reproduced it. Probe 295 added 512 slack rows and
+compared both casts at K=2944:
+
+    tail_slack=0     out 0.00000000   d(A) 0.00000000   d(B) 0.00000000
+    tail_slack=512   out 0.00000000   d(A) 0.00000000   d(B) 0.00000000
+
+Bit-identical. **Refuted.**
+
+What remains, and is where the next session should start:
+
+1. **FSDP/DTensor interaction.** `GptOssGroupedExperts.forward` calls
+   `.to_local()` on all four expert parameters before the grouped mm. The dsv4
+   sweep hit a closely related failure where an MXFP8 tensor subclass met a
+   raw-weight read under FSDP, and this is now the largest untested difference
+   between the probes (single GPU, plain tensors) and the run (64 ranks,
+   DTensor-sharded experts).
+2. **Real activation magnitudes.** Every probe used `randn`. e4m3 saturates at
+   448 and GPT-OSS is a model with large activation outliers; a block whose
+   amax pushes scaled values past 448 would produce inf. The swiglu clamp
+   (+-7) bounds what reaches mlp2 but not what reaches mlp1.
+3. **Name the op.** One 12-step run with `--debug.detect-anomaly` would say
+   which operation first produces a non-finite gradient and would separate 1
+   from 2 immediately. Queued as `gpt_oss_120b_1k_mxfp8_dbg_anomaly`.
 
 ### What would actually unblock the target
 
