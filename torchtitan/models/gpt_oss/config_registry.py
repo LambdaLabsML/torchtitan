@@ -638,10 +638,45 @@ def gpt_oss_120b_gb300_sac_compile_maxbs() -> Trainer.Config:
 
 
 def _120b_ref() -> Trainer.Config:
-    """Job 56's actual configuration: `sac_compile` at bs=18, not the bs=16 the
-    registry function defaults to. The 84.25% memory in its log matches bs=18,
-    and the sweep ran it with a command-line override. Pinned here so every
-    comparison below has a control that needs no override to reproduce.
+    """Job 56's actual configuration: `sac_compile` at **bs=16**.
+
+    `TUNING_RESULTS_120B.md` records job 56 as bs=18. That is an error in the
+    table, and three independent readings say so:
+
+      - job 56's step-1 memory is 219.44 GiB (79.36%), and the registry's own
+        8-step probe comment records "bs=16 79.4%". bs=18 does not land there.
+      - job 56 steady-states at 232.96 GiB (84.25%); job 60 at bs=20 reaches
+        273.00 GiB (98.73%). That is 3.62 percentage points per batch unit, so
+        bs=18 predicts ~91.5%.
+      - measured: bs=18 runs at 254.56 GiB (92.07%). Exactly the prediction,
+        and 21.6 GiB -- two batch units -- above job 56.
+
+    So job 56 ran the registry default with no override, and bs=16 is the
+    configuration the 786.9 TFLOP/s reference belongs to. Pinned explicitly
+    rather than inherited, so this cannot drift again.
+    """
+    config = gpt_oss_120b_gb300_sac_compile()
+    config.training.local_batch_size = 16
+    return config
+
+
+def gpt_oss_120b_1k_ref_bs18() -> Trainer.Config:
+    """bs=18, measured in job 254 and kept because the number is interesting.
+
+    It sits between two configurations that both run well -- bs=16 at 84.25%
+    gives 786.9 and bs=20 at 98.73% gives 786.1 -- and is worse than either:
+    16,050 tokens/s/GPU against job 56's 17,626, i.e. 0.510 s per batch unit
+    against 0.465. Non-monotonic in batch, which is not what a memory-pressure
+    story would predict.
+
+    That reading is NOT clean, and the run is recorded as contaminated: the
+    login node is one of the 16 allocated nodes, and NFS- and /tmp-heavy
+    commands were run on it during steps 40-100 (a `du` over a 17 GB Inductor
+    cache, `find` walks over NFS). Job 254 logged 5 dataloader retries where
+    job 56 logged 0, and its throughput dips line up in time with those
+    commands. Whether bs=18 is genuinely a worse operating point is therefore
+    unresolved, and this config exists to settle it on a quiet cluster rather
+    than to assert it.
     """
     config = gpt_oss_120b_gb300_sac_compile()
     config.training.local_batch_size = 18
@@ -700,7 +735,7 @@ def gpt_oss_120b_1k_bf16reduce() -> Trainer.Config:
     return config
 
 
-def _120b_ep(degree: int, local_batch_size: int = 18) -> Trainer.Config:
+def _120b_ep(degree: int, local_batch_size: int = 16) -> Trainer.Config:
     config = _120b_ref()
     config.parallelism.expert_parallel_degree = degree
     config.training.local_batch_size = local_batch_size
