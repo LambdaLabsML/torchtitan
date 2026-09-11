@@ -1,5 +1,39 @@
 # GPT-OSS-120B: the push from 787 to 1000 TFLOP/s/GPU on 64x GB300
 
+## Summary
+
+**Best config: `gpt_oss_120b_1k_bf16reduce` -> 810.7 TFLOP/s/GPU, 51.88 PFLOP/s
+across 64 GPUs, 32.4% MFU, 222.79 GiB (80.6%).** +3.0% over job 56 measured
+identically (250 steps, steady state from step 100), using 10 GiB less memory.
+
+**The 1000 target was not reached, and it is not reachable by configuration on
+this software stack.** The binding reason is specific and measured: a profile of
+the reference step shows GPT-OSS-120B is **compute-bound** (97% of NCCL hidden,
+GPU idle 0.2%), with **49.7% of the critical path in the bf16 expert grouped
+GEMM** running at ~36% of the bf16 peak. Closing a 27% gap means quantizing that
+GEMM, and every route is blocked below this repository:
+
+- **fp8 grouped mm aborts on sm_103** -- CUTLASS arch-conditional MMA, identically
+  on torch 2.14.0 and the 2.15.0.dev nightly. `abort()`, not an exception.
+- **MXFP8 grouped mm needed K % 128 == 0** and GPT-OSS contracts over 2880. Fixed
+  here (`gb300/patches/torchao-mxfp8-nonmultiple-128-K.patch`) and verified
+  bit-identical to the kernel it replaces -- but the 64-GPU run then produces a
+  **non-finite gradient at step 1**, with overflow (not a bad backward node) the
+  leading hypothesis after anomaly detection came back empty.
+
+What moved, what did not, and what would unblock the target are below. Five NaN
+hypotheses were refuted by measurement and are recorded so the next session does
+not re-test them.
+
+| arm | result |
+| --- | --- |
+| bf16 gradient reduce | **+3.0%** -- the only lever that moved |
+| symmetric-memory all-gather | see table |
+| fp8 on dense Linears | -19.8% (a global Inductor flag, not the GEMMs) |
+| expert parallelism, EP=8 / EP=16 | OOM at bs=16 |
+| MXFP8 on expert GEMMs | runs after a kernel patch; NaN gradient at 64 GPUs |
+| batch size | no lever -- already flat between bs=16 and bs=20 |
+
 16 nodes x 4 GB300, `seq_len=8192`, SelectiveAC + model compile, C4 from locally
 staged shards, `--training.disable-cuda-graphs`. 200 steps per screening arm;
 **steady state is steps >= 100**, the same window every number in
