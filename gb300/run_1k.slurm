@@ -87,6 +87,10 @@ export NCCL_SOCKET_IFNAME=enP22s22f0np0
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export PYTORCH_ALLOC_CONF="expandable_segments:True"
 export PYTHONFAULTHANDLER=1
+# Without this, torchtitan's INFO (stdout) sits in a block buffer while only
+# stderr warnings reach the log, so a job that is 13 minutes into a cold Triton
+# compile looks identical to one that is hung. Affects visibility only.
+export PYTHONUNBUFFERED=1
 # Per-job, or jobs share a cache and recompile mid-run. Must be set here:
 # $SLURM_JOB_ID is unknown at submit time.
 # Opt-in escape from the Inductor pointwise-autotune crash in the fp8 path; read
