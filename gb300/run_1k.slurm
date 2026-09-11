@@ -89,6 +89,12 @@ export PYTORCH_ALLOC_CONF="expandable_segments:True"
 export PYTHONFAULTHANDLER=1
 # Per-job, or jobs share a cache and recompile mid-run. Must be set here:
 # $SLURM_JOB_ID is unknown at submit time.
+# Opt-in escape from the Inductor pointwise-autotune crash in the fp8 path; read
+# by _maybe_disable_pointwise_autotune() in the config registry. Exported
+# explicitly rather than relied on from sbatch's environment inheritance, so the
+# job output records which setting it ran under.
+export GPTOSS_1K_NO_POINTWISE_AUTOTUNE=${GPTOSS_1K_NO_POINTWISE_AUTOTUNE:-0}
+echo "###### GPTOSS_1K_NO_POINTWISE_AUTOTUNE=$GPTOSS_1K_NO_POINTWISE_AUTOTUNE"
 export TRITON_CACHE_DIR="/mnt/dgxc/triton-cache/$SLURM_JOB_ID"
 mkdir -p "$TRITON_CACHE_DIR"
 
