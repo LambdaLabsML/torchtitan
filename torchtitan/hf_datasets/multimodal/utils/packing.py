@@ -71,8 +71,22 @@ class MMSamplePacker:
                 self._sample_buffer.clear()
                 break
 
-            # Incomplete sequence — keep in buffer for future samples
-            if not flush and current_length < self.max_seq_length:
+            # The scan above already appended every sample that still fits, and
+            # current_length only grows, so a sample skipped earlier cannot fit
+            # later in the same scan: this bin is maximal for the current buffer.
+            #
+            # The original test here was `current_length < self.max_seq_length`,
+            # which only emitted a bin that filled max_seq_length EXACTLY. For
+            # any dataset whose sample lengths do not happen to sum to it (i.e.
+            # essentially all of them -- cc12m samples are 250-450 tokens vs
+            # seq_len 4096) nothing was ever emitted, the buffer grew without
+            # bound and the dataloader hung forever. Repro: feed 2000 samples of
+            # random length 250-450 and packed_samples stays empty.
+            #
+            # Instead, keep an under-full bin only while the buffer still has
+            # room for samples that might fill it better; once the buffer is at
+            # capacity, emit the maximal bin so the loop makes progress.
+            if not flush and len(self._sample_buffer) < self.buffer_size:
                 break
 
             samples = [self._sample_buffer.pop(sid) for sid in picked_ids]
