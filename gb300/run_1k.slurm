@@ -99,8 +99,19 @@ export PYTHONUNBUFFERED=1
 # job output records which setting it ran under.
 export GPTOSS_1K_NO_POINTWISE_AUTOTUNE=${GPTOSS_1K_NO_POINTWISE_AUTOTUNE:-0}
 echo "###### GPTOSS_1K_NO_POINTWISE_AUTOTUNE=$GPTOSS_1K_NO_POINTWISE_AUTOTUNE"
-export TRITON_CACHE_DIR="/mnt/dgxc/triton-cache/$SLURM_JOB_ID"
-mkdir -p "$TRITON_CACHE_DIR"
+# Per job AND node-local. Per job because a shared cache causes mid-run
+# recompiles ("Cubin file saved by TritonBundler not found" -- 145 in one job of
+# an earlier sweep and 4 in the next), which makes sub-2% differences
+# meaningless. Node-local because /mnt/dgxc is NFS and Triton's on-disk locking
+# does not hold across it: job 279 died with
+#
+#   FileNotFoundError: /mnt/dgxc/triton-cache/279/UXMPE.../to_mxfp8_dim0_kernel...
+#
+# when 64 ranks on 16 nodes first compiled the mxfp8 cast kernels at once. The
+# bf16 arms never hit it because they compile at model build, more serially.
+# /tmp keeps 4 local ranks per directory, which Triton's locking does handle.
+export TRITON_CACHE_DIR="/tmp/triton-cache-$SLURM_JOB_ID"
+srun --ntasks-per-node=1 mkdir -p "$TRITON_CACHE_DIR"
 
 PROF_ARGS=()
 if [ "$PROFILE" != "0" ]; then
@@ -138,4 +149,5 @@ sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -oE "step: +[0-9]+ .*" | \
 grep -c "Retry\|ConnectionError" "$LOG" | sed 's/^/###### dataloader retries+connerrs: /'
 grep -c "Cubin file saved by TritonBundler not found" "$LOG" | sed 's/^/###### triton cubin misses: /'
 [ $rc -ne 0 ] && sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -E "AssertionError|RuntimeError|OutOfMemory|torch\..*Error|Error:" | tail -3 | cut -c1-220
+srun --ntasks-per-node=1 rm -rf "$TRITON_CACHE_DIR" 2>/dev/null
 exit $rc
