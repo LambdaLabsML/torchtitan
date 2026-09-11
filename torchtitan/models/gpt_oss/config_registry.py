@@ -1098,3 +1098,34 @@ def gpt_oss_120b_1k_sac_gmm_bs6() -> Trainer.Config:
     config = _120b_ep(1, local_batch_size=6)
     config.activation_checkpoint = SelectiveAC.Config(save_grouped_mm=True)
     return config
+
+
+# ---------------------------------------------------------------------------
+# Numerics check for fp8, seeded so the comparison is actually a comparison
+# ---------------------------------------------------------------------------
+
+
+def gpt_oss_120b_1k_ref_seeded() -> Trainer.Config:
+    """bf16 control for the fp8 loss comparison, with a fixed seed.
+
+    The seed is the whole point. On this cluster the init/data seed is not fixed
+    by default and step-1 loss has spanned 11.80-12.60 across runs with
+    bit-identical effective configurations, so an unseeded loss curve cannot
+    show whether fp8 changed anything. With `--debug.seed` pinned, the bf16 and
+    fp8 curves start from the same weights on the same data and any divergence
+    is attributable.
+
+    Short on purpose: fp8's effect on loss, if it has one, shows in the first
+    tens of steps, and this is a check on numerics rather than a throughput
+    measurement.
+    """
+    config = _120b_ref()
+    config.debug.seed = 42
+    return config
+
+
+def gpt_oss_120b_1k_fp8_seeded() -> Trainer.Config:
+    """fp8 arm of the seeded loss comparison. Pairs with the config above."""
+    config = _120b_ref()
+    config.debug.seed = 42
+    return _fp8_120b(config)
