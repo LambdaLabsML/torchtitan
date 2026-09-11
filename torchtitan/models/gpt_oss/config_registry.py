@@ -588,3 +588,235 @@ def gpt_oss_120b_gb300_sac_compile_maxbs() -> Trainer.Config:
     config = gpt_oss_120b_gb300_sac_compile()
     config.training.local_batch_size = 20
     return config
+
+
+# ---------------------------------------------------------------------------
+# The push to 1000 TFLOP/s/GPU on 64x GB300 (branch lambda_64xgb300_gptoss120b_1k)
+#
+# Reference is job 56, `gpt_oss_120b_gb300_sac_compile` at bs=18: 786.9
+# TFLOP/s/GPU steady-state (810.2 at step 250), 232.96 GiB (84.25%). Reaching
+# 1000 needs +27% on that, which is more than any remaining memory/batch knob
+# can give -- the 120B sweep already spent those, and bs=20 bought -0.1%.
+#
+# So these configs go after the two costs the 120B sweep never touched, both of
+# which are large *because* 120B runs at EP=1 with fp32 gradient reduction:
+#
+#   1. MXFP8 on the expert grouped GEMMs and the attention Linears. The MoE FFN
+#      is ~57% of this model's per-token FLOPs (36 layers x 4 active experts x
+#      3 x 2880^2) and the attention projections another ~15%, so this is the
+#      only lever aimed at the majority of the arithmetic. It was recorded as
+#      "blocked: SM100 kernels absent" in TUNING_RESULTS.md -- that was a
+#      packaging gap, not a hardware one, and it is now fixed; see
+#      gb300/MXFP8_120B.md.
+#   2. The fp32 gradient reduce-scatter. At EP=1 every one of the ~114 B expert
+#      parameters is reduce-scattered in fp32 on every step. On Qwen3.5-122B,
+#      a comparable model, that collective measured ~25% of the step and 65% of
+#      all NCCL time. bf16 halves those bytes.
+#
+# and at the interaction the sweep left open: expert parallelism. 120B has only
+# ever run EP=1, where FSDP must all-gather every layer's full 128-expert weight
+# stack (3.19 B params = 6.4 GB bf16 per layer, ~229 GB per step) on every rank.
+# EP shards the experts instead, trading that all-gather for a token all-to-all.
+# Job 105 showed EP=8 runs and costs 48.36 GiB against the baseline's 68.33 at
+# bs=1, so it does cut the gathered-weight buffers substantially.
+#
+# The sign of EP at bs=18 is genuinely unknown rather than predicted: the
+# weight all-gather EP removes is fixed, but the all-to-all it adds scales with
+# tokens, so EP's advantage shrinks as batch grows and these run at 18x the
+# batch job 105 used. That is what makes it worth a measurement.
+#
+# IMPORTANT -- all TFLOP/s here are on torchtitan's STOCK FLOP accounting, the
+# same as job 56, so they are directly comparable to it. That accounting charges
+# sliding-window layers the full O(L^2) attention cost; branch
+# perf/flops-sliding-window corrects it and lowers every 120B number by ~18%
+# (786.9 -> 665.0). Deliberately NOT merged here: changing the denominator
+# mid-comparison would make these runs incomparable to the reference.
+# ---------------------------------------------------------------------------
+
+
+def _120b_ref() -> Trainer.Config:
+    """Job 56's actual configuration: `sac_compile` at bs=18, not the bs=16 the
+    registry function defaults to. The 84.25% memory in its log matches bs=18,
+    and the sweep ran it with a command-line override. Pinned here so every
+    comparison below has a control that needs no override to reproduce.
+    """
+    config = gpt_oss_120b_gb300_sac_compile()
+    config.training.local_batch_size = 18
+    return config
+
+
+def gpt_oss_120b_1k_ref() -> Trainer.Config:
+    """Control. Re-measures job 56 under this branch's launcher.
+
+    Not redundant with job 56: this branch runs with a per-job TRITON_CACHE_DIR,
+    and every other row here is a 100-step run whose steady-state window is
+    steps 50-100 rather than 100-250. Comparing a 100-step arm against a
+    250-step number would fold the difference in window into the result.
+    """
+    return _120b_ref()
+
+
+def _mxfp8_120b(config: Trainer.Config) -> Trainer.Config:
+    """MXFP8 on the expert grouped GEMMs + the attention Linears, at 120B.
+
+    Shares `_20b_mxfp8`'s body -- it is already parameterised by flavor, and the
+    reasoning carries over unchanged: gpt-oss has no shared experts and no dense
+    per-layer feed_forward, so every layer's FFN is the MoE and "attention" is
+    the whole dense-Linear surface. Router gate and lm_head stay bf16.
+    """
+    return _20b_mxfp8(config, flavor="120b")
+
+
+def gpt_oss_120b_1k_mxfp8() -> Trainer.Config:
+    """MXFP8 at job 56's batch. The single largest untried lever.
+
+    Batch is held at 18 on purpose. MXFP8 on dsv4 cost no memory at all (peak
+    243.23 GiB against bf16's 243.21), so there should be nothing to re-tune,
+    and holding the batch keeps this a clean one-variable comparison against
+    `_1k_ref`. If it does shift memory, the follow-up tunes batch against the
+    measurement instead of a guess.
+    """
+    return _mxfp8_120b(_120b_ref())
+
+
+def gpt_oss_120b_1k_bf16reduce() -> Trainer.Config:
+    """bf16 gradient reduce-scatter at job 56's batch.
+
+    CHANGES NUMERICS -- bf16 reduction across 64 shards accumulates rounding
+    error that the fp32 default exists to avoid. Paired with a fixed
+    --debug.seed control run rather than judged on its loss curve alone, because
+    on this cluster the init/data seed is not fixed by default and step-1 loss
+    spans 11.80-12.60 across runs, so an unseeded loss comparison proves nothing.
+
+    Expected to matter far more here than the +0.6% it gave on dsv4: there, EP=64
+    made every expert rank-local so the flag only touched ~21.6 B non-expert
+    parameters. At EP=1 it touches all ~117 B.
+    """
+    config = _120b_ref()
+    config.training.mixed_precision_reduce = "bfloat16"
+    return config
+
+
+def _120b_ep(degree: int, local_batch_size: int = 18) -> Trainer.Config:
+    config = _120b_ref()
+    config.parallelism.expert_parallel_degree = degree
+    config.training.local_batch_size = local_batch_size
+    return config
+
+
+def gpt_oss_120b_1k_ep8() -> Trainer.Config:
+    """EP=8 at job 56's batch, isolating the parallelism change.
+
+    EP=8 was dsv4's joint optimum (with 16) and is the middle of the range that
+    divides 64. Batch held at 18 so this is one variable against `_1k_ref`; the
+    memory it frees is spent in the `_maxbs` variants once it has been measured
+    rather than predicted.
+    """
+    return _120b_ep(8)
+
+
+def gpt_oss_120b_1k_ep16() -> Trainer.Config:
+    """EP=16. dsv4's operating point -- same speed as EP=8 and 14 GiB cheaper.
+
+    On dsv4 the EP optimum was interior: 4 collapsed (each rank all-gathers its
+    whole group's experts), 64 fanned the all-to-all across all 16 nodes over IB.
+    8 and 16 tied. Both are measured here because that optimum is a property of
+    the model's expert count and token volume, not only of the cluster, and
+    gpt-oss-120B has 128 experts against dsv4's 384.
+    """
+    return _120b_ep(16)
+
+
+def gpt_oss_120b_1k_ep4() -> Trainer.Config:
+    """EP=4, one node's worth -- keeps the all-to-all inside a node.
+
+    The case for it on this cluster is that a 4-GPU EP group is exactly one node,
+    so the dispatch never crosses IB. The case against is dsv4's EP=4 result
+    (-66%), where 96 experts per rank drove the gathered weights to 96% of HBM.
+    gpt-oss at EP=4 holds 32 experts per rank, a quarter of that per-layer
+    weight, so the failure mode may simply not apply.
+    """
+    return _120b_ep(4)
+
+
+# --- combinations, run once the isolated arms above are measured -----------
+
+
+def gpt_oss_120b_1k_mxfp8_bf16reduce() -> Trainer.Config:
+    """The two compute/comms levers together: MXFP8 arithmetic + bf16 reduction.
+
+    They target disjoint costs -- GEMM throughput and gradient-reduction bytes --
+    so if both are positive in isolation this should be close to additive. That
+    is a prediction worth recording: if it lands well under the sum, the step is
+    bound by something neither of them touches.
+    """
+    return _mxfp8_120b(gpt_oss_120b_1k_bf16reduce())
+
+
+def gpt_oss_120b_1k_mxfp8_ep8() -> Trainer.Config:
+    """MXFP8 + EP=8."""
+    return _mxfp8_120b(_120b_ep(8))
+
+
+def gpt_oss_120b_1k_all() -> Trainer.Config:
+    """Everything that measured positive: MXFP8 + bf16 reduce + EP=8."""
+    config = _120b_ep(8)
+    config.training.mixed_precision_reduce = "bfloat16"
+    return _mxfp8_120b(config)
+
+
+# --- batch variants, for spending memory a lever frees ---------------------
+#
+# Sized from measurement, not prediction. SelectiveAC on 120B costs ~10.8 GiB
+# per batch unit over a ~60 GiB fixed term (job 53), so each 4 units of batch is
+# ~43 GiB. Job 56 sits at 232.96 GiB of 276.50 (84.25%), leaving ~15 GiB -- about
+# 1.4 units. Anything more has to come from a lever that frees memory.
+
+
+def gpt_oss_120b_1k_ep8_bs24() -> Trainer.Config:
+    """EP=8 spending its freed memory on batch. bs 18 -> 24.
+
+    Only meaningful if `_1k_ep8` measures well under 84% memory. At bs=1, EP=8
+    saved 19.97 GiB over EP=1 (48.36 vs 68.33), and if that saving holds at
+    scale it covers ~1.8 batch units; 24 assumes the saving grows with batch
+    because what EP removes is the per-layer gathered weight buffer that the
+    activations then compete with. Tested, not assumed.
+    """
+    return _120b_ep(8, local_batch_size=24)
+
+
+def gpt_oss_120b_1k_ep8_bs32() -> Trainer.Config:
+    """EP=8 at bs=32. Deliberately past where the memory should sit.
+
+    Kept separate so the config anyone inherits is not the one parked on the
+    edge. On 120B SelectiveAC ran at 98.7% with no penalty, so the 20B cliff
+    rule does not bind here -- but a clean OOM still ends a run.
+    """
+    return _120b_ep(8, local_batch_size=32)
+
+
+def gpt_oss_120b_1k_mxfp8_bs24() -> Trainer.Config:
+    """MXFP8 at bs=24, in case MXFP8 frees memory here unlike on dsv4."""
+    return _mxfp8_120b(_120b_ep(1, local_batch_size=24))
+
+
+# --- debug gate ------------------------------------------------------------
+
+
+def gpt_oss_debugmodel_1k_mxfp8() -> Trainer.Config:
+    """4-GPU gate for the MXFP8 build: does it convert and step at all.
+
+    Exists because MXFP8 needed six separate build/kernel fixes to run on
+    sm_103 at all, and each of them failed at model-build or first-forward time.
+    Finding that out on one node in three minutes is worth far more than finding
+    it out after a 16-node job has taken the whole cluster.
+
+    Converts the same fqn surface as the 120B configs ("attention" + every
+    GroupedExperts), which the dsv4 work found to matter: a gate whose fqn list
+    is narrower than the real config's is not a gate -- theirs converted 12
+    Linears where the real model converted 730, and missed the one that broke.
+    """
+    config = _gpt_oss_debugmodel()
+    config.compile.enable = True
+    config.activation_checkpoint = SelectiveAC.Config()
+    return _20b_mxfp8(config, flavor="debugmodel")
