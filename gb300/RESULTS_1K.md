@@ -283,3 +283,110 @@ Written before the runs, so they can be scored rather than reconstructed:
    looked good. EP's real value here is the ~20 GiB it frees, which buys batch.
 4. **MXFP8 and bf16 reduce are close to additive**, since one is arithmetic and
    the other is bytes on the wire.
+
+
+## Why 1000 is not reachable on this software stack
+
+Half the critical path is one thing -- the bf16 expert grouped GEMM, 49.7% --
+and it runs at roughly **898 TFLOP/s against a 2503 bf16 peak, about 36%**.
+Closing a 29.6% gap means either making that GEMM narrower (quantize it) or
+making it more efficient (better shapes or kernels). Both routes were tried and
+both are closed by things outside this repository.
+
+### Quantizing the expert GEMM: two independent blockers
+
+| path | status on GB300 / sm_103 |
+| --- | --- |
+| `torch._scaled_mm` 2D rowwise | **works** -- but only reaches the 9.9% dense GEMMs |
+| `torch._grouped_mm` bf16 | works (this is what the reference runs) |
+| `torch._scaled_grouped_mm` fp8 | **aborts** -- CUTLASS arch-conditional MMA, identical on torch 2.14.0 and 2.15.0.dev20260907 |
+| MXFP8 grouped, stock torchao | **asserts** -- CuTeDSL cast needs K % 128 == 0, K is 2880 |
+| MXFP8 grouped, patched (this branch) | **runs, and trains to NaN** |
+
+The fp8 abort is worth being precise about: CUTLASS calls `abort()` rather than
+raising, so it kills the process with no Python traceback. That is why the first
+120B fp8 job appeared to fail inside Inductor's autotuner -- the autotuner was
+simply the first caller to touch the kernel. Disabling the autotuner moved the
+message, not the failure.
+
+### The MXFP8 patch works at the kernel level and is verified
+
+`gb300/patches/torchao-mxfp8-nonmultiple-128-K.patch` routes the activation cast
+through Triton when K % 128 != 0. Auditing the path showed the 128 constraint was
+isolated to that single kernel -- weights already use the Triton cast, the 3D
+weight quantize needs only %32, and the scale swizzle has no K constraint.
+
+It is verified, not assumed:
+
+| check | result |
+| --- | --- |
+| K=2880, 128 groups, 524288 rows, fwd+bwd | runs, all finite |
+| rel err vs bf16 (output / dA / dB) | 0.03763 / 0.03764 / 0.03775 -- mxfp8's own error |
+| vs CuTeDSL at K=2944, 2816 (128 groups) | **0.00000000 on both** -- bit-identical |
+| 128 unequal zero-padded groups, N=2880 and N=5760 | finite in fwd, dA, dB |
+| debugmodel end-to-end, 4 GPUs, compile + SelectiveAC | 5 steps, loss 8.10 -> 4.48 |
+
+### Where MXFP8 actually fails, and what was ruled out
+
+At 64 GPUs, **`grad_norm` is NaN at step 1** while the loss reads 12.730.
+
+That loss is *not* evidence the forward is correct. At step 1 the model is
+randomly initialised, so cross-entropy sits near ln(201088) = 12.21 almost
+regardless of what the experts compute. The honest statement is only that the
+gradient is non-finite; the forward is unverified at scale.
+
+Ruled out by measurement rather than argument:
+
+| hypothesis | test | verdict |
+| --- | --- | --- |
+| zero-padded token groups mint inf/NaN scales | cast an all-zero row | **refuted** -- e8m0 scale 0, not the 255 NaN encoding |
+| padding corrupts wgrad, which contracts over tokens | 128 unequal padded groups, fwd+bwd | **refuted** -- finite |
+| Inductor lowers the mxfp8 path wrongly | same config with `compile.enable=False` | **refuted** -- NaN either way |
+| the patched swizzle disagrees with CuTeDSL | compare at K where both are legal | **refuted** -- bit-identical |
+
+What remains untested, and is where the next session should start:
+
+1. **`GptOssGroupedExperts` passes `offs` that do not cover all of `x_RD`.**
+   `offsets_E` is the cumsum of real token counts, while `x_RD` carries extra
+   `tail_slack` rows. The CuTeDSL cast is offset-aware; `triton_to_mxfp8_dim0`
+   is not -- it casts every row, and the swizzle then sizes itself from the full
+   row count rather than from `offs[-1]`. If the grouped GEMM expects a scale
+   layout sized by groups, that is a layout mismatch the isolated probes would
+   not reproduce, because they construct `offs` that cover exactly all rows.
+   **This is the leading hypothesis and it was not tested.**
+2. FSDP/DTensor interaction. `GptOssGroupedExperts.forward` calls `.to_local()`
+   on all four expert parameters; the dsv4 sweep hit a closely related failure
+   where an MXFP8 tensor subclass met a raw-weight read under FSDP.
+3. Per-parameter gradient inspection to name which tensor goes non-finite
+   first, which would settle 1 vs 2 immediately and needs one instrumented
+   12-step run.
+
+### What would actually unblock the target
+
+- An **sm_103 fp8 grouped-GEMM kernel** in torch. This is the clean fix: it
+  needs no patching here and reaches 49.7% of the step.
+- Or resolving the MXFP8 NaN above, which is a bounded debugging task with a
+  named leading hypothesis.
+- Neither is a configuration change, which is why no config in this registry
+  reaches 1000.
+
+## Corrections this sweep makes to the existing write-ups
+
+1. **`TUNING_RESULTS_120B.md` records job 56 as bs=18. It was bs=16.** Job 56's
+   step-1 memory (219.44 GiB, 79.36%) matches the registry's own bs=16 probe
+   note; bs=16 -> bs=20 spans 84.25% -> 98.73%, i.e. 3.62 points per batch unit,
+   predicting 91.5% for bs=18; and bs=18 measures 92.07%. Job 56 ran the
+   registry default with no override.
+2. **"120B is more COMMUNICATION-bound" is wrong at this operating point.** It
+   was inferred from a throughput ratio. Measured: 97% of NCCL is hidden, the
+   compute stream is busy 98.1% of the step, and the GPU is idle 0.2%.
+3. **"MXFP8 is blocked because torchao ships no aarch64 kernels" is no longer
+   the blocker.** That gap is fixed and the build recipe is in
+   `MXFP8_120B.md` -- the kernels load and register on sm_103 under torch 2.14.
+   MXFP8 on GPT-OSS is blocked by K=2880 instead, which the patch addresses at
+   the kernel level.
+4. **Every TFLOP/s figure in `gb300/*.md`, including the 786.9 reference and
+   anything here, is on an accounting that overcharges sliding-window layers by
+   ~18%.** `perf/flops-sliding-window` corrects it: 786.9 -> 665.0. Not merged
+   here deliberately, so these numbers stay comparable to job 56 -- but a
+   corrected 1000 is ~846, and the two must never be mixed in one table.
