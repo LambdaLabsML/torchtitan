@@ -42,10 +42,50 @@ That was a packaging gap, not a hardware limit; see `MXFP8_120B.md`.
 
 ## Gates
 
+Both quantization gates ran on one node in under four minutes each, and both
+failed. That is the gates working, not the plan failing -- each would otherwise
+have been discovered by a 16-node job.
+
 | check | result |
 | --- | --- |
-| torchao 0.19 sm_103 build against torch 2.14 | `cuda_kernels=True triton_kernels=True mxfp8_quantize_op=True` |
-| `gpt_oss_debugmodel_1k_mxfp8`, 4 GPUs, 5 steps | _pending_ |
+| torchao 0.19 sm_103 build against torch 2.14 | **PASS** -- `cuda_kernels=True triton_kernels=True mxfp8_quantize_op=True` |
+| `gpt_oss_debugmodel_1k_mxfp8` (job 246) | **FAIL** -- `AssertionError: K must be divisible by 128` |
+| `gpt_oss_debugmodel_1k_fp8` (job 252) | **FAIL** -- `CUDA error: unspecified launch failure` inside Inductor's autotuner |
+
+### MXFP8: the packaging gap is fixed, the shape gap is not
+
+The build works. The kernel does not fit this model. `K` is the GEMM contraction
+dim, which for every expert GEMM in gpt-oss is `dim` = 2880, and
+**2880 % 128 = 64**. `pad_multiple` cannot help -- it pads per-expert *token*
+groups (M), not K -- and torchao's grouped-MXFP8 path calls
+`mxfp8_quantize_2d_1x32_cutedsl` unconditionally, with no Triton cast to fall
+back to (`flydsl` is the ROCm sibling). MXFP8 here needs a padded-K kernel or a
+model dimension gpt-oss does not have.
+
+This is a **different** blocker from the one `TUNING_RESULTS.md` recorded. That
+one -- "no aarch64 build, SM100 kernels absent" -- is genuinely fixed, and the
+recipe is kept in `MXFP8_120B.md` because it is correct and reusable on any
+model whose dims are multiples of 128. Worth correcting the earlier note: the
+reason MXFP8 is unavailable for gpt-oss was never the hardware or the packaging.
+
+### FP8 rowwise: the gate crashed in the autotuner, not the kernel
+
+```
+triton_poi_fused_..._triton_fp8_rowwise_2d_scale_and_cast_25.run(...)
+  -> autotune_to_one_config -> benchmark_all_configs -> synchronize
+torch.AcceleratorError: CUDA error: unspecified launch failure
+```
+
+The failing launch is one of the autotuner's *trial* configs for a fused fp8-cast
+kernel. Not assumed to transfer to 120B: the gate runs `gpt_oss_debugmodel`,
+which has `dim=256` where 120B has 2880 while sharing `hidden_dim=2880`, and the
+crashing kernel was a 189 M-element fusion over the MoE dispatch -- a shape the
+120B model does not produce. Job 255 runs fp8 at the real shape, and
+`GPTOSS_1K_NO_POINTWISE_AUTOTUNE=1` is ready if it reproduces.
+
+FP8 rowwise is the lever either way, because its alignment requirement is one
+this model meets: `PAD_MULTIPLE` 16, and 2880 % 16 == 0. It also needs nothing
+built -- `torch._scaled_grouped_mm` is compiled into the torch 2.14 wheel.
 
 ## Profile of the reference step
 
