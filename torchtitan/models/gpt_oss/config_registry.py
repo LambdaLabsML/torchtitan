@@ -1333,3 +1333,17 @@ def gpt_oss_120b_1k_mxfp8_dbg_bs4_nocompile() -> Trainer.Config:
     config.training.local_batch_size = 4
     config.compile.enable = False
     return config
+
+
+def gpt_oss_120b_1k_bf16reduce_seeded() -> Trainer.Config:
+    """bf16-reduce arm of the seeded loss comparison.
+
+    Pairs with `gpt_oss_120b_1k_ref_seeded`. This matters more than the other
+    seeded pair: bf16 gradient reduce measured **+2.9%** and is the best config
+    this sweep found, so it is the one a user would actually adopt -- and it is
+    also the one that changes training numerics, by reducing gradients across 64
+    shards in bf16 where fp32 exists precisely to avoid that accumulation.
+    """
+    config = gpt_oss_120b_1k_bf16reduce()
+    config.debug.seed = 42
+    return config
