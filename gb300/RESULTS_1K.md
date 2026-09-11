@@ -416,9 +416,30 @@ What remains, and is where the next session should start:
    448 and GPT-OSS is a model with large activation outliers; a block whose
    amax pushes scaled values past 448 would produce inf. The swiglu clamp
    (+-7) bounds what reaches mlp2 but not what reaches mlp1.
-3. **Name the op.** One 12-step run with `--debug.detect-anomaly` would say
-   which operation first produces a non-finite gradient and would separate 1
-   from 2 immediately. Queued as `gpt_oss_120b_1k_mxfp8_dbg_anomaly`.
+3. ~~Name the op with anomaly detection.~~ **Done (job 299), and the result
+   points at 2.** Twelve uncompiled steps with `--debug.detect-anomaly`
+   produced **no anomaly report at all**, while `grad_norm` was still NaN at
+   step 1 (loss 12.711).
+
+   That is informative rather than a dead end. `torch.autograd.detect_anomaly`
+   checks backward outputs for **NaN**, not for **inf**. So an *infinite*
+   gradient passes it silently, and `grad_norm` then goes NaN downstream the
+   moment an inf meets a zero or another inf. Nothing in the autograd graph
+   emitted a NaN, which argues against a broken backward node and for an
+   **overflow**.
+
+   That is consistent with everything else: e4m3 saturates at 448, every probe
+   used `randn` inputs that never approach it, and GPT-OSS is a model with
+   large activation outliers. The `swiglu` clamp of +-7 bounds what reaches
+   mlp2 but nothing bounds what reaches mlp1.
+
+**The concrete next thing to try, therefore:** this torchao path casts *both*
+activations and gradients to `torch.float8_e4m3fn`. Standard fp8 training uses
+e4m3 forward and **e5m2 for gradients**, precisely because gradients have the
+wider dynamic range -- e5m2 trades 1 mantissa bit for 3 exponent bits. If the
+NaN is an overflow in the backward cast, that is the fix, and it is a
+parameter of the existing call rather than new kernel work. Verify by logging
+per-tensor amax through one step before changing anything.
 
 ### What would actually unblock the target
 
