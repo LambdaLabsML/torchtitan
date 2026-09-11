@@ -150,6 +150,35 @@ runs 128 expert groups of ~4.6 k rows; at EP=8 it runs 16 groups of ~37 k rows.
 Same arithmetic, fewer and larger GEMMs. That is a compute-stream argument, and
 it is the only version of the EP hypothesis this profile leaves standing.
 
+### What the profile says about the two rejected memory levers
+
+The trace also prices, quantitatively, the trade that
+`gpt_oss_120b_1k_sac_gmm_bs6` and every other "recompute less" idea sits on.
+
+Expert grouped GEMMs show ~324 launches per step over 36 layers, about 9 per
+layer, consistent with 2 forward + 2 recomputed + 4 backward. SelectiveAC does
+not save `aten._grouped_mm`, so roughly 2 of those 9 -- about **1030 ms, or 11%
+of the compute stream** -- is recompute that saving the expert GEMM would remove.
+
+That looks like an 11% lever until the NCCL number is put next to it. Saving the
+expert GEMM costs ~17.7 GiB per batch unit on 36 layers, which forces bs=18 down
+to about 6. Compute scales with tokens; the 5599 ms of NCCL does **not** -- it is
+set by parameter count and is the same at any batch. At bs=6 the compute stream
+falls to roughly 3160 ms against 5599 ms of communication, so **the comm stops
+being hidden and starts setting the step time**, for a third of the tokens:
+
+    bs=18   compute 9490 ms > NCCL 5599 ms   -> compute-bound, comm free
+    bs=6    compute ~3160 ms < NCCL 5599 ms  -> comm-bound, ~0.6x throughput
+
+So the reason not to trade batch for recompute is not that recompute is cheap.
+It is that **batch is what hides the communication**, and there is no batch-neutral
+way to buy the 11% back. This is the same mechanism that makes the reference's
+bs=18 worth 5x the bs=1 baseline, now visible directly rather than inferred.
+
+It also says the complement to fp8 is a *larger* batch, not a smaller one: fp8
+shortens the compute stream, which erodes the margin hiding 5599 ms of NCCL, and
+raising batch restores it while amortising the same fixed comm over more tokens.
+
 ### Caveat on the profile
 
 Taken at step 12, where the run is at ~540 TFLOP/s against a steady 787 -- so
