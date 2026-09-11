@@ -301,6 +301,35 @@ Written before the runs, so they can be scored rather than reconstructed:
    the other is bytes on the wire.
 
 
+## Numerics of the recommended config
+
+bf16 gradient reduce changes training, so it was measured rather than waved
+through. Both arms at `--debug.seed 42`, bs=16, 40 steps -- seeded because on
+this cluster the init/data seed is not fixed by default and step-1 loss has
+spanned 11.80-12.60 across runs, which would make an unseeded comparison
+meaningless.
+
+| step | fp32 reduce | bf16 reduce | delta |
+| --- | --- | --- | --- |
+| 1 | 12.70373 | 12.70373 | **0.00000** |
+| 10 | 10.44085 | 10.63130 | +0.19045 |
+| 20 | 8.13019 | 8.11954 | -0.01065 |
+| 30 | 7.68240 | 7.62142 | -0.06098 |
+| 40 | 7.33000 | 7.25082 | -0.07918 |
+
+Step 1 agreeing exactly is the check that the seeding works: same init, same
+data, and no gradient reduction has yet influenced a weight. After that the
+curves separate and re-converge, and the sign of the difference flips -- bf16
+is behind at step 10 and ahead by step 40. That is the shape of float
+reassociation noise, not of degradation.
+
+**What this does not show.** Forty steps says nothing about whether bf16
+reduction error compounds over a real run. The concern with reducing gradients
+across 64 shards in bf16 is cumulative, and the only thing that would settle it
+is a long run against an fp32 control at matched seed. Use this config for
+throughput work freely; before a production run, do that comparison. The fp32
+default remains available and costs 3.0%.
+
 ## Why 1000 is not reachable on this software stack
 
 Half the critical path is one thing -- the bf16 expert grouped GEMM, 49.7% --
