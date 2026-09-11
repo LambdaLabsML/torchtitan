@@ -1368,3 +1368,28 @@ def gpt_oss_120b_1k_mxfp8_dbg_anomaly() -> Trainer.Config:
     config = gpt_oss_120b_1k_mxfp8_dbg_bs4_nocompile()
     config.debug.detect_anomaly = True
     return config
+
+
+def gpt_oss_120b_1k_bf16reduce_symmmem() -> Trainer.Config:
+    """bf16 gradient reduce + NVLink symmetric-memory all-gather.
+
+    Queued on the strength of a measurement that went against the profile's
+    prediction. The profile said 97% of NCCL is hidden, so halving the
+    reduce-scatter bytes should have been worth ~0; it measured **+2.9%**. Small,
+    only just over the noise floor, but in the direction that says some of the
+    collective is exposed after all -- plausibly the tail that has no compute
+    left to hide behind.
+
+    If that reading is right, the all-gather is the better target: it is 3666 ms
+    of the traced step against the reduce-scatter's 1942, and the single largest
+    kernel total in the profile. `enable_fsdp_symm_mem` is the one knob that
+    addresses it. Stacked on bf16 reduce rather than run alone because the two
+    touch different collectives and bf16 reduce is now the reference best.
+
+    Measured flat on dsv4 (+0.0%, and +8 GiB), but that was at EP=16 with
+    experts already rank-local -- far less all-gather to accelerate than this
+    model's ~229 GB per step at EP=1.
+    """
+    config = gpt_oss_120b_1k_bf16reduce()
+    config.parallelism.enable_fsdp_symm_mem = True
+    return config
