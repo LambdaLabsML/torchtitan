@@ -191,9 +191,59 @@ kernel *mix* is what was read from it, and mix is not what changes between step
 
 ## Measured
 
-| job | arm | bs | EP | reduce | MXFP8 | TFLOP/s/GPU | cluster | mem | vs ref |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| _pending_ | | | | | | | | | |
+Control is job 263, which reproduces job 56: **771.9 TFLOP/s at 232.96 GiB
+(84.3%)**, the same memory footprint job 56 reports to the decimal, with 0
+dataloader retries and 0 Triton cubin misses. The 1.9% below job 56's 786.9 is
+inside this cluster's ~2% noise floor, so the launcher and worktree are sound.
+
+| job | arm | bs | TFLOP/s/GPU | cluster | mem | vs control | note |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 56 | `sac_compile` (the reference) | 16 | 786.9 | 50.36 PF | 84.2% | +1.9% | 250 steps, prior sweep |
+| **263** | **`_1k_ref` (control)** | 16 | **771.9** | **49.40 PF** | **84.3%** | — | clean |
+| 254 | `_1k_ref_bs18` | 18 | 730.6 | 46.76 PF | 92.1% | -5.4% | **contaminated**, see below |
+| 281 | `_1k_fp8_linear` | 16 | 618.8 | 39.60 PF | 70.8% | **-19.8%** | clean; frees 37 GiB |
+| 272 | `_1k_ep8` | 16 | — | — | OOM | — | wanted 6.6 GiB, 5.0 free |
+| 273 | `_1k_ep16` | 16 | — | — | OOM | — | wanted 8.7 GiB, 3.2 free |
+| 286 | `_1k_mxfp8_experts` | 16 | — | — | — | — | **grad_norm NaN at step 1** |
+| 287 | `_1k_mxfp8` | 16 | — | — | — | — | cancelled after 286 |
+
+**Nothing beat the control.** The target was +29.6% over 771.9 (or +27.1% over
+job 56's 786.9) and the best measured arm is the control itself.
+
+### fp8 on the dense Linears: -19.8%, and the reason is not the GEMMs
+
+Dense GEMMs are 9.9% of the compute stream, so they cannot lose 20% by
+themselves even if fp8 made them infinitely slow. `Float8LinearConverter` sets
+`torch._inductor.config.emulate_precision_casts = True` (float8.py:122), which
+is global -- it changes codegen for the **whole model**, not the converted
+Linears. That is the most likely cost, and it is a property of how torchtitan
+enables the rowwise recipe rather than of fp8.
+
+Worth noting separately: it freed **37 GiB** (232.96 -> 195.72), which is 3.4
+batch units. On a model where batch is what hides communication that headroom
+has value -- just not at -20%.
+
+### Expert parallelism: OOM, for a reason the bs=1 evidence hid
+
+Job 105 showed EP=8 costing 48.36 GiB against the baseline's 68.33, which reads
+as EP being cheap. That was at **bs=1**. At bs=16 both EP=8 and EP=16 OOM, and
+the amount they overshoot by grows with EP degree (6.6 GiB at EP=8, 8.7 at
+EP=16). The all-to-all staging buffers scale with tokens *and* with the number
+of peers, so EP's memory cost is invisible at bs=1 and binding at bs=16.
+
+EP could still be run at a smaller batch, and was not, because the profile had
+already removed its motive: the collective EP replaces is 97% hidden, so the
+only surviving argument for it was expert-GEMM *shape*, and buying that with
+batch is the trade the next section prices at roughly 0.6x.
+
+### The bs=18 row is contaminated, by me
+
+Job 254 ran while NFS- and `/tmp`-heavy commands were being run on the login
+node -- which is one of the 16 allocated nodes. It logged 5 dataloader retries
+against job 56's 0 and job 263's 0, and its throughput dips line up in time
+with those commands. It is in the table because it is the measurement that
+uncovered the bs=16/bs=18 mix-up, not because -5.4% is a result. Job 294
+re-measures it on a quiet cluster.
 
 ## A confound in the fp8 arms, recorded up front
 

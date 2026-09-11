@@ -1294,3 +1294,42 @@ def gpt_oss_120b_1k_mxfp8_experts() -> Trainer.Config:
         ],
     )
     return config
+
+
+# --- MXFP8 NaN diagnostics (job 286: loss 12.729 at step 1, grad_norm nan) ---
+#
+# The ops are finite in isolation. Probes 284/285/288 cover K=2880 at the real
+# 128 groups (fwd+bwd finite, ~3.8% from bf16), bit-identical agreement with
+# CuTeDSL at K=2944/2816, and unequal zero-padded token groups (finite). The
+# padding hypothesis is refuted: an all-zero row casts to e8m0 scale 0, not the
+# 255 NaN encoding.
+#
+# What the probes do NOT cover is that the model runs the op under
+# torch.compile, SelectiveAC recompute, and FSDP -- and that the debugmodel gate
+# which passed has dim=256, so its w13 GEMM contracts over 256 and takes the
+# CuTeDSL path. Only w2 (hidden_dim 2880) took the patched path there. At 120B
+# both GEMMs contract over 2880, so both take it.
+#
+# These two configs cut the batch to 4 to make a 16-node reproduction cheap
+# (~8 min instead of ~50) and differ only in whether the model is compiled.
+
+
+def gpt_oss_120b_1k_mxfp8_dbg_bs4() -> Trainer.Config:
+    """MXFP8 experts at bs=4, compiled. Cheap reproduction of the NaN."""
+    config = gpt_oss_120b_1k_mxfp8_experts()
+    config.training.local_batch_size = 4
+    return config
+
+
+def gpt_oss_120b_1k_mxfp8_dbg_bs4_nocompile() -> Trainer.Config:
+    """Same, uncompiled. If grad_norm is finite here and NaN above, the fault is
+    in how Inductor lowers the mxfp8 path rather than in the kernels -- which is
+    consistent with every isolated probe being finite in eager.
+
+    Batch is 4 rather than 16 because no-AC/no-compile memory is what forced
+    bs=3 on this model, and this only needs to observe grad_norm.
+    """
+    config = gpt_oss_120b_1k_mxfp8_experts()
+    config.training.local_batch_size = 4
+    config.compile.enable = False
+    return config
