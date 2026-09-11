@@ -1164,3 +1164,19 @@ def gpt_oss_120b_1k_fp8_seeded() -> Trainer.Config:
     config = _120b_ref()
     config.debug.seed = 42
     return _fp8_120b(config)
+
+
+def gpt_oss_120b_1k_ref_noautotune() -> Trainer.Config:
+    """The bf16 reference with Inductor's pointwise autotuner disabled.
+
+    Exists so the fp8 arms have a control that compiles the same way they do.
+    fp8 cannot run on this cluster without `GPTOSS_1K_NO_POINTWISE_AUTOTUNE=1`
+    (jobs 252 and 257 both died in `benchmark_all_configs`), and pointwise
+    kernels are 11.8% of the compute stream, so a matched control is the only
+    way to say how much of an fp8 gain is fp8 rather than a compilation
+    difference. Expected to come in at or slightly below the 771.9 of job 263 --
+    the autotuner exists to pick tilings -- which would mean fp8's gain measured
+    against job 263 is understated rather than flattered.
+    """
+    _maybe_disable_pointwise_autotune()
+    return _120b_ref()
