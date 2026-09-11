@@ -1,0 +1,70 @@
+diff --git a/torchao/prototype/moe_training/mxfp8_grouped_mm.py b/torchao/prototype/moe_training/mxfp8_grouped_mm.py
+index eaf3a1c..4c4af70 100644
+--- a/torchao/prototype/moe_training/mxfp8_grouped_mm.py
++++ b/torchao/prototype/moe_training/mxfp8_grouped_mm.py
+@@ -108,6 +108,35 @@ def _to_mxfp8_then_scaled_grouped_mm(
+     return output
+ 
+ 
++
++def _quantize_2d_1x32_blocked(x, scaling_mode, offs, block_size=32):
++    """Cast a 2D activation to mxfp8 with tcgen05 block-scaled scales.
++
++    Prefers the CuTeDSL kernel and falls back to the Triton cast when the
++    contraction dim is not a multiple of 128.
++
++    Why: cutedsl_quantize_2d_1x32 asserts `K % 128 == 0`. GPT-OSS's expert
++    GEMMs all contract over `dim` = 2880, and 2880 % 128 = 64, so on that model
++    the CuTeDSL path can never be used and MXFP8 MoE training is unreachable --
++    not for any hardware reason, just this kernel's tiling. `pad_multiple` does
++    not help: it pads the per-expert token groups (M), not K.
++
++    The Triton cast has no such requirement (only contiguous, bfloat16, and an
++    inner block size <= 32), and every mxfp8 shape satisfies K % 32 == 0 by
++    definition of the 32-element scaling block. It is already the kernel this
++    same function uses for the *weights*, so it is not a new dependency -- only
++    the activations were routed through CuTeDSL.
++
++    `mx_block_rearrange_2d_M_groups_cuda` then produces the same swizzled scale
++    layout the SM100 grouped GEMM expects; it is the conversion this function
++    already applies on the pre-quantized `MXTensor` path.
++    """
++    if x.shape[-1] % 128 == 0:
++        return mxfp8_quantize_2d_1x32_cutedsl(x, scaling_mode=scaling_mode, offs=offs)
++    qdata, scales = triton_to_mxfp8_dim0(x.contiguous(), block_size, scaling_mode)
++    return qdata, mx_block_rearrange_2d_M_groups_cuda(scales, offs)
++
++
+ class _MXFP8GroupedMM(torch.autograd.Function):
+     """
+     Differentiable implementation of grouped GEMM with dynamic MXFP8 quantization.
+@@ -525,10 +554,11 @@ def _compute_fwd_sm100(
+                 padded_input_act.scales, padded_group_end_offsets
+             )
+     else:
+-        input_act_e4m3, input_act_scales_blocked = mxfp8_quantize_2d_1x32_cutedsl(
++        input_act_e4m3, input_act_scales_blocked = _quantize_2d_1x32_blocked(
+             padded_input_act,
+-            scaling_mode=scale_calculation_mode.value.lower(),
+-            offs=padded_group_end_offsets,
++            scale_calculation_mode.value.lower(),
++            padded_group_end_offsets,
++            block_size,
+         )
+ 
+     # Quantize weights along dim0 (after transposing from (E, K, N) to (E, N, K))
+@@ -625,10 +655,11 @@ def _compute_dgrad_sm100(
+                 grad_output.scales, group_end_offsets
+             )
+     else:
+-        grad_out_e4m3, grad_output_scales_blocked = mxfp8_quantize_2d_1x32_cutedsl(
++        grad_out_e4m3, grad_output_scales_blocked = _quantize_2d_1x32_blocked(
+             grad_output,
+-            scaling_mode=scale_calculation_mode.value.lower(),
+-            offs=group_end_offsets,
++            scale_calculation_mode.value.lower(),
++            group_end_offsets,
++            block_size,
+         )
+ 
+     # Quantize weights directly to blocked tcgen05 scales.
