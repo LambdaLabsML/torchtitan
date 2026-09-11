@@ -28,7 +28,7 @@ not re-test them.
 | arm | result |
 | --- | --- |
 | bf16 gradient reduce | **+3.0%** -- the only lever that moved |
-| symmetric-memory all-gather | see table |
+| symmetric-memory all-gather | **-39%** on top of bf16 reduce -- a large regression |
 | fp8 on dense Linears | -19.8% (a global Inductor flag, not the GEMMs) |
 | expert parallelism, EP=8 / EP=16 | OOM at bs=16 |
 | MXFP8 on expert GEMMs | runs after a kernel patch; NaN gradient at 64 GPUs |
@@ -238,6 +238,7 @@ inside this cluster's ~2% noise floor, so the launcher and worktree are sound.
 | **263** | **`_1k_ref` (control)** | 16 | **771.9** | **49.40 PF** | **84.3%** | — | clean |
 | 254 | `_1k_ref_bs18` | 18 | 730.6 | 46.76 PF | 92.1% | -5.4% | **contaminated**, see below |
 | 281 | `_1k_fp8_linear` | 16 | 618.8 | 39.60 PF | 70.8% | **-19.8%** | clean; frees 37 GiB |
+| 300 | `_1k_bf16reduce_symmmem` | 16 | 485.4 | 31.06 PF | 82.8% | **-37.1%** | clean; symm-mem is a large regression |
 | 272 | `_1k_ep8` | 16 | — | — | OOM | — | wanted 6.6 GiB, 5.0 free |
 | 273 | `_1k_ep16` | 16 | — | — | OOM | — | wanted 8.7 GiB, 3.2 free |
 | 286 | `_1k_mxfp8_experts` | 16 | — | — | — | — | **grad_norm NaN at step 1** |
@@ -334,6 +335,24 @@ Written before the runs, so they can be scored rather than reconstructed:
 4. **MXFP8 and bf16 reduce are close to additive**, since one is arithmetic and
    the other is bytes on the wire.
 
+
+### Symmetric-memory all-gather: -39%, and the bet behind it was wrong
+
+Queued on the reasoning that bf16 reduce's +2.9% meant some collective tail was
+exposed, and that the all-gather -- 3666 ms of the traced step against the
+reduce-scatter's 1942 -- was therefore the better target. It measured **485.4
+against 794.2 at the same 200 steps**, a 39% regression, plus 6 GiB.
+
+So the inference was wrong, and in a way worth keeping: **that a collective is
+large in the profile does not make it a target when it is already hidden.**
+`enable_fsdp_symm_mem` changes how the all-gather is staged, and on a step where
+the all-gather was costing nothing observable, all that can do is add cost. The
++2.9% from bf16 reduce is better explained by the 10 GiB it frees and by the
+reduce-scatter tail at the end of backward, where there is no compute left to
+overlap with, than by communication being broadly exposed.
+
+dsv4 measured this flat at +8 GiB; here it is actively harmful. The difference
+is consistent with EP=1 having vastly more all-gather to re-stage.
 
 ## Numerics of the recommended config
 
