@@ -195,6 +195,24 @@ kernel *mix* is what was read from it, and mix is not what changes between step
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | _pending_ | | | | | | | | | |
 
+## A confound in the fp8 arms, recorded up front
+
+`Float8GroupedExpertsConverter.convert` calls `swap_token_dispatcher`, which
+replaces `AllToAllTokenDispatcher` with `TorchAOTokenDispatcher` (it needs a
+dispatcher that pads token groups to a multiple of 16). So **every fp8 arm
+changes two things**: the expert GEMMs become fp8, and the token dispatcher
+changes.
+
+That matters because the profile puts MoE dispatch/combine data movement at
+18.2% of the compute stream -- the second largest item. A gain measured here is
+"fp8 plus whatever the TorchAO dispatcher does differently", not fp8 alone, and
+the two cannot be separated by configuration: the converter will not accept the
+old dispatcher. Separating them would need a run with the dispatcher swapped and
+no quantization, which is not expressible in this config surface.
+
+Not a reason to avoid the arm -- the combination is what a user would deploy --
+but the attribution has to be stated that way rather than credited to fp8.
+
 ## Predictions on record
 
 Written before the runs, so they can be scored rather than reconstructed:
