@@ -20,6 +20,7 @@ from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.models.common.config_utils import decoder_vocab_size
+from torchtitan.tools.logging import logger
 from torchtitan.trainer import Trainer
 
 from . import model_registry
@@ -878,6 +879,41 @@ def gpt_oss_120b_1k_ref_profile() -> Trainer.Config:
 # ---------------------------------------------------------------------------
 
 
+def _maybe_disable_pointwise_autotune() -> None:
+    """Opt-in escape from an Inductor pointwise-autotune crash in the fp8 path.
+
+    The 4-GPU fp8 gate (job 252) died while Inductor was BENCHMARKING candidate
+    configs for a fused fp8-cast kernel -- not while running it:
+
+        triton_poi_fused_..._triton_fp8_rowwise_2d_scale_and_cast_25.run(...)
+          -> autotune_to_one_config -> benchmark_all_configs -> synchronize
+        torch.AcceleratorError: CUDA error: unspecified launch failure
+        Sticky error detected
+
+    So the failing thing is one of the autotuner's trial launches, and
+    `triton.autotune_pointwise` turns that trial loop off ("this should only be
+    disabled for debugging/testing", per Inductor's own comment). It has no
+    environment variable of its own, hence this hook.
+
+    Gated on GPTOSS_1K_NO_POINTWISE_AUTOTUNE so it changes nothing unless a job
+    asks for it -- the fp8 arms are queued against this worktree already, and a
+    change that altered their compilation silently would make them incomparable.
+    Disabling it is not free: the autotuner exists to pick pointwise tilings, so
+    any run using this needs saying so next to its number.
+    """
+    import os
+
+    if os.environ.get("GPTOSS_1K_NO_POINTWISE_AUTOTUNE") != "1":
+        return
+    import torch._inductor.config as inductor_config
+
+    inductor_config.triton.autotune_pointwise = False
+    logger.warning(
+        "GPTOSS_1K_NO_POINTWISE_AUTOTUNE=1: disabled "
+        "torch._inductor.config.triton.autotune_pointwise"
+    )
+
+
 def _fp8_120b(config: Trainer.Config, experts_only: bool = False) -> Trainer.Config:
     """FP8 rowwise on the expert grouped GEMMs, optionally also the dense Linears.
 
@@ -890,6 +926,7 @@ def _fp8_120b(config: Trainer.Config, experts_only: bool = False) -> Trainer.Con
     features are not multiples of 16, which is what excludes `attn_sink`
     (in_features=1).
     """
+    _maybe_disable_pointwise_autotune()
     converters: list = [
         Float8GroupedExpertsConverter.Config(
             model_compile_enabled=config.compile.enable
