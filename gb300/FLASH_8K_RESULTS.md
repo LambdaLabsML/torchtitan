@@ -72,15 +72,44 @@ confirms the mechanism is mask granularity and not flavor-specific.
 |---|---|---|
 | no activation checkpointing | **OOM** | Wants ~265 GiB at the 8k reference; still OOMs on the composed base. FullAC is load-bearing at 8192 (it was optional at 4096). |
 | `SelectiveAC` | **hard error** | `Tensor cached during selective activation checkpoint has been mutated` -- a correctness guard in the AC machinery, not a memory limit. Some op in this model mutates a tensor SAC cached. |
-| microbatch 2x and 4x | **hang** | Both hang after exactly 64 AUTOTUNE events (one per rank) with no NCCL watchdog. Changing the microbatch changes every attention shape, re-triggering FlexAttention autotuning that does not converge across 64 ranks. 4x burned the full 3 h wall clock without reaching step 1. |
+| microbatch 2x and 4x | **hang** | Three attempts, none reached step 1. See below -- the cause is NOT settled. |
 | `mixed_precision_reduce=bfloat16` | **noise** | 18.58 vs 18.29 = +1.6 %, under the 1.3-1.5 % floor. Frees 20.7 GiB though, so it is a memory lever to spend elsewhere, not a speed lever. |
 
-The batch hang is the most valuable negative result here: peak memory at the
-best config is only 27.7 % of the card, and batch is the obvious way to spend
-that headroom. The blocker is compile-time convergence, not capacity, so the
-fix is eliminating the autotune at the new shape -- the flex tiles are pinned
-via `_pin_gb300_flex_tiles` but Inductor still reports 7 choices, so the pin
-does not cover everything it needs to.
+### The batch hang (unresolved)
+
+The most valuable open problem here. Peak memory at the best config is 76.58 GiB
+of ~276.5 GiB -- **~200 GiB unused** -- and FullAC keeps the *stored* activation
+term small by construction, so a doubled microbatch should cost tens of GiB.
+Memory is not the constraint. Yet:
+
+| job | config | batch | outcome |
+|---|---|---|---|
+| 330 | `ep16_blk32_batch4` | 4x | 3 h wall clock, step 0 |
+| 341 | `ep16_blk32_batch2` | 2x | cancelled, 30 min static, step 0 |
+| 365 | `ep4_blk32_batch2` | 2x | 6 h clock, cancelled after 43 min static, step 0 |
+
+**The cause is not established, and an earlier diagnosis in this file was
+wrong.** This was first recorded as a FlexAttention autotune hang, on the
+reasoning that 341 stopped on an autotune line and its log held 64 AUTOTUNE
+events "one per rank". Both halves were mistaken: the launcher passes
+`--local-ranks-filter 0`, so those 64 events are 64 separate *kernel*
+autotunings on rank 0 alone, not one per rank. And job 365 -- the same lever on
+the best config, with double the wall clock -- froze with **zero** autotune
+blocks, wedged in the DTensor redistribute / weight-materialization phase of
+model init, long before any compilation.
+
+So the failure is in init at 2x, not in autotune. Note the tiles genuinely are
+pinned: all 7 reported choices carry identical `BLOCK_M=32, BLOCK_M1=16, ...`
+and times within 0.2 ms of one another (311.77-311.86 ms), so autotuning is
+re-benchmarking each flex kernel rather than searching tile space.
+
+One caveat against calling it a hard deadlock: job 346 (EP=2, 1x) sat at
+*exactly* the same 27389-byte log offset for over 10 minutes and then recovered
+and finished at 25.22. That phase is legitimately slow. 365 sat there 43 minutes.
+
+Next step is a stack dump from a wedged rank (`py-spy dump`, or
+`PYTORCH_DISTRIBUTED_DEBUG=DETAIL` plus the NCCL flight recorder) to see which
+collective is blocked -- not another long run at a different batch size.
 
 ## Configs added
 
