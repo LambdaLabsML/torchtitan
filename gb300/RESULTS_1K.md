@@ -40,8 +40,9 @@ staged shards, `--training.disable-cuda-graphs`. 200 steps per screening arm;
 `TUNING_RESULTS_120B.md` uses. Peak for MFU is GB300 dense bf16 ~2503
 TFLOP/s/GPU.
 
-Reference is **job 56**, `gpt_oss_120b_gb300_sac_compile` at bs=18: **786.9
-TFLOP/s/GPU**, 232.96 GiB (84.25%). Target is 1000, i.e. **+27.1%**.
+Reference is **job 56**, `gpt_oss_120b_gb300_sac_compile` at **bs=16**: **786.9
+TFLOP/s/GPU**, 232.96 GiB (84.25%). Target is 1000, i.e. **+27.1%**. (bs=16, not
+bs=18 -- see Correction 1 at the end; the run log says "local batch size 16".)
 
 ## Read this before quoting any number here
 
@@ -122,6 +123,14 @@ this model meets: `PAD_MULTIPLE` 16, and 2880 % 16 == 0. It also needs nothing
 built -- `torch._scaled_grouped_mm` is compiled into the torch 2.14 wheel.
 
 ## Profile of the reference step (job 253) -- this inverted the plan
+
+**Read the batch size here carefully.** Job 253 ran at commit `35bf68b4c`, before
+`dc554c3df` corrected `_120b_ref` from bs=18 to bs=16, so its log says "local
+batch size 18" and every bs=18 figure in this section is what was actually
+profiled. The conclusion is unchanged at the corrected bs=16: NCCL is set by
+parameter count and does not scale with tokens, so compute falls to ~8400 ms
+against the same 5599 ms and the step is still compute-bound, just less so. The
+kernel mix being read here is not sensitive to that difference.
 
 15 steps, profiler active at step 12, all 64 ranks traced. Read on rank1 and
 re-read on rank33 (a different node) because a single rank could be atypical;
@@ -207,7 +216,7 @@ being hidden and starts setting the step time**, for a third of the tokens:
 So the reason not to trade batch for recompute is not that recompute is cheap.
 It is that **batch is what hides the communication**, and there is no batch-neutral
 way to buy the 11% back. This is the same mechanism that makes the reference's
-bs=18 worth 5x the bs=1 baseline, now visible directly rather than inferred.
+bs=16 worth 5x the bs=1 baseline, now visible directly rather than inferred.
 
 It also says the complement to fp8 is a *larger* batch, not a smaller one: fp8
 shortens the compute stream, which erodes the margin hiding 5599 ms of NCCL, and
