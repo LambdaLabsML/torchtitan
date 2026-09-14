@@ -633,9 +633,15 @@ def gpt_oss_20b_gb300_sac_gmm_bs8() -> Trainer.Config:
 
 
 def gpt_oss_120b_gb300_sac_gmm_bs5() -> Trainer.Config:
-    """The same change where it matters most: SelectiveAC is the *winning* 120B
-    config (job 56, 250 steps: 810 TFLOP/s at 84.25% memory), so on the larger
-    model the best recipe is the one paying the recompute bill.
+    """KNOWN BROKEN -- DOES NOT TRAIN. Kept for the diagnosis, not for use.
+
+    Two attempts (jobs 62 and 67), neither reached step 2; see the block at the
+    end of this function. The 20B configs above are unaffected and measured
+    clean. Do not run this expecting a number.
+
+    The intent: SelectiveAC is the *winning* 120B config (job 56, 250 steps:
+    810 TFLOP/s at 84.25% memory), so on the larger model the best recipe is the
+    one paying the expert-GEMM recompute bill that save_grouped_mm removes.
 
     Not a controlled A/B -- saving the expert GEMMs at bs=16 cannot fit, so this
     compares configs at each one's own batch, which is what the rest of this
@@ -661,25 +667,39 @@ def gpt_oss_120b_gb300_sac_gmm_bs5() -> Trainer.Config:
     config.activation_checkpoint = SelectiveAC.Config(save_grouped_mm=True)
     config.training.local_batch_size = 5
     config = _stage_local_data(config)
-    # Job 62 died here at the FIRST attempt, and the cause is worth recording
-    # because _stage_local_data does NOT protect against it.
+    # ---------------------------------------------------------------------
+    # WHY THIS DOES NOT WORK. Two runs, same failure, neither reached step 2.
     #
-    #   Watchdog caught collective operation timeout: WorkNCCL(SeqNum=333,
-    #   OpType=_REDUCE_SCATTER_BASE, NumelIn=579133440, Timeout(ms)=300000)
+    #   job 62  Timeout(ms)=300000   SeqNum=333  NumelIn=579133440
+    #   job 67  Timeout(ms)=1800000  SeqNum=338  NumelIn=3213080192
     #
-    # No OOM, no allocator stall, no dataloader retry - the log is clean on all
-    # three. NumelIn=579133440 is exactly 201088 x 2880, the lm_head gradient,
-    # i.e. the last reduce-scatter of step 1's backward. Some ranks posted it and
-    # waited 300 s for stragglers still compiling. 36 layers under torch.compile
-    # with a changed AC save set repartitions a much larger graph than
-    # sac_compile does, and the first backward is where that cost lands.
+    # Both are _REDUCE_SCATTER_BASE in step 1's backward: 579133440 is exactly
+    # 201088 x 2880 (the lm_head gradient), 3213080192 is the expert-weight
+    # gradient of one MoE layer. Ranks that got there posted the collective and
+    # waited for ranks that never arrived.
     #
-    # The 300 s is init_timeout_seconds, NOT train_timeout_seconds:
-    # set_pg_timeouts only swaps in the tighter train timeout AFTER step 1
-    # (trainer.py, "Reduce timeout after the first train step"), so
-    # _stage_local_data raising train_timeout_seconds to 600 has no effect on the
-    # step that actually needs the headroom. Anything compile-heavy at this layer
-    # count needs the init timeout raised instead.
+    # Ruled out by log inspection on BOTH runs, not assumed: zero hits for
+    # "out of memory", "expandable_segments", "memory mapping failed",
+    # "cudaMalloc"; zero dataloader retries on c4_local; all 16 nodes idle and
+    # healthy afterwards. Model materialised at 9.03 GiB (3.26%).
+    #
+    # init_timeout_seconds, not train_timeout_seconds, is what governs step 1 --
+    # set_pg_timeouts only swaps in the tighter train timeout AFTER the first
+    # step completes (trainer.py, "Reduce timeout after the first train step"),
+    # so _stage_local_data raising train_timeout_seconds 100 -> 600 in round 4
+    # does nothing for the step that needs the headroom. That diagnosis was
+    # correct and is worth keeping. It was not, however, the whole cause: job 67
+    # raised the init timeout to 1800 s and hung for the full 30 minutes anyway.
+    #
+    # So this is not compile skew. Something in save_grouped_mm at 36 layers
+    # genuinely deadlocks, and 20B (24 layers) runs the identical code path
+    # clean for 250 steps twice. Unbisected. The next steps, cheapest first:
+    #   1. save_grouped_mm=True at bs=16, to separate the save set from the
+    #      batch-size change this config also makes;
+    #   2. eager (compile.enable=False), to separate the partitioner from FSDP;
+    #   3. FSDP bucket/reduce-scatter tracing on the layer whose gradient is
+    #      3213080192 elements.
+    # ---------------------------------------------------------------------
     config.comm.init_timeout_seconds = 1800
     return config
 
