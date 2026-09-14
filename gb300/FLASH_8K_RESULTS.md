@@ -1,0 +1,114 @@
+# `deepseek_v4_flash` on 64x GB300 — 8k optimization round
+
+Branch `dsv4_flash_64xgb300`, worktree `/mnt/dgxc/worktrees/dsv4-flash`.
+All numbers are 30-step runs at `seq_len=8192`, 64 ranks, mean TFLOP/s over
+steps 15+ (skipping warmup/compile), peak memory from the last step line.
+
+## Headline
+
+| | config | TFLOP/s | peak |
+|---|---|---:|---:|
+| baseline (stock recipe, 4096) | `deepseek_v4_flash_64xgb300` | 24.14 | 56.14 GiB (20.3 %) |
+| **8k reference** (same recipe at 8192) | `deepseek_v4_flash_8k` | **18.29** | 95.14 GiB (34.4 %) |
+| **best** | `deepseek_v4_flash_8k_ep4_blk32` | **25.45** | 76.58 GiB (27.7 %) |
+
+**+39.1 % over the 8k reference**, and above the 4096 baseline while doing 2x
+the context. Everything below is measured against the 8k reference, not the
+4096 baseline: doubling context changes attention work per token, so a
+cross-length comparison would not be clean.
+
+**The replicate spread is 1.3 %**, measured the hard way -- three runs that were
+meant to be different configs turned out identical (see the AC bug below) and
+returned 24.74 / 24.62 / 24.42. Treat anything under ~1.5 % as noise. This is
+tighter than the ~2 % assumed from earlier rounds.
+
+## What worked
+
+Two levers, and they compose almost exactly multiplicatively (1.170 x 1.158 =
+1.355 predicted, 1.353 observed) because they attack disjoint costs: MoE
+dispatch scope and attention score area.
+
+### 1. Expert parallel degree 64 -> 4 (+20.5 % alone)
+
+Stock is EP=64, which spreads every layer's dispatch across all 16 nodes. The
+sweep, at `block_size` 128:
+
+| EP | TFLOP/s | peak |
+|---:|---:|---:|
+| 64 (stock) | 18.29 | 95.14 GiB |
+| 16 | 21.39 | 65.70 GiB |
+| 8 | 21.84 | 67.69 GiB |
+| **4** | **22.04** | 76.02 GiB |
+| 1 | 20.80 | 128.98 GiB |
+
+Composed with `block_size` 32:
+
+| EP | TFLOP/s | peak |
+|---:|---:|---:|
+| 16 | 24.74 | 72.40 GiB |
+| **4** | **25.45** | **76.58 GiB** |
+| 2 | 25.22 | 94.66 GiB |
+
+EP=4 is the optimum, and the reason is the node shape: 4 GPUs per node means an
+EP=4 group fits entirely inside one node's NVLink mesh, so expert dispatch
+never crosses InfiniBand. EP=2 ties it on throughput (0.9 %, inside noise) but
+costs 18 GiB more, and EP=1 collapses -- with no expert parallelism every rank
+holds all 256 routed experts for FSDP to all-gather, which is both slower and
+129 GiB.
+
+### 2. FlexAttention `block_size` 128 -> 32 (+15.8 % alone)
+
+`deepseek_v4_flash_8k_blocksize32`: 21.18 TFLOP/s, and it *frees* 19.3 GiB.
+This is the DSA block-mask granularity: at 128 the mask keeps whole 128-token
+blocks that top-k only partly selected, so the kernel computes score area it
+then discards. Transfers almost exactly from `pro` (+19 % there), which
+confirms the mechanism is mask granularity and not flavor-specific.
+
+`block_size` 16 was never measured -- the one untested tuning question left.
+
+## What did not work
+
+| lever | result | why it is a dead end, not a tuning problem |
+|---|---|---|
+| no activation checkpointing | **OOM** | Wants ~265 GiB at the 8k reference; still OOMs on the composed base. FullAC is load-bearing at 8192 (it was optional at 4096). |
+| `SelectiveAC` | **hard error** | `Tensor cached during selective activation checkpoint has been mutated` -- a correctness guard in the AC machinery, not a memory limit. Some op in this model mutates a tensor SAC cached. |
+| microbatch 2x and 4x | **hang** | Both hang after exactly 64 AUTOTUNE events (one per rank) with no NCCL watchdog. Changing the microbatch changes every attention shape, re-triggering FlexAttention autotuning that does not converge across 64 ranks. 4x burned the full 3 h wall clock without reaching step 1. |
+| `mixed_precision_reduce=bfloat16` | **noise** | 18.58 vs 18.29 = +1.6 %, under the 1.3-1.5 % floor. Frees 20.7 GiB though, so it is a memory lever to spend elsewhere, not a speed lever. |
+
+The batch hang is the most valuable negative result here: peak memory at the
+best config is only 27.7 % of the card, and batch is the obvious way to spend
+that headroom. The blocker is compile-time convergence, not capacity, so the
+fix is eliminating the autotune at the new shape -- the flex tiles are pinned
+via `_pin_gb300_flex_tiles` but Inductor still reports 7 choices, so the pin
+does not cover everything it needs to.
+
+## Configs added
+
+In `torchtitan/models/deepseek_v4/config_registry.py`:
+
+- `deepseek_v4_flash_8k` — the 8k reference
+- `deepseek_v4_flash_8k_ep{1,2,4,8,16}` — EP sweep at `block_size` 128
+- `deepseek_v4_flash_8k_blocksize32`, `_bf16reduce`, `_no_ac`, `_sac`
+- `_flash_8k_ep_blk(ep, block_size)` — the composition helper
+- **`deepseek_v4_flash_8k_ep4_blk32`** — the best config
+- `deepseek_v4_flash_8k_ep{2,8,16}_blk32`, `_ep16_blk16`
+- `_ep16_blk32_{sac,no_ac,batch2,batch4}`
+
+Supporting changes outside the registry:
+
+- `models/deepseek_v4/__init__.py`: raised the `deepseek_v4_flash` context cap
+  from 4096 to 65536 so 8192 is expressible at all.
+- `config/configs.py`: widened `mixed_precision_reduce` to accept `bfloat16`.
+
+## A measurement bug worth not repeating
+
+The first SAC and no-AC configs assigned `config.model_spec.ac`, which is not a
+dataclass field on `model_spec`. Python accepted it as a stray attribute on a
+non-slots dataclass and it controlled nothing, so both runs silently executed
+plain FullAC and looked like flat results with slightly different memory. The
+operative field is `config.activation_checkpoint`. Two jobs were wasted and
+`no_ac` was briefly reported as "fits and is flat" when it had never run.
+
+Assert on the field you think you set, in-process, before queuing 64 ranks --
+every config in this round is now verified by constructing it and printing the
+values that matter.
