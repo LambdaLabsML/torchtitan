@@ -244,8 +244,12 @@ Each config is the 92.15 TFLOP/s tuned config with one lever moved.
 |---|---|---:|---:|---:|---|
 | `mixed_precision_reduce=bfloat16` | `pr18_bf16reduce` | **95.54** | **+3.7 %** | 72.03 GiB | real (spread 1.3 %); was noise under the old kernel, now NCCL is 30 % of kernel time |
 | `compile.enable=True` (model+loss) | `pr18_compile` | -- | -- | -- | **Inductor failure** in the flex template: `convert FlexibleLayout to FixedLayout first` while rendering `dsa_mask_mod`. See below. Retried as `compile2` with the block-mask build excluded from compile. |
-| `moe_comm_backend=minimal_async_ep` | `pr18_asyncep` | pending | | | |
+| `moe_comm_backend=minimal_async_ep` | `pr18_asyncep` | **96.66** | **+4.9 %** | 78.12 GiB | real; +1.9 GiB only (no Kimi-style buffer blow-up), 0 allocator retries. Needed no code change: the shared dispatcher-capacity code fills `num_max_tokens_per_rank` at config time. |
 | 2x microbatch | `pr18_bs2` | pending | | | 3/3 hangs under the old kernel; 2 h clock |
+
+**Round 2 queued:** `pr18_asyncep_bf16reduce` -- the two comm levers stacked
+(different collectives: MoE all-to-all overlap vs FSDP reduce-scatter bytes;
+multiplicative would be ~100.4).
 
 **torch.compile vs the DSA block mask.** `dsa_mask_mod` indexes a dense
 `selected_mask` tensor that `_build_block_mask` builds *inside* the
