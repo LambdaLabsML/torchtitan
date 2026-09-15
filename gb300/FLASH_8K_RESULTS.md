@@ -265,6 +265,11 @@ flip changes every rank's received count. Note this is a different failure
 from the old-kernel 2x/4x attempts (330/341/365), which stalled without
 reaching this point; whether they would have hit it is unknown.
 `determinism_check="none"` is NOT the fix -- the shapes really differ.
+Retry with `CUBLAS_WORKSPACE_CONFIG=:4096:8` (job 400) failed identically
+(`[105470]` vs `[105469]`), so deterministic cuBLAS is not (the whole) answer;
+remaining suspects are cuBLASLt algorithm choice, Triton kernels, the bf16x9
+fp32-emulation path, or an unlisted op. Diagnostic retry under
+`debug.deterministic` (torch.use_deterministic_algorithms, warn-only) queued.
 
 **torch.compile vs the DSA block mask.** `dsa_mask_mod` indexes a dense
 `selected_mask` tensor that `_build_block_mask` builds *inside* the
