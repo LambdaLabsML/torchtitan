@@ -198,6 +198,44 @@ bench. The old kernel matched between bench (932) and profile (890 + fwd)
 because its captured-buffer-gradient path was insensitive to block sparsity --
 part of why it was so slow on real data.
 
+## After PR #18: where the step goes now
+
+Profile of the tuned config on the PR #18 attention
+(`/mnt/dgxc/profiles/dsv4_flash_8k_ep4_blk32_pr18/`, job 391; 79.86 TFLOP/s
+with the profiler on, 92.15 without). Same 2-step window as the sink-token
+profile; `before_after.md` there has the full side-by-side.
+
+| bucket | sink-token ms (share) | PR #18 ms (share) | change |
+|---|---:|---:|---:|
+| attention backward (flex) | 44,512 (72.5 %) | 4,165 (20.6 %) | **0.09x** |
+| NCCL collectives | 6,977 (11.4 %) | 6,069 (30.1 %) | 0.87x |
+| elementwise / reductions | 4,999 (8.1 %) | 5,203 (25.8 %) | 1.04x |
+| other | 2,035 (3.3 %) | 2,023 (10.0 %) | 0.99x |
+| GEMMs (dense + expert) | 1,622 (2.6 %) | 1,571 (7.8 %) | 0.97x |
+| attention forward (flex) | 1,253 (2.0 %) | 1,148 (5.7 %) | 0.92x |
+| **total GPU kernel time** | **61,399** | **20,178** | **0.33x** |
+| NCCL exposed (serialised) | 2,709 (4.7 %) | 3,169 (17.5 %) | -- |
+
+The attention backward kernel runs at **48 ms/call** on real data (vs 517
+before). Every other bucket is unchanged in absolute terms; they only look
+bigger because the denominator shrank 3x. The next levers, in order of size:
+
+1. **NCCL, 30 % of kernel time and 17.5 % exposed.** Absolute comm time did
+   not move; the compute that used to hide it is gone. MoE SendRecv is the top
+   NCCL kernel (2,664 ms). Re-tune EP under PR #18 (the EP=4 choice was made
+   when attention dominated), and the comm-overlap levers (async EP, DeepEP)
+   are worth more now than when they were first tried.
+2. **Elementwise, 26 %, ~153k launches at ~34 us.** The HC-branch fp32
+   upcasts and their backward, RMS norms, casts -- all unfused because the
+   flash recipe runs `compile.enable=False`. torch.compile of the blocks is
+   the natural lever; the mhc.py cast cleanup that looked like <1 % against
+   the old step is now a several-percent item.
+3. **Attention backward, 21 %.** Still the single largest kernel. The gather
+   branch does NOT help here: on real data PR #18's flex costs ~55 ms/layer
+   fwd+bwd against the gather kernel's fixed ~92 ms (its cost does not fall
+   with clustered selections; flex's does). Superseded -- see the gather
+   branch's `gb300/CSA_GATHER_VERDICT.md`.
+
 ## Configs added
 
 In `torchtitan/models/deepseek_v4/config_registry.py`:
