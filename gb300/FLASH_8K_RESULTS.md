@@ -236,6 +236,27 @@ bigger because the denominator shrank 3x. The next levers, in order of size:
    with clustered selections; flex's does). Superseded -- see the gather
    branch's `gb300/CSA_GATHER_VERDICT.md`.
 
+## Sweep on top of PR #18 (branch `dsv4_flash_pr18_sweep`, in progress)
+
+Each config is the 92.15 TFLOP/s tuned config with one lever moved.
+
+| lever | config | TFLOP/s | vs 92.15 | peak | note |
+|---|---|---:|---:|---:|---|
+| `mixed_precision_reduce=bfloat16` | `pr18_bf16reduce` | **95.54** | **+3.7 %** | 72.03 GiB | real (spread 1.3 %); was noise under the old kernel, now NCCL is 30 % of kernel time |
+| `compile.enable=True` (model+loss) | `pr18_compile` | -- | -- | -- | **Inductor failure** in the flex template: `convert FlexibleLayout to FixedLayout first` while rendering `dsa_mask_mod`. See below. Retried as `compile2` with the block-mask build excluded from compile. |
+| `moe_comm_backend=minimal_async_ep` | `pr18_asyncep` | pending | | | |
+| 2x microbatch | `pr18_bs2` | pending | | | 3/3 hangs under the old kernel; 2 h clock |
+
+**torch.compile vs the DSA block mask.** `dsa_mask_mod` indexes a dense
+`selected_mask` tensor that `_build_block_mask` builds *inside* the
+transformer block. Under torchtitan's per-block compile that tensor is an
+Inductor intermediate whose layout is not yet fixed when the flex template
+renders the `mask_mod`, and Inductor asserts. Standalone flex never sees this:
+the tensor is a real input. Workaround under test: `@torch.compiler.disable`
+on `_build_block_mask`, so the mask is built eagerly and enters the flex region
+as a graph input (one graph break per block; the index math is small, and the
+compile target is the HC-branch elementwise work anyway).
+
 ## Configs added
 
 In `torchtitan/models/deepseek_v4/config_registry.py`:
