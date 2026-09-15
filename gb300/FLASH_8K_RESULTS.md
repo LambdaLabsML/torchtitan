@@ -292,10 +292,25 @@ shape the forward and the FullAC recompute can each autotune and pick
 different tile variants, whose rounding differences flip router near-ties by
 a token or two. At 1x the node-local Inductor cache is warm so both pick the
 same kernel. This also explains the old-kernel 2x/4x runs sitting in autotune
-for hours. Under test on branch `dsv4_flash_pr18_noautotune`
-(`max_autotune=False`, `coordinate_descent_tuning=False` -- the state the
-FlexAttention docstring itself prescribes once `kernel_options` are pinned):
-1x for the baseline effect, 2x for the flip.
+for hours. Tested on branch `dsv4_flash_pr18_noautotune`
+(`max_autotune=False`, `coordinate_descent_tuning=False`): **refuted** -- 2x
+still throws the CheckpointError with autotune off (job 407, `[111283]` vs
+`[111282]`). Three mechanisms proposed (cuBLAS split-K, cuBLASLt, Inductor
+autotune), three refuted; **the source of the flip is unidentified.** What is
+established: it needs >1x microbatch to appear, `debug.deterministic=True`
+prevents it and is free (92.66 vs 92.15), and it is moot for this model
+because >1x microbatch is counter-productive anyway. If someone needs it, the
+next step is a per-rank dump of router top-k between forward and recompute,
+not more hypotheses.
+
+The autotune-off branch did establish something else: **autotune off is
+throughput-neutral at 1x (92.01 vs 92.15, job 406) with zero autotune blocks
+and a 6.9-minute 30-step job.** With `kernel_options` pinned on every flex
+layer -- which GB300 forces at head_dim=512 -- timing-based autotune only
+ever re-benchmarked the pinned choice against variants, at a cost of up to
+~10 minutes per block on any new shape (the 2x runs sat in it for hours).
+Recommend adopting `max_autotune=False, coordinate_descent_tuning=False` on
+the PR #18 branch: same speed, deterministic kernel choice, fast startup.
 
 **Batch size: dead as a throughput lever on DSv4 flash.** With deterministic
 mode shown to be free (92.66 vs 92.15 at 1x), the curve is clean:
