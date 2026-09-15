@@ -165,6 +165,39 @@ so `dsa_gather_attention` gathers those rows once and runs the attention as
 batched cuBLAS GEMMs. Config `deepseek_v4_flash_8k_ep4_blk32_gather`; result
 pending as of this writing.
 
+### The gather kernel, measured (branch `dsv4_flash_csa_gather_attention`)
+
+Single GPU, the flash CSA shape (T=8192, H=64, D=512, n_cmp=2048, topk=512,
+window=128), fwd+bwd per layer call, 5 iters after 3 warmups:
+
+| kernel | ms/call | peak |
+|---|---:|---:|
+| sink-token flex (the shipped path) | 932-935 | 5.7 GiB |
+| PR #18 flex (sink out of the kernel) | 520 | 5.7 GiB |
+| gather, fp32 post-gather math | **92.0** | 19.6 GiB |
+
+Correctness (jobs 389/392, `tests/unit_tests/gpu/test_dsv4_csa_gather.py`):
+against an fp32 dense masked softmax over the exact positions both paths
+attend, the gather path is *closer to truth than flex on every tensor* --
+dswa_k 3.3e-3 vs 4.5e-3, dcmp_k 3.3e-3 vs 4.5e-3, dattn_sink 2.6e-3 vs
+6.8e-3 rel-norm. A first version gathered bf16 rows and accumulated the KV
+gradient in bf16 through `index_select`'s backward (1.5-2.7 % error on the KV
+grads); gathering from an fp32 copy fixed it and was also faster (fp32
+`index_add` beats bf16 atomics) and smaller (30 -> 19.6 GiB).
+
+**Do not read the 520 vs 92 as the in-training comparison.** The bench feeds
+random indexer tensors, so each query's 512 top-k picks scatter uniformly and
+the 32 queries in a block touch nearly every KV block: a near-dense block mask,
+i.e. a worst case for flex. With real data the selections cluster and flex
+skips blocks; the PR #18 training run (92.15 TFLOP/s, ~8.5 s/step total) is
+only possible if its attention costs far less than 21 x 520 ms. The gather
+kernel's cost is *fixed* at 641 keys/query (~92 ms/layer, ~1.9 s/step)
+whatever the pattern. Which is faster on real data is decided by the PR #18
+profile (`/mnt/dgxc/profiles/dsv4_flash_8k_ep4_blk32_pr18/`), not by this
+bench. The old kernel matched between bench (932) and profile (890 + fwd)
+because its captured-buffer-gradient path was insensitive to block sparsity --
+part of why it was so slow on real data.
+
 ## Configs added
 
 In `torchtitan/models/deepseek_v4/config_registry.py`:
