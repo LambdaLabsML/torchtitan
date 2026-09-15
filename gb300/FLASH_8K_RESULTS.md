@@ -176,7 +176,7 @@ window=128), fwd+bwd per layer call, 5 iters after 3 warmups:
 | PR #18 flex (sink out of the kernel) | 520 | 5.7 GiB |
 | gather, fp32 post-gather math | **92.0** | 19.6 GiB |
 
-Correctness (jobs 389/392, `tests/unit_tests/gpu/test_dsv4_csa_gather.py`):
+Correctness (job 393, 3/3 passed; `tests/unit_tests/gpu/test_dsv4_csa_gather.py`):
 against an fp32 dense masked softmax over the exact positions both paths
 attend, the gather path is *closer to truth than flex on every tensor* --
 dswa_k 3.3e-3 vs 4.5e-3, dcmp_k 3.3e-3 vs 4.5e-3, dattn_sink 2.6e-3 vs
