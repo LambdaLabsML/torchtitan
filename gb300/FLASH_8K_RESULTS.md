@@ -11,7 +11,8 @@ steps 15+ (skipping warmup/compile), peak memory from the last step line.
 | baseline (stock recipe, 4096) | `deepseek_v4_flash_64xgb300` | 24.14 | 56.14 GiB (20.3 %) |
 | **8k reference** (same recipe at 8192) | `deepseek_v4_flash_8k` | **18.29** | 95.14 GiB (34.4 %) |
 | best, config only | `deepseek_v4_flash_8k_ep4_blk32` | 25.45 | 76.58 GiB (27.7 %) |
-| **best** | same config + **PR #18** (sink out of the kernel), branch `dsv4_flash_pr18_attn` | **92.15** | 76.18 GiB (27.6 %) |
+| PR #18 | same config + PR #18 (sink out of the kernel), branch `dsv4_flash_pr18_attn` | 92.15 | 76.18 GiB (27.6 %) |
+| **best** | PR #18 + `minimal_async_ep` + `mixed_precision_reduce=bfloat16`, `deepseek_v4_flash_pr18_asyncep_bf16reduce` on `dsv4_flash_pr18_sweep` | **100.09** | 74.78 GiB (27.0 %) |
 
 Config tuning alone is **+39.1 %** over the 8k reference. With PR #18 on top
 it is **5.0x the 8k reference (3.62x the tuned config)**, at the same memory,
@@ -247,9 +248,10 @@ Each config is the 92.15 TFLOP/s tuned config with one lever moved.
 | `moe_comm_backend=minimal_async_ep` | `pr18_asyncep` | **96.66** | **+4.9 %** | 78.12 GiB | real; +1.9 GiB only (no Kimi-style buffer blow-up), 0 allocator retries. Needed no code change: the shared dispatcher-capacity code fills `num_max_tokens_per_rank` at config time. |
 | 2x microbatch | `pr18_bs2` | -- | -- | -- | **crash at step 0 (7.5 min, not a hang)**: `CheckpointError: Recomputed values ... have different metadata` -- MoE routed-token tensors `[67898, 4096]` vs `[67896, 4096]` between forward and FullAC recompute. See below. |
 
-**Round 2 queued:** `pr18_asyncep_bf16reduce` -- the two comm levers stacked
-(different collectives: MoE all-to-all overlap vs FSDP reduce-scatter bytes;
-multiplicative would be ~100.4).
+**Round 2:** `pr18_asyncep_bf16reduce` -- the two comm levers stacked --
+**100.09 TFLOP/s (+8.6 %)** at 74.78 GiB. Multiplicative prediction from the
+solo runs was ~100.4, so they compose as expected (different collectives: MoE
+all-to-all overlap vs FSDP reduce-scatter bytes). This is the current best.
 
 **2x microbatch vs FullAC: non-deterministic MoE routing.** At 16384
 tokens/rank the router dispatched two fewer tokens to the local experts during
