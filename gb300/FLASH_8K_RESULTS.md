@@ -269,10 +269,13 @@ reaching this point; whether they would have hit it is unknown.
 transformer block. Under torchtitan's per-block compile that tensor is an
 Inductor intermediate whose layout is not yet fixed when the flex template
 renders the `mask_mod`, and Inductor asserts. Standalone flex never sees this:
-the tensor is a real input. Workaround under test: `@torch.compiler.disable`
-on `_build_block_mask`, so the mask is built eagerly and enters the flex region
-as a graph input (one graph break per block; the index math is small, and the
-compile target is the HC-branch elementwise work anyway).
+the tensor is a real input. Attempt 2 -- `@torch.compiler.disable` on `_build_block_mask` so the mask is
+built eagerly -- failed with `torch._dynamo.exc.Unsupported: Skip inlining
+torch.compiler.disable()'d function`: Dynamo would not graph-break around it,
+consistent with the blocks being compiled `fullgraph`. Next options are
+allowing graph breaks on this branch or hoisting the DSA mask construction
+out of the compiled block (the pattern other torchtitan models use, but DSA's
+mask is data-dependent per layer via the indexer).
 
 ## Configs added
 
