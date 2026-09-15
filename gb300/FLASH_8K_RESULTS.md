@@ -247,7 +247,9 @@ Each config is the 92.15 TFLOP/s tuned config with one lever moved.
 | `compile.enable=True` (model+loss) | `pr18_compile` | 92.18 (attempt 3) | +0.0 % | 77.04 GiB | attempts 1-2 failed (Inductor `FlexibleLayout` assert; then `fullgraph=True` forbidding the graph break the fix needs); attempt 3 with `fullgraph=False` runs but is flat. See below. |
 | `moe_comm_backend=minimal_async_ep` | `pr18_asyncep` | **96.66** | **+4.9 %** | 78.12 GiB | real; +1.9 GiB only (no Kimi-style buffer blow-up), 0 allocator retries. Needed no code change: the shared dispatcher-capacity code fills `num_max_tokens_per_rank` at config time. |
 | 2x microbatch | `pr18_bs2` | -- | -- | -- | crash at step 0: `CheckpointError`, MoE routed-token count differs between forward and FullAC recompute. See below. |
-| 2x microbatch, `debug.deterministic` | `pr18_bs2_det` | 80.90 | -12.2 % (confounded) | 101.04 GiB | runs; number includes the deterministic-mode tax -- 1x-det baseline queued |
+| 1x, `debug.deterministic` | `pr18_det` | 92.66 | +0.6 % | 76.86 GiB | deterministic mode is **free** at 1x -- so the batch numbers below are clean |
+| 2x microbatch, `debug.deterministic` | `pr18_bs2_det` | 80.90 | **-12.7 %** vs 1x-det | 101.04 GiB | batch hurts |
+| 3x microbatch, `debug.deterministic` | `pr18_bs3_det` | 70.55 | **-23.9 %** vs 1x-det | 134.92 GiB | batch hurts more; memory was never the limit |
 
 **Round 2:** `pr18_asyncep_bf16reduce` -- the two comm levers stacked --
 **100.09 TFLOP/s (+8.6 %)** at 74.78 GiB. Multiplicative prediction from the
@@ -294,6 +296,19 @@ for hours. Under test on branch `dsv4_flash_pr18_noautotune`
 (`max_autotune=False`, `coordinate_descent_tuning=False` -- the state the
 FlexAttention docstring itself prescribes once `kernel_options` are pinned):
 1x for the baseline effect, 2x for the flip.
+
+**Batch size: dead as a throughput lever on DSv4 flash.** With deterministic
+mode shown to be free (92.66 vs 92.15 at 1x), the curve is clean:
+1x 92.66 -> 2x 80.90 -> 3x 70.55 TFLOP/s, monotonically worse, while memory
+climbs 77 -> 101 -> 135 GiB of 276. Larger microbatches are affordable and
+counter-productive. Likely mechanism: the DSA indexer scores every query
+against every compressed key of the whole folded microbatch
+(`Indexer.select`, `einsum("shd,td->sht")` with s = t = T) and the selection
+mask is a dense `[T, T + n_cmp]`, so attention-side cost per token grows with
+T instead of staying flat; the extra tokens do not amortise anything the
+step was paying per microbatch. (Whether attention over the folded stream is
+meant to span packed documents is a model question, not addressed here.)
+No bs4, no batch stack. Round-3 `pr18_stack_bs2` is not run.
 
 **torch.compile vs the DSA block mask.** `dsa_mask_mod` indexes a dense
 `selected_mask` tensor that `_build_block_mask` builds *inside* the
