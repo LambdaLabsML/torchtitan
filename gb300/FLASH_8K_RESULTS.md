@@ -245,11 +245,24 @@ Each config is the 92.15 TFLOP/s tuned config with one lever moved.
 | `mixed_precision_reduce=bfloat16` | `pr18_bf16reduce` | **95.54** | **+3.7 %** | 72.03 GiB | real (spread 1.3 %); was noise under the old kernel, now NCCL is 30 % of kernel time |
 | `compile.enable=True` (model+loss) | `pr18_compile` | -- | -- | -- | **Inductor failure** in the flex template: `convert FlexibleLayout to FixedLayout first` while rendering `dsa_mask_mod`. See below. Retried as `compile2` with the block-mask build excluded from compile. |
 | `moe_comm_backend=minimal_async_ep` | `pr18_asyncep` | **96.66** | **+4.9 %** | 78.12 GiB | real; +1.9 GiB only (no Kimi-style buffer blow-up), 0 allocator retries. Needed no code change: the shared dispatcher-capacity code fills `num_max_tokens_per_rank` at config time. |
-| 2x microbatch | `pr18_bs2` | pending | | | 3/3 hangs under the old kernel; 2 h clock |
+| 2x microbatch | `pr18_bs2` | -- | -- | -- | **crash at step 0 (7.5 min, not a hang)**: `CheckpointError: Recomputed values ... have different metadata` -- MoE routed-token tensors `[67898, 4096]` vs `[67896, 4096]` between forward and FullAC recompute. See below. |
 
 **Round 2 queued:** `pr18_asyncep_bf16reduce` -- the two comm levers stacked
 (different collectives: MoE all-to-all overlap vs FSDP reduce-scatter bytes;
 multiplicative would be ~100.4).
+
+**2x microbatch vs FullAC: non-deterministic MoE routing.** At 16384
+tokens/rank the router dispatched two fewer tokens to the local experts during
+the activation-checkpoint recompute than in the original forward (`[67898]` vs
+`[67896]` int64 indices; `[N, 4096]` / `[N, 2048]` expert inputs). Top-k
+routing flipped on a near-tie, i.e. floating-point nondeterminism in the gate
+path at this shape -- consistent with cuBLAS choosing a split-K / atomic GEMM
+at 16384 tokens that it does not choose at 8192, where 30-step runs have been
+reproducible dozens of times. Because routing feeds an all-to-all, one rank's
+flip changes every rank's received count. Note this is a different failure
+from the old-kernel 2x/4x attempts (330/341/365), which stalled without
+reaching this point; whether they would have hit it is unknown.
+`determinism_check="none"` is NOT the fix -- the shapes really differ.
 
 **torch.compile vs the DSA block mask.** `dsa_mask_mod` indexes a dense
 `selected_mask` tensor that `_build_block_mask` builds *inside* the
