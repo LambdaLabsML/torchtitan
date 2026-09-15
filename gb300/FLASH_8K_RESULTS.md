@@ -244,7 +244,7 @@ Each config is the 92.15 TFLOP/s tuned config with one lever moved.
 | lever | config | TFLOP/s | vs 92.15 | peak | note |
 |---|---|---:|---:|---:|---|
 | `mixed_precision_reduce=bfloat16` | `pr18_bf16reduce` | **95.54** | **+3.7 %** | 72.03 GiB | real (spread 1.3 %); was noise under the old kernel, now NCCL is 30 % of kernel time |
-| `compile.enable=True` (model+loss) | `pr18_compile` | -- | -- | -- | **Inductor failure** in the flex template: `convert FlexibleLayout to FixedLayout first` while rendering `dsa_mask_mod`. See below. Retried as `compile2` with the block-mask build excluded from compile. |
+| `compile.enable=True` (model+loss) | `pr18_compile` | 92.18 (attempt 3) | +0.0 % | 77.04 GiB | attempts 1-2 failed (Inductor `FlexibleLayout` assert; then `fullgraph=True` forbidding the graph break the fix needs); attempt 3 with `fullgraph=False` runs but is flat. See below. |
 | `moe_comm_backend=minimal_async_ep` | `pr18_asyncep` | **96.66** | **+4.9 %** | 78.12 GiB | real; +1.9 GiB only (no Kimi-style buffer blow-up), 0 allocator retries. Needed no code change: the shared dispatcher-capacity code fills `num_max_tokens_per_rank` at config time. |
 | 2x microbatch | `pr18_bs2` | -- | -- | -- | **crash at step 0 (7.5 min, not a hang)**: `CheckpointError: Recomputed values ... have different metadata` -- MoE routed-token tensors `[67898, 4096]` vs `[67896, 4096]` between forward and FullAC recompute. See below. |
 
@@ -278,11 +278,18 @@ Inductor intermediate whose layout is not yet fixed when the flex template
 renders the `mask_mod`, and Inductor asserts. Standalone flex never sees this:
 the tensor is a real input. Attempt 2 -- `@torch.compiler.disable` on `_build_block_mask` so the mask is
 built eagerly -- failed with `torch._dynamo.exc.Unsupported: Skip inlining
-torch.compiler.disable()'d function`: Dynamo would not graph-break around it,
-consistent with the blocks being compiled `fullgraph`. Next options are
-allowing graph breaks on this branch or hoisting the DSA mask construction
-out of the compiled block (the pattern other torchtitan models use, but DSA's
-mask is data-dependent per layer via the indexer).
+torch.compiler.disable()'d function`: torchtitan compiles each block with
+`fullgraph=True` (`distributed/compile.py:70`), so the graph break the
+workaround needs is fatal.
+
+Attempt 3 -- `fullgraph=False` on this branch (job 401) -- **runs, and is
+flat: 92.18 vs 92.15**, +0.9 GiB. So compile is *possible* on DSv4 flash but
+as configured buys nothing. The likely reason is fragmentation: every block
+breaks at the eager mask build and again at the all-to-all dispatcher's
+`.tolist()` host sync, so the HC-branch elementwise chains that motivated
+compiling are split across small subgraphs. Confirming that needs a profile
+of the compiled run (does the ~153k-launch elementwise bucket shrink at all?).
+Not stacked with the comm levers -- nothing to add.
 
 ## Configs added
 
