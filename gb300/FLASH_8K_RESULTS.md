@@ -246,7 +246,8 @@ Each config is the 92.15 TFLOP/s tuned config with one lever moved.
 | `mixed_precision_reduce=bfloat16` | `pr18_bf16reduce` | **95.54** | **+3.7 %** | 72.03 GiB | real (spread 1.3 %); was noise under the old kernel, now NCCL is 30 % of kernel time |
 | `compile.enable=True` (model+loss) | `pr18_compile` | 92.18 (attempt 3) | +0.0 % | 77.04 GiB | attempts 1-2 failed (Inductor `FlexibleLayout` assert; then `fullgraph=True` forbidding the graph break the fix needs); attempt 3 with `fullgraph=False` runs but is flat. See below. |
 | `moe_comm_backend=minimal_async_ep` | `pr18_asyncep` | **96.66** | **+4.9 %** | 78.12 GiB | real; +1.9 GiB only (no Kimi-style buffer blow-up), 0 allocator retries. Needed no code change: the shared dispatcher-capacity code fills `num_max_tokens_per_rank` at config time. |
-| 2x microbatch | `pr18_bs2` | -- | -- | -- | **crash at step 0 (7.5 min, not a hang)**: `CheckpointError: Recomputed values ... have different metadata` -- MoE routed-token tensors `[67898, 4096]` vs `[67896, 4096]` between forward and FullAC recompute. See below. |
+| 2x microbatch | `pr18_bs2` | -- | -- | -- | crash at step 0: `CheckpointError`, MoE routed-token count differs between forward and FullAC recompute. See below. |
+| 2x microbatch, `debug.deterministic` | `pr18_bs2_det` | 80.90 | -12.2 % (confounded) | 101.04 GiB | runs; number includes the deterministic-mode tax -- 1x-det baseline queued |
 
 **Round 2:** `pr18_asyncep_bf16reduce` -- the two comm levers stacked --
 **100.09 TFLOP/s (+8.6 %)** at 74.78 GiB. Multiplicative prediction from the
@@ -268,8 +269,14 @@ reaching this point; whether they would have hit it is unknown.
 Retry with `CUBLAS_WORKSPACE_CONFIG=:4096:8` (job 400) failed identically
 (`[105470]` vs `[105469]`), so deterministic cuBLAS is not (the whole) answer;
 remaining suspects are cuBLASLt algorithm choice, Triton kernels, the bf16x9
-fp32-emulation path, or an unlisted op. Diagnostic retry under
-`debug.deterministic` (torch.use_deterministic_algorithms, warn-only) queued.
+fp32-emulation path, or an unlisted op. **Under `debug.deterministic`
+(torch.use_deterministic_algorithms, warn-only; job 402) 2x reaches 30 steps:
+80.90 TFLOP/s at 101.04 GiB, zero fallback warnings.** So the flip is inside
+that flag's coverage but not cuBLAS -- a float scatter/index-class op in the
+block forward. 80.90 mixes the 2x effect with the deterministic-mode tax;
+`pr18_det` (1x, deterministic) isolates the tax and `pr18_bs3_det` extends the
+curve. The surgical fix is to find and replace that one op (torchtitan already
+did exactly this for the MoE combine: `deterministic_scatter_add`).
 
 **torch.compile vs the DSA block mask.** `dsa_mask_mod` indexes a dense
 `selected_mask` tensor that `_build_block_mask` builds *inside* the
