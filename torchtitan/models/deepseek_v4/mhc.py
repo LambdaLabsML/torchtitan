@@ -87,9 +87,15 @@ class HcPre(Module):
         hc_dim = hc_mult * config.dim
         self.hc_mult = config.hc_mult
         self.norm_eps = config.norm_eps
-        self.hc_fn = nn.Parameter(torch.empty(mix_hc, hc_dim))
-        self.hc_base = nn.Parameter(torch.empty(mix_hc))
-        self.hc_scale = nn.Parameter(torch.empty(3))
+        # self.hc_fn = nn.Parameter(torch.empty(mix_hc, hc_dim))
+        # self.hc_base = nn.Parameter(torch.empty(mix_hc))
+        # self.hc_scale = nn.Parameter(torch.empty(3))
+
+        # CL/DM
+        self.hc_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))
+        self.hc_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
+        self.hc_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+        # CL/DM
         self.sinkhorn = HcSplitSinkhorn.Config(
             hc_mult=config.hc_mult,
             sinkhorn_iters=config.sinkhorn_iters,
@@ -109,9 +115,12 @@ class HcPre(Module):
         shape, dtype = x.size(), x.dtype
         x = x.flatten(-2).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(x, self.hc_fn.float()) * rsqrt
+        # CL/DM
+        # mixes = F.linear(x, self.hc_fn.float()) * rsqrt
+        mixes = F.linear(x, self.hc_fn) * rsqrt
         pre, post, comb = self.sinkhorn(
-            mixes.float(), self.hc_scale.float(), self.hc_base.float()
+            # mixes.float(), self.hc_scale.float(), self.hc_base.float()
+            mixes.float(), self.hc_scale, self.hc_base
         )
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=-2)
         return y.to(dtype), post, comb

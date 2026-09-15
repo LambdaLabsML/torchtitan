@@ -111,6 +111,45 @@ Next step is a stack dump from a wedged rank (`py-spy dump`, or
 `PYTORCH_DISTRIBUTED_DEBUG=DETAIL` plus the NCCL flight recorder) to see which
 collective is blocked -- not another long run at a different batch size.
 
+## Attention backward: the 72.5 % kernel, and why tiles cannot fix it
+
+The profile of the best config puts ONE kernel,
+`triton_tem_fused_flex_attention_backward_2`, at **72.5 % of GPU time**:
+517 ms/call mean, against 7.3 ms for its own forward. It alternates by layer --
+890 ms on the 21 `compress_ratio=4` (CSA) layers, 166 ms on the 20
+`compress_ratio=128`, 129 ms on the 2 `compress_ratio=1` -- so 21 layers carry
+84 % of it. The trace shows the kernel at 255 registers/thread (the maximum),
+99,328 B shared memory (`limitingFactors=SMEM`), `num_stages=1`. Full
+analysis: `/mnt/dgxc/profiles/dsv4_flash_8k_ep4_blk32/ATTENTION_BACKWARD_FINDING.md`.
+
+Three tile experiments on the best config, all 30 steps:
+
+| change | TFLOP/s | vs 25.45 | verdict |
+|---|---:|---:|---|
+| `num_stages` 1 -> 2 (jobs 374, 382) | 25.43 / 25.41 | flat | pipelining is not the bottleneck; also widened autotune 7 -> 13 candidates (~40 min startup) |
+| M1/N1/M2/N2 = 32/32/32/32 (383) | **24.06** | **-5.5 %** | larger tiles are *worse* |
+| M1=64, N1=32 / M2=32, N2=64 (381) | -- | -- | **illegal**: tiles must divide `block_size=32` |
+
+Two facts fell out of this that were not known before:
+
+1. **`block_size` caps the backward tiles.** FlexAttention requires
+   `SPARSE_Q/KV_BLOCK_SIZE` (= `block_size`) to be divisible by every tile,
+   so at `block_size=32` no tile can exceed 32. The +15.8 % `block_size`
+   128 -> 32 win therefore also locked the backward into its smallest tiles;
+   a coarser mask paired with the larger tiles it permits was never measured.
+2. Observed shared memory is exactly `2*(M1+N1)*head_dim*2` B, so GB300's
+   232,448 B caps `M1+N1 <= 113`.
+
+**Verdict:** tile geometry cannot fix this kernel -- the generic template at
+`head_dim=512` is the ceiling. The fix is the seam `DSV4FlexAttention`'s own
+docstring names: replace `forward` for CSA with a kernel that consumes the raw
+tensors. That is branch `dsv4_flash_csa_gather_attention`
+(`/mnt/dgxc/worktrees/dsv4-csa-gather`): K is V, the KV stream is one head
+shared by all 64 query heads, and each query attends <=641 explicit positions,
+so `dsa_gather_attention` gathers those rows once and runs the attention as
+batched cuBLAS GEMMs. Config `deepseek_v4_flash_8k_ep4_blk32_gather`; result
+pending as of this writing.
+
 ## Configs added
 
 In `torchtitan/models/deepseek_v4/config_registry.py`:
