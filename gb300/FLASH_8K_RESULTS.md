@@ -10,10 +10,13 @@ steps 15+ (skipping warmup/compile), peak memory from the last step line.
 |---|---|---:|---:|
 | baseline (stock recipe, 4096) | `deepseek_v4_flash_64xgb300` | 24.14 | 56.14 GiB (20.3 %) |
 | **8k reference** (same recipe at 8192) | `deepseek_v4_flash_8k` | **18.29** | 95.14 GiB (34.4 %) |
-| **best** | `deepseek_v4_flash_8k_ep4_blk32` | **25.45** | 76.58 GiB (27.7 %) |
+| best, config only | `deepseek_v4_flash_8k_ep4_blk32` | 25.45 | 76.58 GiB (27.7 %) |
+| **best** | same config + **PR #18** (sink out of the kernel), branch `dsv4_flash_pr18_attn` | **92.15** | 76.18 GiB (27.6 %) |
 
-**+39.1 % over the 8k reference**, and above the 4096 baseline while doing 2x
-the context. Everything below is measured against the 8k reference, not the
+Config tuning alone is **+39.1 %** over the 8k reference. With PR #18 on top
+it is **5.0x the 8k reference (3.62x the tuned config)**, at the same memory,
+with a normal loss trajectory (12.18 -> 2.82 at step 30 vs the reference's
+2.84). See "The 72.5 % kernel" below for what PR #18 actually removes. Everything below is measured against the 8k reference, not the
 4096 baseline: doubling context changes attention work per token, so a
 cross-length comparison would not be clean.
 
@@ -140,8 +143,20 @@ Two facts fell out of this that were not known before:
 2. Observed shared memory is exactly `2*(M1+N1)*head_dim*2` B, so GB300's
    232,448 B caps `M1+N1 <= 113`.
 
-**Verdict:** tile geometry cannot fix this kernel -- the generic template at
-`head_dim=512` is the ceiling. The fix is the seam `DSV4FlexAttention`'s own
+**What it actually was (PR #18, C. Lowman, `dsv4_flash_pr18_attn`).** The
+sink was a zero-valued KV token whose score a `score_mod` replaced with the
+learned `attn_sink[h]` -- a tensor that *requires grad*. FlexAttention then
+has to produce `grad_score_mod_captured` through the joint graph inside the
+backward template on every block, a known slow path. PR #18 removes the sink
+from the kernel and applies it afterwards as `out * sigmoid(lse - sink[h])`,
+which is the identical softmax (the sink's V row was zero, so it only ever
+scaled the denominator; verified to 1e-15 in float64, gradients included).
+Result on the tuned config: **92.15 TFLOP/s, 3.62x**, same memory. The
+register/SMEM pressure in the trace was real but was a *consequence* of that
+fused captured-buffer gradient, not the fundamental cost of `head_dim=512`.
+
+**Verdict:** tile geometry cannot fix this kernel, and it turned out not to
+need fixing -- it needed the captured buffer taken out of it. The fix is the seam `DSV4FlexAttention`'s own
 docstring names: replace `forward` for CSA with a kernel that consumes the raw
 tensors. That is branch `dsv4_flash_csa_gather_attention`
 (`/mnt/dgxc/worktrees/dsv4-csa-gather`): K is V, the KV stream is one head
