@@ -279,9 +279,21 @@ curve. The surgical fix is to find and replace that one op (torchtitan already
 did exactly this for the MoE combine: `deterministic_scatter_add`). Ruled
 out: cuBLASLt -- this torch's default BLAS preference is already cuBLAS, so
 a "prefer cuBLAS" bisect run would have replicated job 400 (cancelled). No
-float scatter/index op exists in the block forward either. Leading suspect:
-`torch.topk` tie-breaking in the router / indexer (CUDA radix-select collects
-boundary ties with an atomic counter -- execution-order dependent).
+float scatter/index op exists in the block forward either. `torch.topk` was
+the next suspect, but `use_deterministic_algorithms` does not touch it, and
+every op the flag *does* list that appears in this forward path is
+integer-typed (exact atomics). So the flag worked through a side effect --
+and the one that fits everything is **Inductor**: `inductor.config.deterministic`
+follows the flag and disables benchmark-driven autotuning. FlexAttention
+compiles with `max_autotune` + `coordinate_descent_tuning`; at an uncached
+shape the forward and the FullAC recompute can each autotune and pick
+different tile variants, whose rounding differences flip router near-ties by
+a token or two. At 1x the node-local Inductor cache is warm so both pick the
+same kernel. This also explains the old-kernel 2x/4x runs sitting in autotune
+for hours. Under test on branch `dsv4_flash_pr18_noautotune`
+(`max_autotune=False`, `coordinate_descent_tuning=False` -- the state the
+FlexAttention docstring itself prescribes once `kernel_options` are pinned):
+1x for the baseline effect, 2x for the flip.
 
 **torch.compile vs the DSA block mask.** `dsa_mask_mod` indexes a dense
 `selected_mask` tensor that `_build_block_mask` builds *inside* the
