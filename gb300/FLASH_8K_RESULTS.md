@@ -276,7 +276,12 @@ that flag's coverage but not cuBLAS -- a float scatter/index-class op in the
 block forward. 80.90 mixes the 2x effect with the deterministic-mode tax;
 `pr18_det` (1x, deterministic) isolates the tax and `pr18_bs3_det` extends the
 curve. The surgical fix is to find and replace that one op (torchtitan already
-did exactly this for the MoE combine: `deterministic_scatter_add`).
+did exactly this for the MoE combine: `deterministic_scatter_add`). Ruled
+out: cuBLASLt -- this torch's default BLAS preference is already cuBLAS, so
+a "prefer cuBLAS" bisect run would have replicated job 400 (cancelled). No
+float scatter/index op exists in the block forward either. Leading suspect:
+`torch.topk` tie-breaking in the router / indexer (CUDA radix-select collects
+boundary ties with an atomic counter -- execution-order dependent).
 
 **torch.compile vs the DSA block mask.** `dsa_mask_mod` indexes a dense
 `selected_mask` tensor that `_build_block_mask` builds *inside* the
