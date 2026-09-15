@@ -13,6 +13,7 @@ from torch import nn
 from torch.nn.attention.flex_attention import BlockMask
 
 from torchtitan.models.common.attention import (
+    apply_attention_sink_rescale,
     AttentionMasksType,
     BaseAttention,
     create_varlen_metadata_for_document,
@@ -31,15 +32,6 @@ from torchtitan.models.utils import (
     quadratic_attention_flops_per_token,
 )
 from torchtitan.protocols.module import Module
-
-
-def apply_attention_sink_rescale(
-    out: torch.Tensor, lse: torch.Tensor, sinks: torch.Tensor
-) -> torch.Tensor:
-    """Rescale attention output by the learned per-head sink term."""
-    sinks = sinks.view(*([1] * (lse.ndim - 1)), -1)
-    sink_scale = torch.sigmoid(lse - sinks).unsqueeze(-1)
-    return out * sink_scale.to(out.dtype)
 
 
 class Attention(BaseAttention):

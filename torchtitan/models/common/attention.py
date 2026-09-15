@@ -66,6 +66,7 @@ __all__ = [
     "get_fixed_block_mask_mod",
     "get_sliding_window_mask_mod",
     "local_head_split",
+    "apply_attention_sink_rescale",
 ]
 
 
@@ -119,6 +120,15 @@ def local_head_split(
         if spmd.is_type_checking():
             spmd.assert_type(out, output_type)
     return out
+
+
+def apply_attention_sink_rescale(
+    out: torch.Tensor, lse: torch.Tensor, sinks: torch.Tensor
+) -> torch.Tensor:
+    """Rescale attention output by the learned per-head sink term."""
+    sinks = sinks.view(*([1] * (lse.ndim - 1)), -1)
+    sink_scale = torch.sigmoid(lse - sinks).unsqueeze(-1)
+    return out * sink_scale.to(out.dtype)
 
 
 class InnerAttention(Module):
