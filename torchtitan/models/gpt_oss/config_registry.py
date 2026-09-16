@@ -957,3 +957,124 @@ def gpt_oss_120b_noreshard_bs1() -> Trainer.Config:
     config = gpt_oss_120b_ep8_compile()
     config.parallelism.fsdp_reshard_after_forward = "never"
     return config
+
+
+# ---------------------------------------------------------------------------
+# Communication-efficiency wave (2026-09-16).
+#
+# Motivation and the correction it rests on. The trace that started this work
+# (job 1399, outputs/profiling/traces_120b_best/iteration_400) shows 41.0% of
+# kernel time in NCCL and only 9.6% of that comm hidden behind compute. Both
+# numbers are real, but they do NOT describe the 660 TFLOPs configuration:
+#
+#   job 237  gpt_oss_120b_ep8_compile_bs_increase  ~660 TFLOPs  step ~1,122 ms
+#   job 1399 same config, profiled                 ~460 TFLOPs  step ~1,674 ms
+#
+# Job 1399 was missing three environment variables that job 237 set:
+#   TORCH_NCCL_AVOID_RECORD_STREAMS=1
+#   NCCL_NVLS_ENABLE=0
+#   PYTORCH_ALLOC_CONF=...,garbage_collection_threshold:0.8
+# and it ran at 173.52GiB (97.29%) against job 237's 169.50GiB (95.04%).
+#
+# What the trace actually shows, measured per rank: all 7 non-rank-4 ranks each
+# sit ~185 ms inside ONE ncclDevKernel_SendRecv waiting for rank 4, whose GPU is
+# 29 ms busy out of that 185 ms window while its CPU is stuck in
+# CompiledFunctionBackward. So the dominant "communication" cost in that trace
+# is rank desynchronization under memory pressure, not bytes on the wire.
+# Correlating every NCCL kernel to its collective through the profiler's
+# "External id" (analyze_trace_comm.py) prices this exactly:
+#
+#   collective              bytes/step   kernel time   best rate   transfer   wait
+#   all_to_allv  (bf16)       55.87 GB     564.86 ms   713 GB/s    78.33 ms  486.53 ms
+#   reduce_scatter (fp32)      8.51 GB     122.27 ms   638 GB/s    13.34 ms  108.93 ms
+#   all_gather   (bf16)        1.21 GB      29.21 ms    82 GB/s    14.79 ms   14.42 ms
+#   ---------------------------------------------------------------------------------
+#   total                                   716.34 ms              106.46 ms  609.88 ms
+#
+# "transfer" is the time those same bytes would take at the best rate the run
+# itself achieved. So of 716 ms of NCCL kernel time, ~107 ms moves data and
+# ~610 ms is ranks waiting for each other. The largest dispatches (804-819 MB)
+# hit 693-713 GB/s, close to NVLink peak, while 52-135 MB calls land at
+# 0.3-14 GB/s -- those are not slow transfers, they are stalls.
+# Bandwidth is not the problem; arrival skew is.
+#
+# Trace compute union is 1,050 ms. Against job 237's 1,122 ms step that leaves
+# only ~70 ms of exposed comm at 660 TFLOPs, so the 41% headline overstates the
+# available win by roughly an order of magnitude. run_profile_v2.sbatch re-takes
+# the trace with job 237's environment to replace these estimates with a
+# measurement.
+#
+# The one comm cost the trace shows that is NOT overlap-dependent, and therefore
+# survives the correction, is the fp32 gradient path (see gpt_oss_120b_bf16reduce).
+# ---------------------------------------------------------------------------
+
+
+def gpt_oss_120b_bf16reduce() -> Trainer.Config:
+    """Best 120b config with the FSDP gradient reduce-scatter in bf16.
+
+    Single variable against gpt_oss_120b_ep8_compile_bs_increase (job 237,
+    ~660 TFLOPs/GPU, 14,600 tok/s/GPU, 169.50GiB): only
+    training.mixed_precision_reduce moves from "float32" to "bfloat16".
+
+    Why this one is not overlap-dependent. FSDP reduces gradients in fp32 while
+    the model trains in bf16, so every step pays twice:
+
+      ncclDevKernel_ReduceScatter_Sum_f32   122.27 ms   fp32 bytes on the wire
+      chunk_cat_cuda_kernel<float, BFloat16> 75.94 ms   bf16 -> fp32 copy-in
+
+    The 75.94 ms is ordinary compute on the critical path -- it is not comm and
+    cannot be hidden by better overlap -- and halving the reduce-scatter payload
+    is a byte reduction that does not depend on arrival skew. Verified against
+    the trace's record_param_comms: reduce-scatter input totals 2.114e9 elements
+    per step (2 x 579,133,440 for tok_embeddings and lm_head at vocab 201,088 x
+    dim 2,880, plus 36 x 26,924,672 for the per-layer dense params), which is
+    exactly the 2.114B dense parameter count. The 114.71B expert params are
+    EP-sharded and never enter this collective, so bf16 reduction here touches
+    only 1.8% of the model's parameters.
+
+    Expected size, stated before measuring: the Qwen3.5-122B precedent on this
+    same cluster measured +4.5% (RESULTS_QWEN35.md §17, jobs 647/648), and the
+    lesson recorded there applies -- a profile bucket's size is an upper bound on
+    what removing it can save, not an estimate, because FSDP already overlaps
+    gradient reduction with backward compute. Anything from +3% to +8% would be
+    consistent.
+
+    THIS CHANGES TRAINING NUMERICS and is not cleared for a real run. Gradients
+    reduced across 8 shards in bf16 accumulate rounding error that fp32
+    reduction exists to prevent. It must be read against a float32 control at
+    the same --debug.seed; gpt_oss_120b_ep8_compile_bs_increase run with the same
+    seed is that control, which is why no separate control config is added here.
+    On Qwen3.5 the paired curves converged (gap narrowing ~30x from step 15 to
+    150) with no instability, but 400 steps can reveal a problem, not prove its
+    absence at 10k.
+    """
+    config = gpt_oss_120b_ep8_compile_bs_increase()
+    config.training.mixed_precision_reduce = "bfloat16"
+    return config
+
+
+def gpt_oss_120b_fsdp_symm_mem() -> Trainer.Config:
+    """Best 120b config with FSDP2 symmetric-memory collectives.
+
+    Single variable against gpt_oss_120b_ep8_compile_bs_increase: only
+    parallelism.enable_fsdp_symm_mem moves from False to True. This routes the
+    FSDP all-gather and reduce-scatter through symmetric memory (direct NVLink
+    peer copies) instead of NCCL ring kernels.
+
+    Prior expectation is LOW. The same flag measured exactly flat on
+    Qwen3.5-122B on this cluster -- 11.82% MFU and 3,650 tok/s against a 3,648
+    baseline, identical peak memory (RESULTS_QWEN35.md §18, job 785). It is
+    included because the FSDP side here is a different shape than Qwen3.5's: at
+    EP=8 only the 2.114B dense params are FSDP-managed, and 1.16B of those are
+    two 579M-element embedding matrices, so this run's collectives are a few
+    very large buckets (2 x 144.8 MiB all-gathers) rather than many medium ones.
+    Symmetric memory helps large transfers more than small, so the Qwen3.5 null
+    result does not transfer cleanly.
+
+    Numerics are unchanged, so loss is directly comparable to job 237 and MFU is
+    valid. Cheap to run and independent of gpt_oss_120b_bf16reduce; if both win
+    they should be stacked and re-measured, not assumed additive.
+    """
+    config = gpt_oss_120b_ep8_compile_bs_increase()
+    config.parallelism.enable_fsdp_symm_mem = True
+    return config
