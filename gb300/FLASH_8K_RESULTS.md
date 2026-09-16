@@ -244,7 +244,7 @@ Each config is the 92.15 TFLOP/s tuned config with one lever moved.
 | lever | config | TFLOP/s | vs 92.15 | peak | note |
 |---|---|---:|---:|---:|---|
 | `mixed_precision_reduce=bfloat16` | `pr18_bf16reduce` | **95.54** | **+3.7 %** | 72.03 GiB | real (spread 1.3 %); was noise under the old kernel, now NCCL is 30 % of kernel time |
-| `compile.enable=True` (model+loss) | `pr18_compile` | 92.18 (attempt 3) | +0.0 % | 77.04 GiB | attempts 1-2 failed (Inductor `FlexibleLayout` assert; then `fullgraph=True` forbidding the graph break the fix needs); attempt 3 with `fullgraph=False` runs but is flat. See below. |
+| `compile.enable=True` (model+loss) | `pr18_compile` | 92.18 / 92.02 (attempts 3 / 4) | +0.0 % | 77 GiB | runs after fixes, **fuses nothing** (profiled twice: eager launches unchanged). Block body silently runs eager under Dynamo. Closed. See below. |
 | `moe_comm_backend=minimal_async_ep` | `pr18_asyncep` | **96.66** | **+4.9 %** | 78.12 GiB | real; +1.9 GiB only (no Kimi-style buffer blow-up), 0 allocator retries. Needed no code change: the shared dispatcher-capacity code fills `num_max_tokens_per_rank` at config time. |
 | 2x microbatch | `pr18_bs2` | -- | -- | -- | crash at step 0: `CheckpointError`, MoE routed-token count differs between forward and FullAC recompute. See below. |
 | 1x, `debug.deterministic` | `pr18_det` | 92.66 | +0.6 % | 76.86 GiB | deterministic mode is **free** at 1x -- so the batch numbers below are clean |
@@ -395,9 +395,21 @@ context manager" clause this time, resume point in the sharding wrapper -- so
 Dynamo now splits the block around the mask build rather than abandoning it,
 and **no `.tolist()` break appears**, so the MoE half traced through as well.
 That leaves one explanation for the flat 92.02: the block compiled and fusion
-bought nothing. A profiled run of the attempt-4 code (fusion check: do the
-150k eager elementwise launches finally drop?) is the definitive close-out;
-queued. Not stacked with the comm levers -- no gain to add.
+bought nothing. **Profiled (job 416, `/mnt/dgxc/profiles/dsv4_flash_8k_ep4_blk32_pr18_compiled4/`):
+still nothing fused** -- eager elementwise launches 150,512 -> 150,428 ->
+150,376 (eager / attempt 3 / attempt 4), Inductor fused kernels 258 -> 306 ->
+306 (the loss). Even with a clean split, the block body runs eagerly: the
+graphs Dynamo emits contain none of it. Remaining explanation: silent frame
+skipping for a reason `graph_breaks` does not log (SPMD `local()` /
+`no_typecheck()` or the redistribution wrapper are the candidates;
+`TORCH_LOGS=graph_code` would show what each graph contains). That is a
+Dynamo-level investigation, not a config change.
+
+**Verdict: torch.compile is not a lever on DSv4 flash today.** Four attempts
+(Inductor FlexibleLayout assert; fullgraph forbidding the fix; clean-breaking
+reorder; profile confirming no fusion), two graph-break runs, two profiles.
+Prize if it ever works: ~10-13 % of step time. Not stacked with the comm
+levers.
 
 ## Configs added
 
