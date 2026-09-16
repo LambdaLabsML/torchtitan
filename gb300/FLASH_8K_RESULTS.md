@@ -389,8 +389,15 @@ the context: **still flat, 92.02** (tps 1038 vs 1040 eager). So either
 another break inside a context manager is abandoning the frame (the outer
 `Attention.forward` uses `spmd.local()` blocks; the flex call itself is still
 inside `no_typecheck()`), or the block compiled and fusion bought nothing.
-The attempt-4 `TORCH_LOGS=graph_breaks` run (job 415) decides which. Not
-stacked with the comm levers -- no gain to add.
+The attempt-4 `TORCH_LOGS=graph_breaks` run (job 415) shows **one clean
+break per block** at the disabled `_eager_block_mask` call -- no "active
+context manager" clause this time, resume point in the sharding wrapper -- so
+Dynamo now splits the block around the mask build rather than abandoning it,
+and **no `.tolist()` break appears**, so the MoE half traced through as well.
+That leaves one explanation for the flat 92.02: the block compiled and fusion
+bought nothing. A profiled run of the attempt-4 code (fusion check: do the
+150k eager elementwise launches finally drop?) is the definitive close-out;
+queued. Not stacked with the comm levers -- no gain to add.
 
 ## Configs added
 
