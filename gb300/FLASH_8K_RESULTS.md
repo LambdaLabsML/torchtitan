@@ -377,8 +377,17 @@ graph-broke pervasively (SPMD typecheck contexts, the dispatcher's `.tolist()`
 sync, the eager mask build). Hoisting the mask removes one break source of
 several; making the block compile-friendly is a real engineering task with a
 bounded prize (elementwise is 25.8 % of kernel time; fusing half is ~10-13 %).
-A `TORCH_LOGS=graph_breaks` run enumerates the exact sites (queued). Not
-stacked with the comm levers -- nothing to add.
+**`TORCH_LOGS=graph_breaks` (job 413) found exactly one break per block**, and
+it explains the whole thing: the `torch.compiler.disable`'d `_build_block_mask`
+call at `attention.py:270` is reached *inside* `with spmd.no_typecheck():`, and
+Dynamo cannot split a graph inside a context manager it does not model
+("Attempted to graph break in an active context manager that doesn't support
+graph breaking"), so it abandoned the entire block frame. Nothing compiled;
+the dispatcher's `.tolist()` never even appeared as a break because tracing
+never reached it. Fix (attempt 4, one run): build the mask in a disabled
+helper *before* entering the context, so only the flex call is inside it and
+the rest of the block is compilable. Result pending. Not stacked with the
+comm levers until it shows a gain.
 
 ## Configs added
 
