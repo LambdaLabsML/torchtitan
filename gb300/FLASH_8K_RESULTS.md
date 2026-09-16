@@ -384,10 +384,13 @@ Dynamo cannot split a graph inside a context manager it does not model
 ("Attempted to graph break in an active context manager that doesn't support
 graph breaking"), so it abandoned the entire block frame. Nothing compiled;
 the dispatcher's `.tolist()` never even appeared as a break because tracing
-never reached it. Fix (attempt 4, one run): build the mask in a disabled
-helper *before* entering the context, so only the flex call is inside it and
-the rest of the block is compilable. Result pending. Not stacked with the
-comm levers until it shows a gain.
+never reached it. Attempt 4 (job 414) built the mask in a disabled helper *before* entering
+the context: **still flat, 92.02** (tps 1038 vs 1040 eager). So either
+another break inside a context manager is abandoning the frame (the outer
+`Attention.forward` uses `spmd.local()` blocks; the flex call itself is still
+inside `no_typecheck()`), or the block compiled and fusion bought nothing.
+The attempt-4 `TORCH_LOGS=graph_breaks` run (job 415) decides which. Not
+stacked with the comm levers -- no gain to add.
 
 ## Configs added
 
