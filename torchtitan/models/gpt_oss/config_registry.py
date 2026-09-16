@@ -22,7 +22,12 @@ from torchtitan.components.quantization import (
     MXFP8LinearConverter,
 )
 from torchtitan.components.validate import Validator
-from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.config import (
+    CompileConfig,
+    DebugConfig,
+    ParallelismConfig,
+    TrainingConfig,
+)
 from torchtitan.distributed.activation_checkpoint import (
     FullAC,
     MemoryBudgetAC,
@@ -1077,4 +1082,155 @@ def gpt_oss_120b_fsdp_symm_mem() -> Trainer.Config:
     """
     config = gpt_oss_120b_ep8_compile_bs_increase()
     config.parallelism.enable_fsdp_symm_mem = True
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Wave 2: the non-GEMM compute the corrected trace reading exposes.
+#
+# Once the 41% NCCL figure is understood as rank skew rather than bytes (see the
+# wave-1 block above), the trace's 570.54 ms of non-GEMM, non-NCCL kernel time
+# becomes the thing worth attacking. Attributed to call sites by External id:
+#
+#   ms      n    aten call site              what it is
+#   ------  ---  --------------------------  --------------------------------
+#   83.70   200  _fused_adamw_               optimizer step
+#   75.94    74  _chunk_cat                  FSDP bf16->fp32 grad copy-in
+#   38.71   439  copy_ (Memcpy DtoD)         staging copies
+#   26.43    36  <inductor fused pointwise>  router math + token permute
+#   23.89    36  <inductor fused pointwise>  index_put / index_select permute
+#   22.03    36  <inductor fused pointwise>  permute backward
+#   21.76    36  _index_put_impl_            MoE combine backward scatter
+#   21.56    36  <inductor fused pointwise>  index_put / index_select permute
+#   21.47    36  <inductor fused pointwise>  router + permute (fwd)
+#   16.55    37  div (fp32)                  FSDP gradient divide
+#   18.17   200  _foreach_norm/_foreach_mul_ grad-norm clipping
+#
+# Grouping those: ~178 ms is the MoE token permute/unpermute cluster (14
+# inductor pointwise kernels, all n=36, i.e. once per layer), ~228 ms is the
+# fp32 gradient path (_chunk_cat + fp32 div + the fp32 reduce-scatter), and
+# ~84 ms is the optimizer. Only 517 ms of the step is in GEMMs.
+#
+# The expert grouped GEMMs are the healthy part: ~352 TFLOP of expert work in
+# 341.80 ms is ~1,030 TFLOPs, 46% of the 2.25e15 bf16 peak. The dense GEMMs
+# (attention projections plus the 201,088-wide lm_head) manage ~530 TFLOPs.
+#
+# A second pattern from the logs drives the ordering below. Every configuration
+# that pushes HBM to >=97% collapses, and not by a little:
+#
+#   job 237  gpt_oss_120b_ep8_compile_bs_increase   95.04%   ~660 TFLOPs
+#   job 1399 same config, thinner env               97.29%   ~460 TFLOPs
+#   job 1300 gpt_oss_120b_mxfp8_linears             96.23%   ~460 TFLOPs
+#   job  661 gpt_oss_120b_membudget_bs3             97.55%     ~32 TFLOPs
+#   job 1518 gpt_oss_120b_noreshard                 97.56%     ~20 TFLOPs, then OOM
+#
+# That is the same mechanism as the trace's rank-4 straggler: near the limit the
+# allocator stalls, one rank falls behind, and every other rank bills the wait
+# to whatever collective it is parked in. So memory headroom is worth more here
+# than any single kernel on the list above, and a wave-2 candidate that spends
+# memory has to be judged against that, not just on its own kernel savings.
+#
+# Nothing in this block changes the permute implementation, because none of the
+# routes to one are open: TorchAOTokenDispatcher is reachable only through the
+# quantization converters, MXFP8GroupedExpertsConverter is architecturally
+# blocked (the CuTeDSL 1x32 quantize kernel needs K % 128 == 0 and GPT-OSS has
+# dim 2880), deepep and hybridep are not installed in the venv, and
+# minimal_async_ep hard-requires FullAC, which crashes under compile
+# ("AssertionError: Node add_21 was invalid, but is output"). What is left is
+# making the generated kernels better (inductor autotuning, driven by env vars
+# in run_gptoss120b_v2.sbatch since CompileConfig exposes no inductor knobs),
+# bounding how much of the cost is routing imbalance, and one retry of the
+# float8 path.
+# ---------------------------------------------------------------------------
+
+
+def gpt_oss_120b_balanced_diag() -> Trainer.Config:
+    """DIAGNOSTIC CEILING, not a shippable config: forced round-robin routing.
+
+    Sets debug.moe_force_load_balance on the best config. The router's own
+    top-k choice is replaced by round-robin assignment, so every expert receives
+    exactly the same number of tokens.
+
+    This is NOT a throughput candidate -- it changes which expert sees which
+    token, so the model being trained is not GPT-OSS-120B and the loss is
+    meaningless. It exists to put a number on how much of the MoE cost is
+    imbalance rather than intrinsic work, which three separate measurements
+    currently blame imbalance for:
+
+      - the 144 bf16 all-to-all payloads in the trace span 200.9-819.4 MB,
+        a 4x spread across calls that should be identical in a balanced model
+      - the permute kernels' cost scales with the largest expert group, not the
+        average, because grouped-mm pads to the biggest group
+      - rank 4 being ~185 ms late is consistent with it having drawn the heavy
+        share of routed tokens that step
+
+    Under forced balance all three effects vanish at once. Read the result as an
+    upper bound on what a real fix (auxiliary load-balancing loss, router
+    temperature, expert-capacity tuning) could recover, and read it on tok/s
+    only. If it is flat, imbalance is not the problem and this whole line of
+    attack closes -- which is worth one node-hour to know.
+
+    Numerics note: GptOssMoE subclasses the common MoE and does not override the
+    router, and GptOssModel subclasses the common Decoder, whose
+    update_from_config propagates debug.moe_force_load_balance into
+    router._debug_force_load_balance. So the flag does take effect on this model.
+    """
+    config = gpt_oss_120b_ep8_compile_bs_increase()
+    config.debug = DebugConfig(moe_force_load_balance=True)
+    return config
+
+
+def gpt_oss_120b_fp8_bs2() -> Trainer.Config:
+    """Float8 rowwise linears + float8 grouped experts on the best config.
+
+    gpt_oss_120b_fp8 already exists but was built on gpt_oss_120b_ep8_compile
+    (local_batch_size=1) and crashed when it ran as job 194:
+
+        CUDA error: unspecified launch failure  (cudaErrorLaunchFailure)
+        raised from currentStreamCaptureStatusMayInitCtx
+
+    This is the retry at bs=2 on the current best base rather than a re-run of
+    the same thing: the base config, the environment (job 194 predates
+    TORCH_NCCL_AVOID_RECORD_STREAMS / garbage_collection_threshold:0.8) and the
+    memory profile are all different now. It is the speculative entry of wave 2
+    and should be queued last.
+
+    Why it is worth one attempt despite the crash. Float8GroupedExpertsConverter
+    is the only open route to replacing the MoE permute: it swaps in
+    TorchAOTokenDispatcher, which uses torchao's permute_and_pad kernel instead
+    of the inductor-generated permute that costs ~178 ms per step. So this
+    single config attacks the largest non-GEMM pool AND the 341.80 ms of expert
+    grouped GEMM at once. MXFP8 cannot do this -- it needs K % 128 == 0 and
+    GPT-OSS's dim is 2880 -- but float8 needs only 16-element alignment and
+    2880 % 16 == 0.
+
+    Reading the result: MFU is computed against the bf16 peak (2.25e15), so a
+    float8 run inflates mfu% and metrics.py reports N/A. Compare on tok/s, which
+    is precision-neutral. Loss is not comparable to the bf16 runs.
+
+    Router gate and lm_head stay bf16 via filter_fqns: quantizing the router
+    perturbs expert assignment, and the 201,088-wide lm_head feeds the loss.
+
+    Memory is the risk as much as the crash. Every config in this registry that
+    reached >=97% of HBM collapsed, and bs=2 already sits at 95.04%. Float8
+    keeps master weights in bf16 and adds quantized copies plus padding, so this
+    could land the wrong side of that line even if the launch failure is gone.
+    If it OOMs or degrades, gpt_oss_120b_fp8 at bs=1 is the fallback shape.
+    """
+    config = gpt_oss_120b_ep8_compile_bs_increase()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.model_spec = model_registry(
+        "120b",
+        converters=[
+            Float8LinearConverter.Config(
+                recipe_name="rowwise",
+                filter_fqns=["lm_head", "gate"],
+            ),
+            Float8GroupedExpertsConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+            ),
+        ],
+    )
     return config
