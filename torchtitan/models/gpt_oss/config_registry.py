@@ -1234,3 +1234,104 @@ def gpt_oss_120b_fp8_bs2() -> Trainer.Config:
         ],
     )
     return config
+
+
+# ---------------------------------------------------------------------------
+# Wave 3: expert load balance, which turns out to be the throughput limiter.
+#
+# gpt_oss_120b_balanced_diag (job 2278) was queued as a diagnostic ceiling and
+# came back as the largest result in this whole registry:
+#
+#   step            100   200   300   400   500   600   peak HBM
+#   job 2278 forced 686   689   681   684   682   683   163.68GiB (91.77%)
+#   job 2268 control 404   494   523   532   538   517   171.28GiB (96.03%)
+#   job  237 (*)     464   550   616   631   646   656   169.50GiB (95.04%)
+#   (*) different LR trajectory, see the TT_STEPS note below
+#
+# Forced round-robin routing is FLAT AT THE CEILING FROM STEP 100. Every other
+# run climbs toward it for hundreds of steps and never arrives. So the ramp that
+# looked like ordinary warmup is the auxiliary-loss-free load balancer slowly
+# converging, and the gap between the ramp and 683 is the cost of imbalance:
+# +27% throughput and 7.6GiB of peak memory, the latter mattering twice over
+# because every config here that touched 97% of HBM collapsed.
+#
+# The mechanism is in optimizer.py::_update_expert_bias:
+#
+#   expert_bias_delta_E = load_balance_coeff * sign(mean(tokens_per_expert) -
+#                                                   tokens_per_expert)
+#
+# A fixed-size sign step, DeepSeek-V3 style (arXiv 2408.15664), applied once per
+# optimizer step. GPT-OSS's 120b flavor hardcodes load_balance_coeff=1e-3
+# (gpt_oss/__init__.py:363), so a routing bias can travel at most 0.001 per
+# step: order 1000 steps to move one bias by 1.0 against softmax logits of order
+# 1. That is why balance is still converging at step 600, and it is the knob.
+#
+# The configs below raise it. This is a legitimate training knob, not a
+# benchmark cheat -- it is the published bias update rate, and the balancer adds
+# no gradient term to the objective (that is what "auxiliary-loss-free" means).
+# Too large should overshoot and oscillate, so 10x and 30x bracket it rather
+# than guessing one value.
+#
+# A METHODOLOGY NOTE that applies to every comparison here. Wave 1 and 2 ran
+# TT_STEPS=600, and LRSchedulersContainer clamps warmup to the total step count
+# (lr_scheduler.py:107-112), so those runs rewrote warmup_steps 2000 -> 600 and
+# reached the full 8e-4 LR by step 600 instead of ~2.4e-4. They are internally
+# comparable but are on a different, more aggressive LR trajectory than job 237,
+# which plausibly explains why the control plateaued at ~535 where job 237
+# reached 656: a faster-moving router gate balances worse. Wave 3 leaves
+# training.steps at the config's 10000 and caps the run with slurm --time
+# instead, so the LR trajectory is the real one.
+# ---------------------------------------------------------------------------
+
+
+def _gpt_oss_120b_with_load_balance_coeff(coeff: float) -> Trainer.Config:
+    """Best 120b config with the expert-bias update rate set to `coeff`.
+
+    Reaches into the per-layer MoE configs because load_balance_coeff is a model
+    flavor argument, hardcoded at 1e-3 by gpt_oss/__init__.py::_120b, with no
+    Trainer.Config field and no CLI override. All 36 layers must agree:
+    register_moe_load_balancing_hook raises if load_balance_coeff is set on some
+    MoE layers and not others, and nothing enforces a consistent VALUE, so an
+    inconsistent sweep would silently train 36 different balancers.
+    """
+    config = gpt_oss_120b_ep8_compile_bs_increase()
+    for layer in config.model_spec.model.layers:
+        layer.moe.load_balance_coeff = coeff
+    return config
+
+
+def gpt_oss_120b_lbc1e2() -> Trainer.Config:
+    """load_balance_coeff 1e-3 -> 1e-2 (10x). Single variable off job 237's config.
+
+    The conservative end of the bracket. At 10x, a routing bias can move 0.01
+    per step, so the ~1.0 of bias travel that balance appears to need arrives in
+    ~100 steps rather than ~1000. If the +27% ceiling from job 2278 is really
+    just convergence speed, this should track much closer to 683 early and
+    plateau higher than the ~535-656 band.
+
+    Numerics: this changes routing, so loss is not bit-comparable to the control,
+    but unlike gpt_oss_120b_balanced_diag it is a real model -- the router still
+    chooses experts, it is just nudged toward balance faster. MFU stays valid
+    (nothing is quantized). Watch peak HBM: job 2278 freed 7.6GiB by balancing,
+    and any of that which materializes here is worth as much as the throughput.
+    """
+    return _gpt_oss_120b_with_load_balance_coeff(1e-2)
+
+
+def gpt_oss_120b_lbc3e2() -> Trainer.Config:
+    """load_balance_coeff 1e-3 -> 3e-2 (30x). The aggressive end of the bracket.
+
+    Exists to find the overshoot. A sign-step update has no damping, so the bias
+    hunts around the balanced point with an amplitude proportional to the step
+    size; at some coeff the hunting itself costs more than the imbalance it
+    fixes, and expert assignment starts churning between steps, which also
+    defeats any expert specialization the model is trying to learn.
+
+    If this beats gpt_oss_120b_lbc1e2, the knob is not yet saturated and the
+    sweep should continue upward. If it is worse, the answer is between 1e-3 and
+    3e-2 and gpt_oss_120b_lbc1e2 is the better starting point. Either result
+    bounds the useful range, which is the reason to run both rather than pick
+    one. Judge on throughput AND on whether the loss curve stays smooth --
+    routing churn shows up as loss noise before it shows up as divergence.
+    """
+    return _gpt_oss_120b_with_load_balance_coeff(3e-2)
