@@ -438,6 +438,13 @@ plain FullAC and looked like flat results with slightly different memory. The
 operative field is `config.activation_checkpoint`. Two jobs were wasted and
 `no_ac` was briefly reported as "fits and is flat" when it had never run.
 
+**A second one.** `git add -A` in this worktree swept a colleague's *uncommitted*
+`mhc.py` edit (fp32 HC parameters, which FSDP2 rejects -- it killed jobs
+377/378) into ledger commit `172428400`. Restored verbatim in `f4dedd8f7`; the
+edit is recoverable with `git show 172428400 -- torchtitan/models/deepseek_v4/mhc.py`.
+No measurement was launched from the contaminated state. In a shared worktree,
+stage paths explicitly.
+
 Assert on the field you think you set, in-process, before queuing 64 ranks --
 every config in this round is now verified by constructing it and printing the
 values that matter.
