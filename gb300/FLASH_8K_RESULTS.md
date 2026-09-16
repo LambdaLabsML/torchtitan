@@ -341,9 +341,17 @@ flat: 92.18 vs 92.15**, +0.9 GiB. So compile is *possible* on DSv4 flash but
 as configured buys nothing. The likely reason is fragmentation: every block
 breaks at the eager mask build and again at the all-to-all dispatcher's
 `.tolist()` host sync, so the HC-branch elementwise chains that motivated
-compiling are split across small subgraphs. Confirming that needs a profile
-of the compiled run (does the ~153k-launch elementwise bucket shrink at all?).
-Not stacked with the comm levers -- nothing to add.
+compiling are split across small subgraphs. **Confirmed by profile (job 408,
+`/mnt/dgxc/profiles/dsv4_flash_8k_ep4_blk32_pr18_compiled/`, `fusion.md`):
+compile fused nothing in the blocks.** Eager elementwise launches 150,512 ->
+150,428; Inductor fused kernels 258 -> 306 where the 258 are flex's own and
+the extra ~24/step are the compiled loss. The blocks ran eagerly -- Dynamo
+graph-broke pervasively (SPMD typecheck contexts, the dispatcher's `.tolist()`
+sync, the eager mask build). Hoisting the mask removes one break source of
+several; making the block compile-friendly is a real engineering task with a
+bounded prize (elementwise is 25.8 % of kernel time; fusing half is ~10-13 %).
+A `TORCH_LOGS=graph_breaks` run enumerates the exact sites (queued). Not
+stacked with the comm levers -- nothing to add.
 
 ## Configs added
 
