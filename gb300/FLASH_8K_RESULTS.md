@@ -325,6 +325,33 @@ step was paying per microbatch. (Whether attention over the folded stream is
 meant to span packed documents is a model question, not addressed here.)
 No bs4, no batch stack. Round-3 `pr18_stack_bs2` is not run.
 
+## EP re-sweep on the 100.09 recipe (round 4, branch `dsv4_flash_pr18_sweep`)
+
+EP=4 was chosen under a *blocking* all-to-all, where a group that fits one
+node's NVLink mesh won. MinimalAsyncEP overlaps that all-to-all, so the
+optimum could have moved. It did not:
+
+| EP | config | TFLOP/s | vs EP=4 | peak |
+|---:|---|---:|---:|---:|
+| **4** | `pr18_asyncep_bf16reduce` | **100.09** | -- | 74.78 GiB |
+| 8 | `pr18_best_ep8` | 94.87 | -5.2 % | 71.36 GiB |
+| 16 | `pr18_best_ep16` | 82.90 | -17.2 % | 75.95 GiB |
+| 32 | `pr18_best_ep32` | 67.44 | -32.6 % | 93.35 GiB |
+| 64 | `pr18_best_ep64` | not run | | (cancelled: curve already unambiguous) |
+
+Everything but `expert_parallel_degree` is identical to the 100.09 config
+(verified in-process before submission). Steeply monotonic: keeping each
+expert group inside a single 4-GPU node is worth ~5 % per doubling and more
+beyond, overlap or not -- cross-node dispatch costs more than its collective's
+latency. Peak memory *rises* with EP because MinimalAsyncEP's symmetric-memory
+buffers scale with group size.
+
+Below 4: EP=1 is illegal with MinimalAsyncEP (the dispatcher requires EP > 1)
+and lost anyway with the standard dispatcher (20.80 vs 22.04 at 129 GiB, old
+kernel) because every rank then FSDP-all-gathers all 256 experts per layer
+(~12.9 GB/layer); EP=2 tied EP=4 at +18 GiB on the old kernel. **EP=4 is a
+real optimum on 4-GPU nodes: exactly one node per expert group.**
+
 **torch.compile vs the DSA block mask.** `dsa_mask_mod` indexes a dense
 `selected_mask` tensor that `_build_block_mask` builds *inside* the
 transformer block. Under torchtitan's per-block compile that tensor is an
