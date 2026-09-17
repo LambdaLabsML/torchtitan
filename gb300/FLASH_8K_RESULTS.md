@@ -858,3 +858,24 @@ its domain: a multi-node NVLink (NVL72-class) fabric. Whether NCCL already
 carries inter-node collectives over it (MNNVL) or over the 4 IB HCAs is what
 the 2-node all_gather probe (`nccl_probe.slurm`) measures; if it is IB today,
 enabling MNNVL is potentially the largest communication lever available.
+
+**NCCL already uses the NVLink fabric across nodes (probe job 463, 2 nodes x 4
+GPUs, 128 MiB per rank):**
+
+| collective | default env | `NCCL_MNNVL_ENABLE=1` |
+|---|---|---|
+| all_gather, per-rank receive bandwidth | **489 GB/s** (1.92 ms) | 371 GB/s |
+| reduce_scatter, per-rank send bandwidth | 394 GB/s | 392 GB/s |
+
+NCCL logs `MNNVL 1 ... nvlDomainSize 8`, `nNodes 1 localRanks 8` (the two
+nodes are one NVLink domain to NCCL), every channel `via P2P/MNNVL`, NVLS
+multicast available. The IB HCAs are not used at all: NCCL reports
+`Using network Socket` with "GPU Direct RDMA Disabled" -- if any collective
+ever had to leave the NVLink domain it would run over TCP. So inter-node
+FSDP traffic is already at ~0.5 TB/s per GPU, and the exposed 17.6 % is
+volume and latency at NVLink speed. Levers that cut bytes (reshard-never:
++3.1 %) or add overlap are the ones that can move it; there is no IB->NVLink
+step left to take. MNNVL also means the EP degree is not bounded by the
+node: EP=8..32 groups are NVLink-connected too (the earlier EP re-sweep
+that found EP=4 optimal was therefore not comparing NVLink vs IB, but
+dispatcher fan-out at equal link speed).
