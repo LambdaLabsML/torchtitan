@@ -879,3 +879,10 @@ step left to take. MNNVL also means the EP degree is not bounded by the
 node: EP=8..32 groups are NVLink-connected too (the earlier EP re-sweep
 that found EP=4 optimal was therefore not comparing NVLink vs IB, but
 dispatcher fan-out at equal link speed).
+
+With `NCCL_MNNVL_ENABLE=0` the same 2-node all_gather runs at **0.5 GB/s**
+(1.9 s per 128 MiB): NCCL's IB transport is not functional here (no IB
+plugin picked up; `Using network Socket`, GPU Direct RDMA disabled), so
+without the NVLink fabric every inter-node collective would be TCP. The
+`NCCL_IB_HCA` setting in the launcher is inert. Every multi-node result in
+this ledger therefore ran over MNNVL.
