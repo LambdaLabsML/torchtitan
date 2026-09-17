@@ -832,6 +832,15 @@ Base: the 137.28 recipe (`deepseek_v4_flash_best_leaf2`), one lever each.
 | 449 | `comms_ep_deepep` | DeepEP v2.1.0 dispatch (EP=4 intra-node, GIN disabled) | **128.21** | -6.6 % | 102.3 GiB |
 | 450 | `comms_reshard_never` | `fsdp_reshard_after_forward="never"`: params stay unsharded after forward, no second all-gather for the FullAC recompute/backward | **141.52** | **+3.1 %** | **241.17 GiB (87 %)** |
 
+| 451 | `comms_symm_mem` | `enable_fsdp_symm_mem=True` on the async-EP recipe | **crash at init** | -- | -- |
+
+`enable_fsdp_symm_mem` and MinimalAsyncEP are mutually exclusive in one
+process: FSDP's symm-mem collectives call `symm_mem.set_backend("NCCL")`
+(`_fsdp_collectives.py`) while MinimalAsyncEP requires the "CUDA" backend
+(`minimal_async_ep/api.py:221`) and has already initialised it -- "Backend
+can not be changed after use". Re-tested as `comms_deepep_symm` (FSDP
+symm-mem over DeepEP dispatch, which does not use torch symmetric memory).
+
 Reshard-never fits at 8 nodes after all (the 141 GiB of unsharded bf16
 params land on top of 106 GiB static: 241 GiB peak, 35 GiB headroom) and is
 the first communication lever to beat 137.28. At 16 nodes the same setting
