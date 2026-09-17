@@ -475,3 +475,64 @@ stage paths explicitly.
 Assert on the field you think you set, in-process, before queuing 64 ranks --
 every config in this round is now verified by constructing it and printing the
 values that matter.
+
+## Round 5: the elementwise bucket, attacked at the source (8 nodes)
+
+Motivation: the 8-node profile of the 100.09 config attributes 36 % of kernel
+time to ~75k elementwise/copy/reduce launches per step averaging 44 us --
+memory-bound passes over hidden-state-sized fp32 tensors, not launch
+overhead. By autograd node, MulBackward0 alone is 46 % of that bucket and,
+with forward `aten::mul`, Pow/Mean/Div backward and the bf16<->fp32 copies,
+two thirds of it come from the hyper-connection branches in `mhc.py`. Since
+block-level `torch.compile` never fused anything (round 4), three branches
+were cut from `dsv4_flash_pr18_sweep` (the 100.09 config), each moving one
+thing. All runs 8 nodes x 4 GPUs, EP=4, 30 steps, mean TFLOP/s over steps 5-30
+(5 nodes were down; every number in this table is same-node-count).
+
+| job | branch | config | TFLOP/s | vs 8-node baseline | peak mem |
+|---|---|---|---|---|---|
+| 418 | `dsv4_flash_pr18_sweep` | `deepseek_v4_flash_pr18_asyncep_bf16reduce` | **99.50** | baseline (the 100.09 recipe at 8 nodes) | 108.71 GiB |
+| 419 | `dsv4_flash_hc_einsum` | `deepseek_v4_flash_best_hc_einsum` | **109.00** | **+9.5 %** | 106.66 GiB |
+| 420 | `dsv4_flash_hc_compile` | `deepseek_v4_flash_best_hc_compile` | **123.31** | **+23.9 %** | 107.54 GiB |
+| 421 | `dsv4_flash_flex_sac` | `deepseek_v4_flash_best_flex_sac` | crashed at config time | -- | -- |
+
+**419, `hc_einsum` (worktree `/mnt/dgxc/worktrees/hc_einsum`, commit 0edc9386a).**
+`HcPre`/`HcHead`: the branch reduction `sum(pre[:, m, None] * x[:, m])`
+becomes a batched `[1, M] @ [M, D]` GEMM and the RMS statistic uses
+`vector_norm` (no full-size fp32 `x^2`, no PowBackward pass). `HcPost`: see
+the finding below. Same function of the same inputs -- CPU check against the
+original agrees to 9e-7 (fp32) / 3e-5 (bf16) rel-norm on outputs and every
+gradient.
+
+**420, `hc_compile` (worktree `/mnt/dgxc/worktrees/hc_compile`, commit ae46cc3d7).**
+The HC pre/post/head math moved into three module-level functions, each
+`torch.compile(fullgraph=True, dynamic=False)`; the modules call them. Nothing
+else in the block is compiled. This is the compile that round 4 could not get:
+the functions contain only tensor ops, so there is no SPMD context manager
+for Dynamo to trip on. `HC_COMPILE=0` runs the same functions eagerly
+(compiled vs eager: 3e-5 rel-norm). **+23.9 % from fusing one module's math**
+-- the largest single lever since PR #18. The two branches are alternatives
+for the same bytes, not a stack: the compiled version already avoids the
+intermediates the einsum rewrite removes by hand, and does it for the
+sinkhorn too.
+
+**Finding: `HcPost`'s residual term is a per-branch scale, not a branch mix.**
+`torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)` broadcasts
+`[T, M, M, 1]` against `[T, M, 1, D]` -- product index `[t, i, j, d] =
+comb[t,i,j] * residual[t,i,d]` -- and reduces over j, so it equals
+`residual * comb.sum(-1, keepdim=True)` exactly (verified 1e-6 fp32). A true
+M x M mix would reduce over i (`dim=1`, i.e. `bmm(comb^T, residual)`).
+Upstream torchtitan main has the identical line. Both branches preserve the
+existing semantics; whether that is the intended model is a question for the
+model owners -- if it is a bug, the 20 sinkhorn iterations feed a near-1
+scalar.
+
+Loss is not evidence either way here (init/data seed is not fixed; step-1
+losses differ across all three runs).
+
+**421, `flex_sac`: `ValueError: MinimalAsyncEP requires full recompute`** from
+`distributed/minimal_async_ep/api.py` -- a plain `isinstance(..., FullAC.Config)`
+gate on the AC policy. `FlexSaveAC` saves only the flex region and recomputes
+the dispatcher's ops exactly as FullAC does, so the gate was widened to accept
+it; requeued. Job 422 (same branch, 2x microbatch with saved top-k) was
+cancelled before it hit the same error and requeued behind it.
