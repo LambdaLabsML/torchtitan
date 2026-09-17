@@ -830,6 +830,12 @@ Base: the 137.28 recipe (`deepseek_v4_flash_best_leaf2`), one lever each.
 |---|---|---|---|---|---|
 | 448 | `comms_ep_standard` | stock NCCL all-to-all dispatch instead of MinimalAsyncEP | **119.33** | -13.1 % | 103.4 GiB |
 | 449 | `comms_ep_deepep` | DeepEP v2.1.0 dispatch (EP=4 intra-node, GIN disabled) | **128.21** | -6.6 % | 102.3 GiB |
+| 450 | `comms_reshard_never` | `fsdp_reshard_after_forward="never"`: params stay unsharded after forward, no second all-gather for the FullAC recompute/backward | **141.52** | **+3.1 %** | **241.17 GiB (87 %)** |
+
+Reshard-never fits at 8 nodes after all (the 141 GiB of unsharded bf16
+params land on top of 106 GiB static: 241 GiB peak, 35 GiB headroom) and is
+the first communication lever to beat 137.28. At 16 nodes the same setting
+would peak near 190 GiB.
 
 So MinimalAsyncEP is worth +15 % on the current recipe (it was +4.9 % on the
 92.15 one): the cheaper compute gets, the more the dispatch overlap matters.
