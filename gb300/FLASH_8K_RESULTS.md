@@ -930,7 +930,8 @@ the next two cheap experiments (jobs 472/473).
 | job | env | TFLOP/s | vs 141.52 |
 |---|---|---|---|
 | 472 | `NCCL_PROTO=Simple` | **142.72** | +0.85 % (at the 1.3 % noise floor, but positive and free) |
-| 473 | `NCCL_ALGO=NVLS` (global) | **crash** | `No algorithm/protocol available for function Broadcast with datatype ncclInt8` -- NVLS has no Broadcast path, and a global NCCL_ALGO applies to every collective including the bootstrap broadcasts. Per-collective syntax (`allgather:nvls,reducescatter:nvls`) is the correct form; job 475. |
+| 473 | `NCCL_ALGO=NVLS` (global) | **crash** | `No algorithm/protocol available for function Broadcast with datatype ncclInt8` -- NVLS has no Broadcast path, and a global NCCL_ALGO applies to every collective including the bootstrap broadcasts. Per-collective syntax is the correct form. |
+| 475 | `NCCL_ALGO=allgather:nvls,reducescatter:nvls` | **crash** | `Unrecognized element token "reducescatter"` -- NCCL's parser wants its CamelCase function names. The accepted tokens in this build (2.30.7, from `strings libnccl.so.2`) are `AllGather ReduceScatter AllReduce Broadcast Reduce SendRecv` and algorithms `TREE RING NVLS NVLS_TREE COLLNET_DIRECT`; job 476 uses `AllGather:NVLS,ReduceScatter:NVLS`. |
 
 (The 473 failure also confirms the exported env does reach the ranks, which
 is how the `NCCL_PROTO=Simple` run is known to have taken effect.)
