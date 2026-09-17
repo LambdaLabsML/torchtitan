@@ -575,3 +575,26 @@ productive direction is the one that already paid: make the recomputed work
 cheap (leaf compile, +24 %), not skip it. The stock policy is still the right
 tool for saving router top-k across the recompute if >1x microbatch is ever
 needed (job 424 pattern), and the `relu_` fix is required for it.
+
+## Round 6: leaf compile beyond the HC branches (8 nodes)
+
+`torchtitan/tools/leaf_compile.py` (branch `dsv4_flash_hc_compile`, commit
+dd4d70759) generalises the mhc.py pattern -- compile a pure-tensor function on
+its own, `fullgraph=True`, per-group env switches -- and adds three sites:
+`attn` (deepseek_v4/attention.py: per-head q RMS-norm + rope tail rotation +
+cat as one graph, and the inverse rope on o; complex rotation written in real
+arithmetic, cache passed as `view_as_real`), `moe` (common/moe.py: the SwiGLU
+between the expert grouped GEMMs, `dynamic=True`), `sink` (common/attention.py:
+the sink rescale). Eager mode reproduces the original code bitwise in bf16;
+compiled bf16 sites differ at bf16 rounding level and are closer to an fp64
+reference than eager (q-norm 1.7e-3 vs 3.8e-3; SwiGLU 1.6e-3 vs 2.4e-3).
+
+| job | groups | TFLOP/s | vs FullAC baseline 99.50 | peak mem |
+|---|---|---|---|---|
+| 420 | `hc` | 123.31 | +23.9 % | 107.54 GiB |
+| 427 | `hc,attn,moe,sink` (all) | **133.80** | **+34.5 %** | 106.48 GiB |
+| 428 | `hc,attn` | (pending) | | |
+
+Config `deepseek_v4_flash_best_leaf_compile` = the 100.09 recipe; the groups
+come from `TORCHTITAN_LEAF_COMPILE` in the job environment. No recompile or
+graph-break warnings in the 427 log.
