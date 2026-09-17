@@ -33,13 +33,79 @@ from torchtitan.protocols.module import Module
 logger = logging.getLogger(__name__)
 
 
-def _get_default_save_ops() -> set:
-    """Returns the default set of ops whose activations should be saved
-    (compute + comm).
+def _resolve_ops(op_specs: list) -> set:
+    """Resolve op specs to the set of ops they name.
 
     Each op spec is either an op object (always included) or a tuple
-    (root, dotted_path) for conditionally available ops — resolved via
+    (root, dotted_path) for conditionally available ops -- resolved via
     getattr and silently skipped if not registered.
+    """
+    ops = set()
+    for spec in op_specs:
+        if isinstance(spec, tuple):
+            obj, path = spec
+            try:
+                for part in path.split("."):
+                    obj = getattr(obj, part)
+                ops.add(obj)
+            except AttributeError:
+                pass
+        else:
+            ops.add(spec)
+    return ops
+
+
+def _get_required_save_ops() -> set:
+    """Returns the ops that must be saved for recomputation to stay faithful
+    to the forward pass, whatever memory policy is in effect.
+
+    Unlike the rest of the save set, these are not a memory-for-compute
+    tradeoff: recomputing them can produce a *different value* than the
+    forward pass produced.
+
+    - ``topk`` breaks ties non-deterministically on CUDA (its gather kernel
+      hands out output slots for elements equal to the k-th value via
+      atomics), so a recompute can return a different set of indices for
+      bitwise-identical scores. Models that make decisions from it -- MoE
+      expert assignment, sparse-attention KV selection -- then recompute a
+      different graph. Under expert parallelism that also changes the routed
+      token count, which surfaces as a checkpoint metadata mismatch; without
+      it the recomputed activations are simply wrong and nothing complains.
+    - Collectives must not be re-issued during backward. Beyond the cost, the
+      result depends on what every other rank routed, which is subject to the
+      same tie-breaking.
+    """
+    compute_ops = [
+        torch.ops.aten.topk.default,
+    ]
+
+    comm_ops = [
+        torch.ops._c10d_functional.reduce_scatter_tensor.default,
+        torch.ops._c10d_functional.all_to_all_single.default,
+        # DeepEP (available when deepep is installed)
+        (torch.ops, "deepep.dispatch.default"),
+        (torch.ops, "deepep.combine.default"),
+        # HybridEP (available when hybridep is installed)
+        (torch.ops, "hybridep.dispatch.default"),
+        (torch.ops, "hybridep.combine.default"),
+    ]
+    return _resolve_ops(compute_ops) | _resolve_ops(comm_ops)
+
+
+def _is_device_to_host_copy(func, args, kwargs) -> bool:
+    """True for a CUDA -> CPU ``_to_copy``, e.g. the MoE all-to-all split-size
+    sync. Saving these avoids re-running a device-to-host sync in backward."""
+    return (
+        func == torch.ops.aten._to_copy.default
+        and "cuda" in str(args[0].device)
+        and "device" in kwargs
+        and str(kwargs["device"]) == "cpu"
+    )
+
+
+def _get_default_save_ops() -> set:
+    """Returns the default set of ops whose activations should be saved
+    (compute + comm), on top of the ops that must always be saved.
     """
     # Ops whose outputs are expensive to recompute (matmuls, attention, etc.)
     compute_ops = [
@@ -54,41 +120,11 @@ def _get_default_save_ops() -> set:
         torch._higher_order_ops.flex_attention,
         torch.ops.aten.linear.default,
         torch.ops.aten.mm.dtype,
-        # topk can be non-deterministic; save to keep MoE expert assignments
-        # stable between forward and recompute.
-        torch.ops.aten.topk.default,
         # Inductor compiled code (available when torch.compile is used)
         (torch._higher_order_ops, "inductor_compiled_code"),
         # torch_attn custom backend
         (torch.ops, "torch_attn._varlen_attn.default"),
     ]
-
-    # Communication ops whose outputs should be saved to avoid re-communication.
-    comm_ops = [
-        torch.ops._c10d_functional.reduce_scatter_tensor.default,
-        torch.ops._c10d_functional.all_to_all_single.default,
-        # DeepEP (available when deepep is installed)
-        (torch.ops, "deepep.dispatch.default"),
-        (torch.ops, "deepep.combine.default"),
-        # HybridEP (available when hybridep is installed)
-        (torch.ops, "hybridep.dispatch.default"),
-        (torch.ops, "hybridep.combine.default"),
-    ]
-
-    def _resolve_ops(op_specs: list) -> dict:
-        ops = {}
-        for spec in op_specs:
-            if isinstance(spec, tuple):
-                obj, path = spec
-                try:
-                    for part in path.split("."):
-                        obj = getattr(obj, part)
-                    ops[obj] = CheckpointPolicy.MUST_SAVE
-                except AttributeError:
-                    pass
-            else:
-                ops[spec] = CheckpointPolicy.MUST_SAVE
-        return ops
 
     aten_op_types = get_default_op_list()
     save_ops = {
@@ -96,7 +132,7 @@ def _get_default_save_ops() -> set:
         for op in aten_op_types.compute_intensive_ops
     }
     save_ops.update(_resolve_ops(compute_ops))
-    save_ops.update(_resolve_ops(comm_ops))
+    save_ops.update(_get_required_save_ops())
     return save_ops
 
 
@@ -170,7 +206,14 @@ class ActivationCheckpointing(Configurable):
 
 
 class FullAC(ActivationCheckpointing):
-    """Recompute the entire transformer block during the backward pass."""
+    """Recompute the entire transformer block during the backward pass.
+
+    Everything in the block is recomputed except ``_get_required_save_ops``
+    (plus device-to-host copies), whose recomputed values are not guaranteed
+    to reproduce the forward. Those are retained for correctness rather than
+    for speed, at the cost of holding their outputs live -- for MoE and
+    sparse-attention models, mainly the top-k index tensors.
+    """
 
     @dataclass(kw_only=True, slots=True)
     class Config(ActivationCheckpointing.Config):
@@ -179,12 +222,39 @@ class FullAC(ActivationCheckpointing):
     def _wrap_block(
         self, module: nn.Module, *, base_fqn: str | None = None
     ) -> nn.Module:
+        if self.config.debug:
+            # torch.utils.checkpoint rejects debug=True together with a
+            # non-default context_fn, and debug mode exists to reproduce and
+            # locate a forward/recompute mismatch -- which the save policy is
+            # there to prevent. Recompute everything so debug stays usable.
+            logger.warning(
+                "FullAC debug=True disables the required-save policy, so "
+                "non-deterministic ops such as topk are recomputed. Gradients "
+                "from this run are not trustworthy; use it only to locate a "
+                "recomputation mismatch."
+            )
+            return ptd_checkpoint_wrapper(
+                module,
+                preserve_rng_state=self.config.preserve_rng_state,
+                determinism_check=self.config.determinism_check,
+                early_stop=False,
+                debug=True,
+            )
+
+        save_ops = _get_required_save_ops()
+
+        def _policy(ctx, func, *args, **kwargs) -> CheckpointPolicy:
+            del ctx
+            if func in save_ops or _is_device_to_host_copy(func, args, kwargs):
+                return CheckpointPolicy.MUST_SAVE
+            return CheckpointPolicy.PREFER_RECOMPUTE
+
         return ptd_checkpoint_wrapper(
             module,
+            context_fn=lambda: create_selective_checkpoint_contexts(_policy),
             preserve_rng_state=self.config.preserve_rng_state,
             determinism_check=self.config.determinism_check,
             early_stop=False,
-            debug=self.config.debug,
         )
 
 
@@ -254,14 +324,7 @@ class SelectiveAC(ActivationCheckpointing):
             meta = {"forward_mm_count": 0, "recompute_mm_count": 0}
 
             def wrapped_policy(ctx, func, *args, **kwargs) -> CheckpointPolicy:
-                # Always save CUDA→CPU results to avoid recomputing them
-                # (e.g. MoE D2H sync for all-to-all metadata).
-                if (
-                    func == torch.ops.aten._to_copy.default
-                    and "cuda" in str(args[0].device)
-                    and "device" in kwargs
-                    and str(kwargs["device"]) == "cpu"
-                ):
+                if _is_device_to_host_copy(func, args, kwargs):
                     return CheckpointPolicy.MUST_SAVE
 
                 mode = "recompute" if ctx.is_recompute else "forward"
