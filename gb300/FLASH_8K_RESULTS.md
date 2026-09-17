@@ -651,3 +651,28 @@ not reproduce. Next: `gb300/block_determinism.py` runs one real CSA+MoE
 block (layer 4) on one GPU, same weights and input, four times at T=8192 and
 T=16384, with forward hooks on every submodule, and names the first one
 whose output is not bitwise stable.
+
+**FOUND (job 431, one GB300): `Indexer.select` is not run-to-run
+deterministic at the 2x shape.** Same bf16 inputs, six calls:
+
+| T | n_cmp (candidates per query) | identical indices | identical *set* |
+|---|---|---|---|
+| 8192 | 2048 | yes | yes |
+| 16384 | 4096 | **no** | **no** |
+
+`Indexer.select` (`deepseek_v4/compressor.py:183-208`) sums relu'd bf16 index
+scores over 64 heads and takes `topk(512)` per query over the n_cmp
+compressed keys. bf16 scores have many exact ties (relu zeros and 8-bit
+mantissas), so the 512th-place boundary is usually a tie; `torch.topk`'s
+choice among tied candidates is arbitrary, and at slice length 4096 it is
+not even stable call to call (at 2048 it is). A different key set for some
+queries changes those queries' attention output, which is the 1-ulp bf16
+flips in ~2 % of the hidden state that job 429 saw at the router, which flip
+6th-slot near-ties in the router's own top-k, which changes the routed-token
+counts -- the CheckpointError. The chain is now traced end to end, and the
+same thing will happen at 1x for any seq_len whose n_cmp crosses the
+threshold (seq_len 16384 -> n_cmp 4096), i.e. this is a long-context
+correctness issue too, not just a batch-size one. Every individual GEMM was
+a red herring (job 430). The fix is to break ties deterministically in
+`Indexer.select` (fp32 scores with an index-ordered tiebreak, or a stable
+sort), which costs nothing at these sizes.
