@@ -706,3 +706,26 @@ original is itself deterministic. **Landed in `compressor.py` on
 plain FullAC 2x without deterministic mode or saved top-k
 (`deepseek_v4_flash_pr18_bs2`, tag `_fix`), the all-leaves 1x recipe with
 the fix (regression check), and all-leaves at 2x.
+
+**Proof runs of the fix (8 nodes, 30 steps each, all completed, exit 0):**
+
+| job | branch | config | AC / determinism | TFLOP/s | peak mem |
+|---|---|---|---|---|---|
+| 438 | `dsv4_flash_pr18_sweep` @4f005a26b | `deepseek_v4_flash_pr18_bs2` (92.15 recipe, **2x**) | plain FullAC, no deterministic mode, no saved top-k | 80.84 | 142.72 GiB |
+| 439 | `dsv4_flash_hc_compile` @2bbaa16d9 | `deepseek_v4_flash_best_leaf_compile` (1x) | FullAC | 133.77 | 106.05 GiB |
+| 440 | `dsv4_flash_hc_compile` @2bbaa16d9 | `deepseek_v4_flash_best_leaf_compile_bs2` (**2x**) | plain FullAC | 107.85 | 142.88 GiB |
+
+- 438 is the first >1x run to complete under plain FullAC with nothing else
+  changed: **the CheckpointError is fixed at the source.** 80.84 matches the
+  16-node 2x-deterministic number (80.90), as expected.
+- 439 vs 427 (133.77 vs 133.80): the stable sort costs nothing measurable.
+- 440: 2x is still **-19 % vs 1x** on the best recipe (107.85 vs 133.77),
+  same direction as every earlier batch measurement -- the DSA single-
+  sequence cost (indexer and masks scaling with T^2, see the batch section).
+  The crash is gone; the throughput case for batch still needs the batched
+  DSA path.
+
+**State of the best recipe:** `deepseek_v4_flash_best_leaf_compile` on
+`dsv4_flash_hc_compile` (leaf compiles hc/attn/moe/sink + deterministic
+Indexer.select), 133.77 TFLOP/s at 8 nodes vs 99.50 for the 100.09 recipe
+at the same node count (+34.4 %). Not yet measured at 16 nodes.
