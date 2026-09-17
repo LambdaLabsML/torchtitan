@@ -778,7 +778,46 @@ recipe; all levers code-level).
 | job | commit | what | TFLOP/s | vs 133.77 | peak mem |
 |---|---|---|---|---|---|
 | 442 | 498480c8c | indexer leaves (`_index_q_rope`, `_index_scores`), indexer + block-mask build under `no_grad`, compressor pooling leaf, router leaves, shared-expert SwiGLU | **137.02** | **+2.4 %** | 105.31 GiB |
-| 444 | 3198706d9 | + rotation scale folded into the cached hadamard (one GEMM instead of GEMM + pass) | (pending) | | |
+| 444 | 0bc5311e2 | + rotation scale folded into the cached hadamard (one GEMM instead of GEMM + pass) | **137.28** | +2.6 % | 106.56 GiB |
+
+The fold is +0.2 % over 442, inside the run-to-run floor; kept because it is
+free. **`dsv4_flash_leaf2` @ 0bc5311e2, config
+`deepseek_v4_flash_best_leaf2`, is the current best: 137.28 TFLOP/s at 8
+nodes, +38 % over the 100.09 recipe at the same node count.**
+
+**Grouped GEMM layout (job 445, one GB300):** `_grouped_mm` with the model's
+`[E, F, D].transpose(-2, -1)` weights vs a pre-transposed contiguous copy:
+2.0 vs 1.9 ms fwd+bwd at the flash shape, same cutlass kernels, no copy
+kernels. The 658 ms/2 steps under `aten::_grouped_mm` in the profile is the
+grouped GEMM itself (4.5 % of kernel time, real compute), not layout copies.
+Closed.
+
+### Verdict on compile for DSv4 flash
+
+Rounds 5-7 moved the recipe 99.50 -> 123.31 (hc) -> 133.80 (+attn, moe,
+sink) -> 137.28 (+indexer, compressor, router, shared FFN, hadamard fold), all
+at 8 nodes, all with identical memory, every leaf verified against the
+original math. After round 7 the eager elementwise/copy/reduce work is
+~11 % of kernel time, of which FSDP2's own copy-in/out and reduce-scatter
+staging is ~4 %, async-EP metadata ~1 %, and the model-side remainder is
+scattered over sub-1 % sites (`mul` 1.9 %, `copy_` 1.2 %, `add_` 0.7 %,
+block-mask build ~0.5 %). Compiling more of the model (the router's top-k
+selection, the dispatcher glue, `_build_block_mask`) is possible but each is
+worth well under 1 %; there is no remaining single site of the kind that
+paid in rounds 5-7. **The compile lever is exhausted on this model** short
+of a fused attention kernel. What remains, by size:
+
+1. Exposed communication: 17.6 % of wall time (FSDP all-gather twice per
+   step under FullAC + resharding; async-EP dispatch/combine). Levers:
+   `parallelism.fsdp_reshard_after_forward="never"` (halves all-gather bytes;
+   holds unsharded bf16 params -- fits at 16 nodes, likely not at 8), the EP
+   backend sweep (deepep / hybridep / minimal_async_ep / standard), fewer
+   all-gather bytes (fp8 params).
+2. FlexAttention: 36 % of kernel time (backward 28 %, forward x2 8 %). Needs
+   a purpose-built DSA kernel; every template-level lever is measured flat.
+3. Batch size: crash fixed; throughput needs the batched DSA path (T^2
+   indexer/mask cost).
+4. FSDP2 copies ~4 %: framework; `enable_fsdp_symm_mem` is the knob to try.
 
 No recompile / graph-break warnings. Eager mode of every new leaf reproduces
 the original math bitwise (CPU); compiled differs at bf16 rounding only.
