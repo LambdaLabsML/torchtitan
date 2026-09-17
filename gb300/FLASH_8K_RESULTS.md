@@ -892,3 +892,35 @@ plugin picked up; `Using network Socket`, GPU Direct RDMA disabled), so
 without the NVLink fabric every inter-node collective would be TCP. The
 `NCCL_IB_HCA` setting in the launcher is inert. Every multi-node result in
 this ledger therefore ran over MNNVL.
+
+### Profile of the reshard-never recipe (job 466, 8 nodes)
+
+`/mnt/dgxc/profiles/dsv4_flash_reshard_never_32xgb300/`. Kernel time 11,265 ms
+/ 2 steps (was 14,636 at 137.28); NCCL 1,536 ms (was 3,596 -- the second
+all-gather is gone).
+
+| | 137.28 recipe | + reshard-never (141.52) |
+|---|---|---|
+| compute busy | 79.9 % | 75.9 % |
+| communication total | 38.4 % | 21.2 % |
+| **exposed communication** | **17.6 %** | **12.9 %** |
+| idle (no kernel at all) | 2.5 % | **11.2 %** |
+
+Halving the all-gather bytes did exactly what it should to the comm term,
+but ~9 points of it reappeared as *idle*: the step is now partly
+launch-bound rather than comm-bound. The idle is NOT a few big stalls -- only
+114 ms sits in gaps >1 ms (the largest being `Optimizer.step#AdamW` at 56 ms
+and the profiler's own step boundary) -- it is ~1.2 s of sub-millisecond gaps
+spread across 92,746 launches per 2 steps. Levers for that are fewer, larger
+kernels (CUDA graphs, more aggressive fusion) rather than communication.
+
+Remaining kernel-time shares: **flex backward 36.8 %**, flex forward 9.7 %,
+GEMMs 15.1 %, NCCL 13.6 %, all-gather/symm copies 8.3 %, Inductor leaves
+8.0 %, elementwise 4.2 %, cat/split 2.5 %.
+
+Collectives are `ncclDevKernel_ReduceScatter_Sum_bf16_RING_LL` (776 ms) and
+`ncclDevKernel_AllGather_RING_LL` (718 ms) -- NCCL picks the **LL protocol**,
+which carries 8 bytes of payload per 16-byte line (half the link's usable
+bandwidth), and the RING algorithm even though the probe showed NVLS
+multicast available. `NCCL_PROTO=Simple` and `NCCL_ALGO=NVLS` are therefore
+the next two cheap experiments (jobs 472/473).
