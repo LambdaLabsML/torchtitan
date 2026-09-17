@@ -979,3 +979,46 @@ HybridEP's TMA intranode path plus a larger
 `NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN` is the one configuration where it
 could plausibly beat MinimalAsyncEP. That needs the EP sweep re-run per
 backend, which is a round of its own.
+
+## The batched DSA path (branch `dsv4_batched_dsa`)
+
+The DSA path treated the whole per-rank stream as one sequence:
+`_forward_impl` used `seqlen = q.size(0)` with `bsz=1`, so the indexer scored
+every query against every compressed key of the entire microbatch
+(`einsum` T x T/4) and the selection mask was a dense `[T, T + n_cmp]`.
+Attention-side cost was quadratic in the microbatch, which is why 2x measured
+-19 % and 3x -24 % per token even after the CheckpointError was fixed.
+
+Every DSA component now knows the packed sequence length (threaded from the
+three model builders into `DSV4FlexAttention.Config.seq_len` and
+`Compressor.Config.seq_len`), and a T-token stream is split into
+`T // seq_len` independent sequences:
+
+- `deepseek_v4/attention.py`: `_batch_shape()`, per-sequence KV streams
+  `[B, L + n_cmp, H, D]`, block mask built with `bsz=B`, indexer tensors
+  viewed as `[B, L, ...]`;
+- `common/attention.py`: `FlexAttention.forward` accepts 4D `[B, L, H, K]`
+  and folds the result back to `[T, H, V]`, so `out_transform` and all callers
+  are unchanged;
+- `compressor.py`: `Indexer.select` batched (`einsum("bshd,btd->bsht")`), so
+  the score tensor is `B*L*(L/4)` rather than `(B*L)*(B*L/4)`;
+- `leaf_ops.py`: a batched variant of the index-score reduction.
+
+`seq_len=0`, or a stream exactly one sequence long, keeps the folded path
+unchanged.
+
+**A second correctness bug, found while doing this:** `Compressor.
+_overlap_transform` took each compressed group's "previous group" from the
+flat stream, so with more than one packed sequence the first group of sequence
+n was fed from the tail of sequence n-1. Now the shift stays inside each
+sequence. This was wrong on the folded path too, at every document boundary
+inside a packed row.
+
+**Equivalence test** `tests/unit_tests/gpu/test_dsv4_batched_dsa.py`
+(job 483, 6 passed): for all three DSA variants and the compressor, a batch of
+B reproduces, per sequence, what that sequence produces alone -- outputs and
+gradients, rel-err 0.000e+00 on every tensor except one `dcmp_k` at 7.2e-6.
+It also pins `_batch_shape` and rejects a token count that is not a multiple
+of `seq_len`. Two bugs it caught before any cluster time was spent:
+`Indexer.select`'s stable sort returned `order[:, :k]` (slices the sequence
+dim once batched) and the batched fold-back dropped the head dim.
