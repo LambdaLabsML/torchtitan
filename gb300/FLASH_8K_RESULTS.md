@@ -593,7 +593,11 @@ reference than eager (q-norm 1.7e-3 vs 3.8e-3; SwiGLU 1.6e-3 vs 2.4e-3).
 |---|---|---|---|---|
 | 420 | `hc` | 123.31 | +23.9 % | 107.54 GiB |
 | 427 | `hc,attn,moe,sink` (all) | **133.80** | **+34.5 %** | 106.48 GiB |
-| 428 | `hc,attn` | (pending) | | |
+| 428 | `hc,attn` | 132.17 | +32.8 % | 105.52 GiB |
+
+Attribution: `attn` (q-norm + rope + cat, o inverse rope) is worth +8.9
+points over `hc` alone; `moe` + `sink` add +1.6, at the edge of the 1.3-1.5 %
+run-to-run floor but positive and free. Keep all four on.
 
 Config `deepseek_v4_flash_best_leaf_compile` = the 100.09 recipe; the groups
 come from `TORCHTITAN_LEAF_COMPILE` in the job environment. No recompile or
