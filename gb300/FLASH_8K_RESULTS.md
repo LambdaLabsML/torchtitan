@@ -924,3 +924,13 @@ which carries 8 bytes of payload per 16-byte line (half the link's usable
 bandwidth), and the RING algorithm even though the probe showed NVLS
 multicast available. `NCCL_PROTO=Simple` and `NCCL_ALGO=NVLS` are therefore
 the next two cheap experiments (jobs 472/473).
+
+### NCCL protocol / algorithm on the reshard-never winner (8 nodes)
+
+| job | env | TFLOP/s | vs 141.52 |
+|---|---|---|---|
+| 472 | `NCCL_PROTO=Simple` | **142.72** | +0.85 % (at the 1.3 % noise floor, but positive and free) |
+| 473 | `NCCL_ALGO=NVLS` (global) | **crash** | `No algorithm/protocol available for function Broadcast with datatype ncclInt8` -- NVLS has no Broadcast path, and a global NCCL_ALGO applies to every collective including the bootstrap broadcasts. Per-collective syntax (`allgather:nvls,reducescatter:nvls`) is the correct form; job 475. |
+
+(The 473 failure also confirms the exported env does reach the ranks, which
+is how the `NCCL_PROTO=Simple` run is known to have taken effect.)
