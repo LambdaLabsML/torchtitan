@@ -821,3 +821,24 @@ of a fused attention kernel. What remains, by size:
 
 No recompile / graph-break warnings. Eager mode of every new leaf reproduces
 the original math bitwise (CPU); compiled differs at bf16 rounding only.
+
+## Round 8: communication (branch `dsv4_comms_reduction_attempt`, 8 nodes)
+
+Base: the 137.28 recipe (`deepseek_v4_flash_best_leaf2`), one lever each.
+
+| job | config | lever | TFLOP/s | vs 137.28 | peak mem |
+|---|---|---|---|---|---|
+| 448 | `comms_ep_standard` | stock NCCL all-to-all dispatch instead of MinimalAsyncEP | **119.33** | -13.1 % | 103.4 GiB |
+
+So MinimalAsyncEP is worth +15 % on the current recipe (it was +4.9 % on the
+92.15 one): the cheaper compute gets, the more the dispatch overlap matters.
+
+**Topology correction (probe jobs 453/455).** The cluster is NOT a per-node
+NVLink mesh with IB between nodes, as every earlier note assumed. Each GPU
+has all 18 NVLinks into NVSwitches (`nvidia-smi topo -m`: NV18 for every
+pair; remotes `FFFFFFFF:FF:FF.0`), `Fabric State: Completed` with one
+ClusterUUID across nodes, and `nvidia-imex` is active with all 16 nodes in
+its domain: a multi-node NVLink (NVL72-class) fabric. Whether NCCL already
+carries inter-node collectives over it (MNNVL) or over the 4 IB HCAs is what
+the 2-node all_gather probe (`nccl_probe.slurm`) measures; if it is IB today,
+enabling MNNVL is potentially the largest communication lever available.
