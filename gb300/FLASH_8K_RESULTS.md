@@ -829,6 +829,7 @@ Base: the 137.28 recipe (`deepseek_v4_flash_best_leaf2`), one lever each.
 | job | config | lever | TFLOP/s | vs 137.28 | peak mem |
 |---|---|---|---|---|---|
 | 448 | `comms_ep_standard` | stock NCCL all-to-all dispatch instead of MinimalAsyncEP | **119.33** | -13.1 % | 103.4 GiB |
+| 449 | `comms_ep_deepep` | DeepEP v2.1.0 dispatch (EP=4 intra-node, GIN disabled) | **128.21** | -6.6 % | 102.3 GiB |
 
 So MinimalAsyncEP is worth +15 % on the current recipe (it was +4.9 % on the
 92.15 one): the cheaper compute gets, the more the dispatch overlap matters.
