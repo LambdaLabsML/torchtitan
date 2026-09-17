@@ -841,6 +841,12 @@ process: FSDP's symm-mem collectives call `symm_mem.set_backend("NCCL")`
 can not be changed after use". Re-tested as `comms_deepep_symm` (FSDP
 symm-mem over DeepEP dispatch, which does not use torch symmetric memory).
 
+| 464 | `comms_deepep_symm` | FSDP symm-mem collectives over DeepEP dispatch | **125.28** | -8.7 % (-2.3 % vs DeepEP alone) | 105.1 GiB |
+
+FSDP symmetric-memory collectives are a loss on this fabric (NCCL's MNNVL
+path is already at ~0.5 TB/s per rank), and they cannot be combined with
+the best dispatcher anyway. Closed.
+
 Reshard-never fits at 8 nodes after all (the 141 GiB of unsharded bf16
 params land on top of 106 GiB static: 241 GiB peak, 35 GiB headroom) and is
 the first communication lever to beat 137.28. At 16 nodes the same setting
