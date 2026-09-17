@@ -602,3 +602,36 @@ run-to-run floor but positive and free. Keep all four on.
 Config `deepseek_v4_flash_best_leaf_compile` = the 100.09 recipe; the groups
 come from `TORCHTITAN_LEAF_COMPILE` in the job environment. No recompile or
 graph-break warnings in the 427 log.
+
+## The >1x microbatch CheckpointError: where the divergence starts
+
+torch's own checkpoint debug mode cannot run on this model (job 426: its
+`LoggingTensorMode` has no rule for the `flex_attention` HOP). Job 429 ran a
+targeted instrument instead (`common/moe.py`, `DSV4_ROUTER_DEBUG=1`, branch
+`dsv4_flash_pr18_sweep`, commit 79e9d3025): the router records its input
+`x_TD`, post-sigmoid `scores_TE` and top-k on the forward call and diffs them
+on the FullAC recompute. 2x microbatch, determinism check off, 8 nodes. Every
+one of the 8 reporting ranks, first compared layer:
+
+| rank | router input equal? | elements differing (of 67.1 M) | max |x diff| | scores max diff | top-k rows changed (of 16384) |
+|---|---|---|---|---|---|
+| 0..7 | **no** | 0.59 M - 1.77 M (0.9-2.6 %) | 3.1e-2 / 4.7e-2 (1 bf16 ulp at |x|~4-8) | 3.5e-4 - 4.8e-4 | 11 - 34 |
+
+`expert_bias_equal=True` everywhere. The flipped rows are 6th-slot near-ties
+(e.g. row 6430: experts 28 vs 180 at 0.9114022 vs 0.9114074 in the forward,
+0.9114000 vs 0.9113990 in the recompute).
+
+So the router and top-k are not the culprit: **the block's hidden state is
+already not bitwise reproducible between forward and recompute at T=16384,
+upstream of the router** -- in attention, the HC branches or the norms --
+while at T=8192 thirty runs never tripped the check. One-ulp bf16 flips in
+~2 % of elements is the signature of an fp32 accumulation whose order varies
+run to run (split-K / atomics) somewhere that feeds the whole hidden state.
+Prime suspect: the HC mixing linear, `F.linear(x.float(), hc_fn.float())`
+with K=16384 and N=24, an extremely skinny fp32 GEMM that runs through the
+bf16x9 emulation path; cuBLAS heuristics pick split-K by M, which would
+explain the shape dependence, and deterministic mode (which fixed 2x) is
+the one knob that constrains cuBLAS/cuBLASLt algorithm choice. A single-GPU
+run-to-run test of every GEMM and reduction on the block's path at M=8192
+and M=16384, under bfx9/ieee and with/without deterministic mode, is
+`gb300/gemm_determinism.py` (branch `dsv4_flash_pr18_sweep`).
