@@ -690,3 +690,19 @@ and a tie-broken fp32 variant of `select` is still nondeterministic at
 T=16384 -- so the nondeterminism is in the index-score computation
 (`einsum("shd,td->sht")`, relu, `* idx_w`, head-sum) rather than in top-k.
 `gb300/select_determinism.py` isolates the op.
+
+**Settled (jobs 433, 434).** Every op producing the index scores is bitwise
+deterministic at both shapes (433). `torch.topk` on bf16 rows is stable even
+with boundary ties at every width (434) -- but the original `select` promotes
+its scores to fp32 (the `where(mask, finfo.min, 0)` add), and the fp32
+top-k over 4096-wide rows is where the tie order becomes unstable: the
+original's *effective* selection differs in 5/5 calls at T=16384 and 0/5 at
+8192; under `use_deterministic_algorithms` 0/5 (torch routes topk through a
+deterministic path). The stable-sort formulation
+(`masked_fill` + `torch.sort(descending, stable=True)[:, :k]`) is 0/5 at
+both shapes and agrees with the original in 100 % of rows at 8192, where the
+original is itself deterministic. **Landed in `compressor.py` on
+`dsv4_flash_pr18_sweep` and `dsv4_flash_hc_compile`.** Proof runs (8 nodes):
+plain FullAC 2x without deterministic mode or saved top-k
+(`deepseek_v4_flash_pr18_bs2`, tag `_fix`), the all-leaves 1x recipe with
+the fix (regression check), and all-leaves at 2x.
