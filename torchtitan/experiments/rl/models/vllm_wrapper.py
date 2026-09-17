@@ -413,10 +413,8 @@ class VLLMModelWrapper(Module):
     # TODO: followup with potentially adding extra kwarg ``sinks`` to vLLM attn
     def _inject_attention_sinks(self) -> None:
         """Give each gpt-oss attention's vLLM backend its sink-rescale hook."""
-        from torchtitan.models.gpt_oss.model import (
-            apply_attention_sink_rescale,
-            Attention,
-        )
+        from torchtitan.models.common.attention import apply_attention_sink_rescale
+        from torchtitan.models.gpt_oss.model import Attention
 
         for module in self.model.modules():
             if not isinstance(module, Attention):
