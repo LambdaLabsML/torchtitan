@@ -325,6 +325,33 @@ step was paying per microbatch. (Whether attention over the folded stream is
 meant to span packed documents is a model question, not addressed here.)
 No bs4, no batch stack. Round-3 `pr18_stack_bs2` is not run.
 
+## The 100.09 config, profiled on 8 nodes (32 GPUs)
+
+`/mnt/dgxc/profiles/dsv4_flash_8k_best100_32xgb300/` (job 417). Run on 8
+nodes because 5 of 16 were down; **no config change was needed** (dp_shard=-1
+resolves to the world size, EP=4 divides 32, per-rank quantities unchanged) --
+only the launcher's hardcoded `--nnodes 16` became a parameter that follows
+the allocation.
+
+| | TFLOP/s per GPU | peak |
+|---|---:|---:|
+| 100.09 config, 16 nodes, unprofiled (399) | 100.09 | 74.78 GiB |
+| 100.09 config, 8 nodes, profiler on (417) | **88.86** | **108.83 GiB** |
+| step 3 of the same run | 100.84 | 106.21 GiB |
+
+The profiler costs ~13 % on this model (92.15 -> 79.86 measured on the eager
+config), so 88.86 profiled corresponds to ~101-102 unprofiled: **per-GPU
+throughput at 8 nodes is the same as at 16, a hair better**, as expected from
+FSDP groups of 32 instead of 64. Memory +34 GiB, exactly the doubled FSDP
+shard of weights + optimizer state.
+
+Buckets vs the 16-node profile of the 92.15 config (not like-for-like: node
+count AND the two comm levers differ): NCCL 30.1 % -> 22.6 % with launches
+1,240 -> 552 (MinimalAsyncEP replaces NCCL SendRecv with its own
+symmetric-memory kernels, which land in "other": 2,023 -> 2,585 ms); attention
+backward and elementwise unchanged in absolute ms (4,124 / 4,833); total GPU
+kernel time 20,178 -> 18,485 ms.
+
 ## EP re-sweep on the 100.09 recipe (round 4, branch `dsv4_flash_pr18_sweep`)
 
 EP=4 was chosen under a *blocking* all-to-all, where a group that fits one
