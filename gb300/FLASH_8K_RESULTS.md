@@ -1022,3 +1022,38 @@ It also pins `_batch_shape` and rejects a token count that is not a multiple
 of `seq_len`. Two bugs it caught before any cluster time was spent:
 `Indexer.select`'s stable sort returned `order[:, :k]` (slices the sequence
 dim once batched) and the batched fold-back dropped the head dim.
+
+### The NVLink domain at working scale, and EP>4 on it (jobs 481, 478-480)
+
+The 8-node probe settles the topology question at the scale we actually run:
+NCCL reports `cliqueSize 32 nvlDomainSize 32` -- all 32 GPUs of an 8-node job
+are one NVLink clique -- and bandwidth *improves* with scale:
+
+| ranks | all_gather per rank | reduce_scatter per rank |
+|---|---|---|
+| 8 (2 nodes) | 489 GB/s | 394 GB/s |
+| 32 (8 nodes) | **526 GB/s** | **527 GB/s** |
+
+So the fabric is not the constraint and nothing about it is being
+underutilised. What about using it for *expert* dispatch? With HybridEP's
+NVLink-domain knob set to the real domain size and `USE_MNNVL=1`:
+
+| config | TFLOP/s | peak mem |
+|---|---|---|
+| HybridEP EP=4 (`ranks_per_nvlink_domain=4`) | 133.25 | 104.85 GiB |
+| HybridEP EP=8 (`=8`, `USE_MNNVL=1`) | 130.44 | 100.42 GiB |
+| HybridEP EP=32 (`=32`, `USE_MNNVL=1`) | 89.73 | 124.47 GiB |
+
+Monotonically worse, exactly as MinimalAsyncEP was (4 -> 100.09, 8 -> 94.87,
+16 -> 82.90, 32 -> 67.44 on the older recipe). **EP=4 is optimal for
+dispatcher-fan-out reasons, not link reasons**: a wider group means more
+peers, smaller per-peer transfers and more metadata, and that cost does not
+care whether the links are NVLink or IB. The earlier interpretation ("EP=4
+wins because it stays inside a node's NVLink mesh") was wrong about the
+mechanism while right about the conclusion.
+
+`NCCL_ALGO=AllGather:NVLS;ReduceScatter:NVLS` (semicolon syntax, which does
+parse -- the launcher echo confirms it reached the ranks) fails at runtime:
+**NVLS has no bf16 ReduceScatter** ("No algorithm/protocol available for
+function ReduceScatter with datatype ncclBfloat16"). All-gather-only NVLS is
+job 487.
