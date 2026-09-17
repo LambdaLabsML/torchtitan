@@ -1082,3 +1082,27 @@ re-benchmarks the pinned choice; it is measured free at 1x
 `common/attention.py`) and the batch runs requeued as 489 (2x), 490 (4x),
 491 (1x re-check). This is the same trap the original 2x/4x attempts
 (jobs 330/341/365) fell into.
+
+**Jobs 489-491 all failed without steps -- two separate causes, one of them a
+config mistake of mine:**
+
+1. **No memory headroom.** The batch configs were based on reshard-never,
+   which already peaks at 241 GiB of 276 because it keeps every block's
+   parameters unsharded. There is nothing left for a bigger microbatch: job
+   490 (4x) died with a genuine `OutOfMemoryError` (3 GiB request, 777 MiB
+   free). Fixed by basing >1x on the leaf-compile recipe (137.28, 106 GiB) and
+   keeping reshard-never only for the 1x comparison. The two levers are
+   memory-competing, not additive.
+2. **Cold Inductor cache over NFS.** Jobs 489 and 491 died with
+   `Operation timed out after 300 s` on their FIRST collective, on every rank.
+   Editing the flex `inductor_configs` (autotune off) changed the Inductor
+   cache key, so all 32 ranks recompiled every flex kernel into the shared
+   `~/.triton` at once -- the same NFS contention that has bitten this cluster
+   before -- and blew the 300 s `comm.init_timeout_seconds` default. Raised to
+   1800 s on these configs. Note 491 also *overwrote* 484's log because both
+   used the same TAG; use distinct tags for re-runs.
+
+Also: `NCCL_ALGO=AllGather:NVLS` (job 488) = **140.74**, below the 142.72 of
+`NCCL_PROTO=Simple` alone. NVLS multicast is not a win for FSDP's all-gather
+here, and it has no bf16 reduce-scatter at all. **Communication round closed
+at 142.72** (leaf2 + reshard-never + `NCCL_PROTO=Simple`).
