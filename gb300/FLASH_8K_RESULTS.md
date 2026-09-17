@@ -635,3 +635,19 @@ the one knob that constrains cuBLAS/cuBLASLt algorithm choice. A single-GPU
 run-to-run test of every GEMM and reduction on the block's path at M=8192
 and M=16384, under bfx9/ieee and with/without deterministic mode, is
 `gb300/gemm_determinism.py` (branch `dsv4_flash_pr18_sweep`).
+
+**GEMM/reduction microbench (job 430, one GB300): suspect refuted.** Every
+GEMM and reduction on the block's path to the router -- the skinny HC mixing
+linear (K=16384, N=24) and HC head linear under bf16x9, the HC RMS statistic
+and branch sum, the router gate, wq_a/wq_b/wkv/wo_a/wo_b, rms_norm and the
+q-norm -- is bitwise identical across 6 runs at both M=8192 and M=16384,
+under bfx9 and ieee, with and without deterministic mode. So the
+nondeterminism is not in any individual dense op run in isolation. Remaining
+candidates: FlexAttention's forward (Triton template) at the 2x mask shape,
+the DSA index selection (`Indexer.select`: bf16 scores with many relu ties
+feeding `topk`, n_cmp 2048 -> 4096 may cross a kernel-selection threshold),
+or an interaction (allocator/stream state) that a single op in a loop does
+not reproduce. Next: `gb300/block_determinism.py` runs one real CSA+MoE
+block (layer 4) on one GPU, same weights and input, four times at T=8192 and
+T=16384, with forward hooks on every submodule, and names the first one
+whose output is not bitwise stable.
