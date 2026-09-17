@@ -1057,3 +1057,28 @@ parse -- the launcher echo confirms it reached the ranks) fails at runtime:
 **NVLS has no bf16 ReduceScatter** ("No algorithm/protocol available for
 function ReduceScatter with datatype ncclBfloat16"). All-gather-only NVLS is
 job 487.
+
+### Batched DSA throughput (8 nodes, reshard-never + NCCL_PROTO=Simple)
+
+| job | config | microbatch | TFLOP/s | peak mem |
+|---|---|---|---|---|
+| 484 | `bdsa_bs1` | 1x | **143.29** | 241.17 GiB |
+
+The 1x regression check: the batched code path plus the compressor overlap fix
+cost nothing at one sequence per rank (143.29 vs 142.72 baseline, inside
+noise), which is the prerequisite for trusting the >1x numbers.
+
+**Job 485 (2x) did not reach step 1 in 13 minutes** -- not a bug in the
+batched path but Inductor autotune on the new shape, ~115 s per block across
+43 layers for forward and backward. The autotune banner is itself the
+confirmation that the batch dim is live in the kernel:
+`flex_attention(2x64x8192x512, 2x64x10240x512, ...)`, i.e. 2 sequences of
+8192 queries against their own 10240-long KV streams, where the folded path
+would have shown one 16384-query sequence against 20480 KV. Since every flex
+layer pins `kernel_options` (required on GB300 at head_dim=512), autotune only
+re-benchmarks the pinned choice; it is measured free at 1x
+(`dsv4_flash_pr18_noautotune`, 92.01 vs 92.15). **Turned off on this branch**
+(`max_autotune=False, coordinate_descent_tuning=False` in
+`common/attention.py`) and the batch runs requeued as 489 (2x), 490 (4x),
+491 (1x re-check). This is the same trap the original 2x/4x attempts
+(jobs 330/341/365) fell into.
