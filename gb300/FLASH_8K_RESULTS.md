@@ -934,3 +934,47 @@ the next two cheap experiments (jobs 472/473).
 
 (The 473 failure also confirms the exported env does reach the ranks, which
 is how the `NCCL_PROTO=Simple` run is known to have taken effect.)
+
+### EP dispatch backends, head to head on the 137.28 recipe (8 nodes, EP=4)
+
+| backend | config | TFLOP/s | vs best |
+|---|---|---|---|
+| **MinimalAsyncEP** | `deepseek_v4_flash_best_leaf2` | **137.28** | -- |
+| HybridEP | `comms_ep_hybridep` (job 474) | 133.25 | -2.9 % |
+| DeepEP v2.1.0 | `comms_ep_deepep` (job 449) | 128.21 | -6.6 % |
+| standard NCCL all-to-all | `comms_ep_standard` (job 448) | 119.33 | -13.1 % |
+
+All four measured with identical model code, parallelism, AC and leaf
+compiles; only the dispatcher differs. MinimalAsyncEP wins; the sweep is
+complete for EP=4.
+
+**Installing HybridEP on this cluster** (it is the `hybrid-ep` branch of
+deepseek-ai/DeepEP, not a separate package; torchtitan imports
+`deep_ep.HybridEPBuffer`). Checked out at `/mnt/dgxc/DeepEP-hybrid`, build
+job `build_hybridep.slurm` there. Five environmental blockers, all fixed,
+none architectural:
+
+1. multinode path needs DOCA or NIXL, neither installed -> built with
+   `HYBRID_EP_MULTINODE=0` (intranode only; fine at EP=4, which is one node);
+2. `cuda/std/tuple` -- the branch's setup.py never adds the CCCL include dir;
+   CCCL ships in the `nvidia-cu13` wheel, symlinked as
+   `$CUDA_HOME/include/cccl` and put on `CPATH`/`NVCC_PREPEND_FLAGS`;
+3. `cuda_profiler_api.h` absent from the wheel-assembled shadow toolkit ->
+   two-declaration stub written into `/mnt/dgxc/cuda13/include`;
+4. link `-lnvtx3interop`: the wheel ships only `libnvtx3interop.so.1` ->
+   unversioned symlink in `/mnt/dgxc/deepep-deps/libs`, and that dir plus
+   `nvidia/cu13/lib` on `LIBRARY_PATH` (and `LD_LIBRARY_PATH` at runtime);
+5. HybridEP JIT-compiles its backend at *runtime* and passes
+   `-L$CUDA_HOME/lib64`, while the shadow toolkit only had `lib` ->
+   `lib64 -> lib` symlink. This one failed only inside a real run (job 471).
+
+Runtime knobs are in the launcher behind `HYBRIDEP=1`
+(`NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN`, `USE_MNNVL`,
+`HYBRIDEP_NUM_SMS_{DISPATCH,COMBINE}`).
+
+Not tried: HybridEP with EP>4. Because the cluster is one NVLink domain (see
+the MNNVL finding), an EP=8/16/32 group is still NVLink-connected, and
+HybridEP's TMA intranode path plus a larger
+`NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN` is the one configuration where it
+could plausibly beat MinimalAsyncEP. That needs the EP sweep re-run per
+backend, which is a round of its own.
