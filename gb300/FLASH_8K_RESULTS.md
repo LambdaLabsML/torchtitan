@@ -563,3 +563,15 @@ branch `dsv4_flash_flex_sac`: out-of-place relu, indexer and block-mask build
 under `torch.no_grad()` (its aux loss is dropped, nothing differentiable
 consumes it -- gradients unchanged). Stock SAC on the 100.09 recipe is job 425
 (`deepseek_v4_flash_best_sac_mm`).
+
+| 425 | `deepseek_v4_flash_best_sac_mm` (stock `SelectiveAC` + the `relu_` fix) | **96.96** | 227.51 GiB | ran 30 steps -- the mutation-guard root cause is confirmed -- but **-2.6 % vs FullAC and +118 GiB**. |
+
+**Verdict on "less AC" for DSv4 flash: closed.** Both SAC flavours are
+flat-to-worse against FullAC at 8 nodes (flex-only 99.69, stock 96.96 vs
+99.50) while costing 44-118 GiB. The recompute this model pays is dominated
+by cheap-to-recompute elementwise work whose *eager* cost is the problem, and
+SAC's per-op Python dispatch mode adds overhead on ~75k ops/step. The
+productive direction is the one that already paid: make the recomputed work
+cheap (leaf compile, +24 %), not skip it. The stock policy is still the right
+tool for saving router top-k across the recompute if >1x microbatch is ever
+needed (job 424 pattern), and the `relu_` fix is required for it.
