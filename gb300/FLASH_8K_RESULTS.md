@@ -676,3 +676,17 @@ correctness issue too, not just a batch-size one. Every individual GEMM was
 a red herring (job 430). The fix is to break ties deterministically in
 `Indexer.select` (fp32 scores with an index-ordered tiebreak, or a stable
 sort), which costs nothing at these sizes.
+
+**Job 432 (one GB300, whole block):** the real CSA+MoE block (layer 4, 6.6 B
+params, bf16 weights) run four times on identical input is bitwise identical
+at T=8192 and NOT at T=16384; the first diverging submodule is
+`attention.inner_attention` (the flex CSA output, 6.4 % of elements), and
+everything downstream inherits it (router input 6.1 %, router top-k 7.1 % of
+slots). Under `torch.use_deterministic_algorithms(True)` the same block is
+bitwise identical at T=16384 -- reproducing the training-side observation on
+one GPU. Two corrections to the story above: `torch.topk` itself IS
+deterministic on tied bf16 rows at every slice length tested (2048/4096/8192),
+and a tie-broken fp32 variant of `select` is still nondeterministic at
+T=16384 -- so the nondeterminism is in the index-score computation
+(`einsum("shd,td->sht")`, relu, `* idx_w`, head-sum) rather than in top-k.
+`gb300/select_determinism.py` isolates the op.
