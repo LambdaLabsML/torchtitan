@@ -729,3 +729,42 @@ the fix (regression check), and all-leaves at 2x.
 `dsv4_flash_hc_compile` (leaf compiles hc/attn/moe/sink + deterministic
 Indexer.select), 133.77 TFLOP/s at 8 nodes vs 99.50 for the 100.09 recipe
 at the same node count (+34.4 %). Not yet measured at 16 nodes.
+
+## Profile of the all-leaves recipe (job 441, 8 nodes, 133.8 TFLOP/s class)
+
+`/mnt/dgxc/profiles/dsv4_flash_leaf_all_32xgb300/rank0_trace.json.gz` (2
+profiled steps). Kernel time 14,636 ms vs 18,383 for the 100.09 recipe; launches
+96,480 vs ~150k.
+
+| bucket | ms / 2 steps | share | note |
+|---|---|---|---|
+| flex attention backward | 4,147 | 28.3 % | unchanged in absolute terms; now the largest item |
+| NCCL (FSDP all-gather / reduce-scatter) | 3,596 | 24.6 % | |
+| GEMMs incl. grouped (cutlass) | 1,733 | 11.8 % | grouped expert GEMM alone 658 ms |
+| symmetric-memory (async EP dispatch/combine, FSDP AG copies) | 1,555 | 10.6 % | |
+| flex attention forward (x2: recompute) | 1,204 | 8.2 % | |
+| eager elementwise | 853 | 5.8 % | was 4,613 (25.1 %) |
+| Inductor leaf kernels | 840 | 5.7 % | the compiled hc/attn/moe/sink work |
+| cat/split copies | 423 | 2.9 % | mostly FSDP2 all-gather copy-out (`split_with_sizes_copy`) and reduce-scatter staging (`_chunk_cat`) |
+| sort/topk/scatter/index | 96 | 0.7 % | the stable sort is 17 ms of this |
+
+**Wall-clock view (union of kernel intervals over the 11.78 s window):
+compute busy 79.9 %, communication 38.4 %, EXPOSED communication 17.6 %,
+fully idle 2.5 %.** With compute 20 % cheaper, the same communication volume
+is exposed three times more than in the 100.09 profile (5.5 %). Communication
+is now the largest non-kernel inefficiency, ahead of anything compile can
+reach.
+
+**What is left for compile.** The remaining eager elementwise/copy/reduce
+work is ~1.86 s / 2 steps (12.7 % of kernel time) once the cutlass grouped
+GEMM (which the name-based bucket mis-caught) is removed; of that ~0.55 s is
+FSDP2's own copy-in/copy-out and reduce-scatter staging, ~0.1 s async-EP
+metadata, and the model-side remainder is spread thin: `aten::mul` 280 ms,
+`copy_` 174, `add_` 100, `sum` 75, `clamp_min` 70 (block-mask build and the
+indexer relu), `cat` 63, `mul_` 57. Round 7 (`dsv4_flash_leaf2`) targets the
+indexer (relu*weight*head-sum over the 2 GiB score tensor, q rope/cat, scale
+folded into the hadamard), the compressor pooling, the router and the
+shared-expert SwiGLU; after it the compile lever is within ~3-4 % of
+exhausted on this model. The big remaining items are the flex kernels (36 %
+of kernel time, needs kernel work), exposed communication (17.6 % of wall)
+and the FSDP2 copies (~4 %).
