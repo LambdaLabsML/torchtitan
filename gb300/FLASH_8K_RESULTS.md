@@ -768,3 +768,17 @@ shared-expert SwiGLU; after it the compile lever is within ~3-4 % of
 exhausted on this model. The big remaining items are the flex kernels (36 %
 of kernel time, needs kernel work), exposed communication (17.6 % of wall)
 and the FSDP2 copies (~4 %).
+
+## Round 7: leaves beyond the first four (8 nodes, 30 steps)
+
+Branch `dsv4_flash_leaf2` (worktree `/mnt/dgxc/worktrees/leaf2`), off the
+all-leaves branch. Config `deepseek_v4_flash_best_leaf2` (= the 100.09
+recipe; all levers code-level).
+
+| job | commit | what | TFLOP/s | vs 133.77 | peak mem |
+|---|---|---|---|---|---|
+| 442 | 498480c8c | indexer leaves (`_index_q_rope`, `_index_scores`), indexer + block-mask build under `no_grad`, compressor pooling leaf, router leaves, shared-expert SwiGLU | **137.02** | **+2.4 %** | 105.31 GiB |
+| 444 | 3198706d9 | + rotation scale folded into the cached hadamard (one GEMM instead of GEMM + pass) | (pending) | | |
+
+No recompile / graph-break warnings. Eager mode of every new leaf reproduces
+the original math bitwise (CPU); compiled differs at bf16 rounding only.
