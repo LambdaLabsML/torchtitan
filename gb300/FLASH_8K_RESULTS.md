@@ -536,3 +536,30 @@ gate on the AC policy. `FlexSaveAC` saves only the flex region and recomputes
 the dispatcher's ops exactly as FullAC does, so the gate was widened to accept
 it; requeued. Job 422 (same branch, 2x microbatch with saved top-k) was
 cancelled before it hit the same error and requeued behind it.
+
+### Round 5, continued: the AC policies (8 nodes)
+
+| job | config | TFLOP/s | peak mem | note |
+|---|---|---|---|---|
+| 423 | `deepseek_v4_flash_best_flex_sac` (save flex outputs only, recompute the rest) | **99.69** | 152.86 GiB | flat vs 99.50; +44 GiB. Skipping the flex forward recompute buys nothing: either it was smaller than the profile suggested or SAC's per-op dispatch overhead ate it. |
+| 424 | `deepseek_v4_flash_best_flex_sac_topk_bs2` (2x microbatch, flex + **aten.topk saved**, NO deterministic mode) | **90.24** | 239.50 GiB | **reached steps** -- the first >1x run to survive without `debug.deterministic`. Saving the router's top-k across the recompute is a structural fix for the CheckpointError. 2x is still -9.5 % vs the same policy at 1x (99.69), consistent with the 16-node curve. |
+
+To get 421 (and 423/424) to run at all, `distributed/minimal_async_ep/api.py`'s
+full-recompute gate had to accept SAC policies: it was a plain
+`isinstance(..., FullAC.Config)`. The gate's real reason -- verified in
+`_dispatch_to_experts`, which returns the process-global symmetric receive
+buffer itself -- is that without recompute autograd would hold expert inputs
+aliasing a buffer the next layer overwrites. Eager SAC recomputes the
+dispatcher's ops (none is in any save set), so it is as safe as FullAC; no-AC
+(`None`) stays rejected.
+
+**Stock `SelectiveAC` mutation guard, root cause found.** Every stock-SAC run
+of this model died with "Tensor cached during selective activation checkpoint
+has been mutated", traceback ending in `Indexer.select`
+(`compressor.py:193`). The einsum there lowers to `aten.bmm`, whose output the
+stock policy caches, and the next line applied `relu_()` to it in place
+(reproduced on CPU: version counter 0 -> 1 on the cached tensor). Fixed on
+branch `dsv4_flash_flex_sac`: out-of-place relu, indexer and block-mask build
+under `torch.no_grad()` (its aux loss is dropped, nothing differentiable
+consumes it -- gradients unchanged). Stock SAC on the 100.09 recipe is job 425
+(`deepseek_v4_flash_best_sac_mm`).
