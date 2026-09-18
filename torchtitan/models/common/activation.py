@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from torchtitan.config.configurable import Configurable
+from torchtitan.tools.leaf_compile import leaf_compile
 from torchtitan.config.function import Function
 
 
@@ -105,6 +106,18 @@ class SqrtSoftplus(UnaryActivationFn):
         return F.softplus(x).sqrt()
 
 
+@leaf_compile(group="moe", dynamic=True)
+def _swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """SwiGLU, fused into one kernel.
+
+    Eager this is two passes over the hidden activation (silu, then multiply)
+    plus three more in backward; for the MoE experts that hidden is [R, F] with
+    R = routed tokens. ``dynamic=True`` because R changes every step and a
+    static compile would recompile each time.
+    """
+    return F.silu(gate) * up
+
+
 class SwiGLU(BinaryActivationFn):
     """SwiGLU activation."""
 
@@ -122,7 +135,7 @@ class SwiGLU(BinaryActivationFn):
         **kwargs: Any,
     ) -> torch.Tensor:
         del kwargs
-        return F.silu(gate) * up
+        return _swiglu(gate, up)
 
 
 class SiTUGLU(BinaryActivationFn):
