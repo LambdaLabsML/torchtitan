@@ -1129,3 +1129,46 @@ Note the 1x row uses the reshard-never base (241 GiB) and so is not directly
 comparable to 2x/4x; the honest comparisons are 2x/4x against the leaf2 base
 at 1x (137.28), and the two memory-heavy levers cannot be stacked naively
 (see job 490's OOM). `bdsa_bs2_rn` tests whether reshard-never + 2x fits.
+
+### The batch curve, and where it ends (8 nodes, 30 steps)
+
+| job | microbatch | tokens/rank | TFLOP/s | tok/s/GPU | peak mem |
+|---|---|---|---|---|---|
+| -- | 1x | 8,192 | 137.28 | ~1,517 | 106 GiB |
+| 492 | 2x | 16,384 | 150.57 | 1,699 | 128 GiB |
+| 493 | 4x | 32,768 | **158.74** | 1,791 | 174 GiB |
+| 495 | 6x | 49,152 | **160.04** | 1,806 | 221 GiB |
+| 496 | 8x | 65,536 | **27.96** | 315 | 245 GiB |
+
+**4x is the operating point.** 6x buys +0.8 % for +47 GiB (and 160.04 vs
+158.74 is inside the run-to-run floor), and 8x falls off a cliff: the log
+shows `expandable_segments: memory mapping failed with OOM` and allocator
+retries, with throughput decaying step by step (35.4 at step 5, 33.7 at 10,
+21.3 at 20) as the allocator thrashes. It never OOMs outright, it just grinds
+-- worth knowing as a failure signature: a *slow* run at ~88 % memory is the
+allocator, not the model.
+
+**Stacking with reshard-never (job 497): fits, but is not worth it.** 2x +
+reshard-never = 151.75 at **262.91 GiB (95.1 %)**, versus 150.57 at 128 GiB
+for 2x alone. +0.8 % for +135 GiB and no headroom left. The two levers are
+memory-competing and batch is the far better use of the memory.
+
+### Profile of the 4x batched step (job 498)
+
+`/mnt/dgxc/profiles/dsv4_flash_bdsa_bs4_32xgb300/`. Kernel time 39,615 ms per
+2 steps over 94,804 launches -- i.e. **4x the tokens for 2.6x the launches**,
+which is the whole point of the batched path.
+
+| | reshard-never 1x | **batched 4x** |
+|---|---|---|
+| compute busy | 75.9 % | **87.0 %** |
+| exposed communication | 12.9 % | 11.8 % |
+| idle | 11.2 % | **1.2 %** |
+
+The launch-bound idle that appeared after reshard-never is gone: bigger
+per-kernel work refills the pipeline. Kernel shares: flex backward 40.7 %,
+GEMMs 15.6 %, flex forward 11.2 %, all-gather/symm copies 10.4 %, NCCL 8.3 %,
+Inductor leaves 8.1 %, elementwise 4.1 %, and the DSA index/sort work is
+**0.9 %** (it was the quadratic term before). Attention is now 52 % of kernel
+time and everything else is small: the next lever is a DSA-specific attention
+kernel, nothing else.
