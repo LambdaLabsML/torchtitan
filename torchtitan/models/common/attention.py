@@ -361,9 +361,21 @@ class FlexInnerAttention(InnerAttention):
             attention_masks, BlockMask
         ), f"attention_masks must be instance of BlockMask, got {type(attention_masks)}"
 
-        q_1HTK = q_THK.transpose(0, 1).unsqueeze(0)
-        k_1HTK = k_THK.transpose(0, 1).unsqueeze(0)
-        v_1HTV = v_THV.transpose(0, 1).unsqueeze(0)
+        # Two input layouts are accepted:
+        #   3D ``[T, H, K]``    -- a folded single-sequence stream (kernel batch 1);
+        #   4D ``[B, L, H, K]`` -- B independent sequences of length L, run as a
+        #     real kernel batch so each sequence attends only to its own KV and
+        #     cost scales with L rather than with B*L. Outputs are folded back to
+        #     ``[T, H, V]`` so callers and ``out_transform`` see one layout.
+        batched = q_THK.ndim == 4
+        if batched:
+            q_1HTK = q_THK.transpose(1, 2)
+            k_1HTK = k_THK.transpose(1, 2)
+            v_1HTV = v_THV.transpose(1, 2)
+        else:
+            q_1HTK = q_THK.transpose(0, 1).unsqueeze(0)
+            k_1HTK = k_THK.transpose(0, 1).unsqueeze(0)
+            v_1HTV = v_THV.transpose(0, 1).unsqueeze(0)
         aux_request = self._get_aux_request(return_lse=out_transform is not None)
 
         # 1. _compiled_flex_attn has to be a class variable, otherwise there will
@@ -388,10 +400,17 @@ class FlexInnerAttention(InnerAttention):
                 kernel_options=self.kernel_options,
             )
         self._process_aux(aux)
-        out_THV = out_1HTV.squeeze(0).transpose(0, 1)
+        if batched:
+            # [B, H, L, V] -> [B, L, H, V] -> [B*L, H, V]
+            out_THV = out_1HTV.transpose(1, 2).flatten(0, 1)
+        else:
+            out_THV = out_1HTV.squeeze(0).transpose(0, 1)
         if out_transform is None:
             return out_THV
-        lse_TH = aux.lse.squeeze(0).transpose(0, 1)
+        if batched:
+            lse_TH = aux.lse.transpose(1, 2).flatten(0, 1)
+        else:
+            lse_TH = aux.lse.squeeze(0).transpose(0, 1)
         return out_transform(out_THV, lse_TH)
 
 

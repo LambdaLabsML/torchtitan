@@ -46,6 +46,11 @@ class Compressor(Module):
         head_dim: int = 512
         rope_head_dim: int = 64
         compress_ratio: int = 4
+        seq_len: int = 0
+        """Length of one packed sequence. 0 means "the whole token stream is one
+        sequence" (the original behaviour). When set and the stream is longer,
+        the overlap shift below stays inside each sequence instead of feeding
+        sequence n's first compressed group from sequence n-1's tail."""
 
     def __init__(self, config: Config):
         super().__init__()
@@ -53,6 +58,7 @@ class Compressor(Module):
         self.head_dim = cfg.head_dim
         self.rope_head_dim = cfg.rope_head_dim
         self.compress_ratio = cfg.compress_ratio
+        self.seq_len = cfg.seq_len
         self.overlap = cfg.compress_ratio == 4
         self.rope = cfg.rope.build()
 
@@ -72,15 +78,36 @@ class Compressor(Module):
             Tensor of shape ``[B, L // R, 2 * R, D]``.
         """
         d = self.head_dim
-        prev = torch.cat(
-            [
-                torch.full_like(tensor[:1, :, :d], value),
-                tensor[:-1, :, :d],
-            ],
-            dim=0,
-        )
+        groups_per_seq = self._groups_per_seq(tensor.size(0))
+        if groups_per_seq is None:
+            prev = torch.cat(
+                [
+                    torch.full_like(tensor[:1, :, :d], value),
+                    tensor[:-1, :, :d],
+                ],
+                dim=0,
+            )
+        else:
+            # Shift by one group WITHIN each packed sequence: the first group of
+            # every sequence gets ``value``, not the tail of the previous one.
+            g = tensor.unflatten(0, (-1, groups_per_seq))[..., :d]
+            prev = torch.cat(
+                [torch.full_like(g[:, :1], value), g[:, :-1]], dim=1
+            ).flatten(0, 1)
         curr = tensor[:, :, d:]
         return torch.cat([prev, curr], dim=1)
+
+    def _groups_per_seq(self, n_groups: int) -> int | None:
+        """Compressed groups per packed sequence, or None for a single sequence."""
+        if not self.seq_len:
+            return None
+        per_seq = self.seq_len // self.compress_ratio
+        if per_seq <= 0 or n_groups % per_seq != 0:
+            raise ValueError(
+                f"compressed groups ({n_groups}) must be a multiple of "
+                f"seq_len // compress_ratio ({per_seq})"
+            )
+        return None if n_groups == per_seq else per_seq
 
     def forward(self, x, positions):
         """Compress hidden states into compressed KV states.
@@ -189,10 +216,23 @@ class Indexer(Module):
         ratio: int,
         topk: int,
     ) -> torch.Tensor:
-        """Select top-k compressed positions per folded query token."""
-        index_score = torch.einsum("shd,td->sht", idx_q, idx_k)
-        index_score = index_score.relu_() * idx_w.unsqueeze(-1)
-        index_score = index_score.sum(dim=1)
+        """Select top-k compressed positions per query token.
+
+        Accepts the folded single-sequence layout (``idx_q`` ``[T, H, D]``,
+        ``idx_k`` ``[T // ratio, D]``, ``idx_w`` ``[T, H]`` -> ``[T, topk]``) or
+        a batched one (``[B, L, H, D]``, ``[B, L // ratio, D]``, ``[B, L, H]``
+        -> ``[B, L, topk]``). Batched, the score tensor is ``B * L * (L/ratio)``
+        instead of ``(B*L) * (B*L/ratio)`` -- linear in tokens rather than
+        quadratic -- and a query can only select keys from its own sequence.
+        """
+        batched = idx_q.ndim == 4
+        eq = "bshd,btd->bsht" if batched else "shd,td->sht"
+        index_score = torch.einsum(eq, idx_q, idx_k)
+        # Out of place: the einsum lowers to aten.bmm, whose output selective
+        # activation checkpointing caches, and an in-place relu on it trips the
+        # SAC mutation guard.
+        index_score = index_score.relu() * idx_w.unsqueeze(-1)
+        index_score = index_score.sum(dim=-2)
 
         compress_causal_limit = (
             torch.arange(1, seqlen + 1, device=idx_q.device).unsqueeze(1) // ratio
@@ -201,6 +241,8 @@ class Indexer(Module):
             torch.arange(seqlen // ratio, device=idx_q.device).repeat(seqlen, 1)
             >= compress_causal_limit
         )
+        if batched:
+            compress_causal_mask = compress_causal_mask.unsqueeze(0)
         index_score = index_score + torch.where(
             compress_causal_mask, torch.finfo(idx_q.dtype).min, 0
         )
