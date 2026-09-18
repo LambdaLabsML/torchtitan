@@ -101,12 +101,14 @@ def _make_compressor_config(
     norm_eps: float,
     coff: int,
     rope: RoPE.Config,
+    seq_len: int = 0,
 ) -> "Compressor.Config":
     return Compressor.Config(
         rope=dataclasses.replace(rope),
         head_dim=head_dim,
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
+        seq_len=seq_len,
         wkv=Linear.Config(
             in_features=dim,
             out_features=coff * head_dim,
@@ -140,6 +142,7 @@ def _make_indexer_config(
     compress_ratio: int,
     norm_eps: float,
     rope: RoPE.Config,
+    seq_len: int = 0,
 ) -> "Indexer.Config":
     coff = 2  # overlap always True for indexer
     return Indexer.Config(
@@ -167,6 +170,7 @@ def _make_indexer_config(
             norm_eps=norm_eps,
             coff=coff,
             rope=rope,
+            seq_len=seq_len,
         ),
     )
 
@@ -189,6 +193,7 @@ def _make_v4_attn_config(
     index_topk: int,
     n_layers: int,
     rope: RoPE.Config,
+    seq_len: int = 0,
 ) -> Attention.Config:
     hd = head_dim
     per_group_in = (n_heads * hd) // n_groups
@@ -209,6 +214,7 @@ def _make_v4_attn_config(
             norm_eps=norm_eps,
             coff=coff,
             rope=rope,
+            seq_len=seq_len,
         )
         indexer_cfg = _make_indexer_config(
             dim=dim,
@@ -219,6 +225,7 @@ def _make_v4_attn_config(
             compress_ratio=compress_ratio,
             norm_eps=norm_eps,
             rope=rope,
+            seq_len=seq_len,
         )
     elif compress_ratio > 1:
         coff = 1  # no overlap
@@ -230,6 +237,7 @@ def _make_v4_attn_config(
             norm_eps=norm_eps,
             coff=coff,
             rope=rope,
+            seq_len=seq_len,
         )
     if compress_ratio == 4:
         inner_attention_cls = CompressedSparseAttention
@@ -238,6 +246,7 @@ def _make_v4_attn_config(
     else:
         inner_attention_cls = SlidingWindowAttention
     inner_attention_cfg = inner_attention_cls.Config(
+        seq_len=seq_len,
         window_size=window_size,
         compress_ratio=compress_ratio,
         softmax_scale=softmax_scale,
@@ -421,6 +430,7 @@ def _build_v4_layers(
     hc_eps: float = 1e-6,
     dense_hidden_dim: int | None = None,
     dense_layers: set[int] | None = None,
+    seq_len: int = 0,
 ) -> list[DeepSeekV4TransformerBlock.Config]:
     if dense_layers is None:
         dense_layers = set()
@@ -449,6 +459,7 @@ def _build_v4_layers(
             index_topk=index_topk,
             n_layers=n_layers,
             rope=rope_compress if cr > 1 else rope,
+            seq_len=seq_len,
         )
 
         if layer_id in dense_layers:
@@ -668,6 +679,7 @@ def _debugmodel(
     )
 
     layers = _build_v4_layers(
+        seq_len=seq_len,
         n_layers=n_layers,
         dim=dim,
         n_heads=n_heads,
@@ -800,6 +812,7 @@ def _deepseek_v4_flash(
     )
 
     layers = _build_v4_layers(
+        seq_len=seq_len,
         n_layers=n_layers,
         dim=dim,
         n_heads=n_heads,
@@ -932,6 +945,7 @@ def _deepseek_v4_pro(
     )
 
     layers = _build_v4_layers(
+        seq_len=seq_len,
         n_layers=n_layers,
         dim=dim,
         n_heads=n_heads,

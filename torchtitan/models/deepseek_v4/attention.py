@@ -107,6 +107,17 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
         compress_ratio: int
         softmax_scale: float
         index_topk: int
+        seq_len: int = 0
+        """Length of one packed sequence. 0 (the original behaviour) treats the
+        whole per-rank token stream as a single sequence, which makes the DSA
+        cost quadratic in the microbatch: the indexer scores every query
+        against every compressed key of the whole stream and the selection mask
+        is a dense [T, T + n_cmp]. With it set, the stream is split into
+        ``T // seq_len`` independent sequences and both scale with ``seq_len``
+        instead -- so a larger microbatch costs proportionally more rather than
+        quadratically more, and queries stop attending across packed document
+        boundaries (their RoPE positions restart per sequence, so those scores
+        were meaningless)."""
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
@@ -114,6 +125,7 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
         self.compress_ratio = config.compress_ratio
         self.softmax_scale = config.softmax_scale
         self.index_topk = config.index_topk
+        self.seq_len = config.seq_len
         self.block_size = config.block_size
 
     def get_window_topk_idxs(
@@ -254,17 +266,35 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
         if attn_sink is None:
             raise ValueError("DSV4FlexInnerAttention requires attn_sink")
 
-        seqlen = q.size(0)
-        n_cmp = 0 if cmp_k is None else cmp_k.size(0)
+        bsz, seqlen = self._batch_shape(q.size(0))
+        n_cmp = 0 if cmp_k is None else cmp_k.size(0) // bsz
 
-        kv = swa_k.unsqueeze(1)
-        if cmp_k is not None:
-            kv = torch.cat([kv, cmp_k.unsqueeze(1)], dim=0)
-        kv = kv.expand(-1, q.size(1), -1)
+        if bsz == 1:
+            kv = swa_k.unsqueeze(1)
+            if cmp_k is not None:
+                kv = torch.cat([kv, cmp_k.unsqueeze(1)], dim=0)
+            kv = kv.expand(-1, q.size(1), -1)
+            kv_len = kv.size(0)
+            q_in = q
+        else:
+            # One KV stream per sequence: [B, L (+ n_cmp), H, D]. Window and
+            # compressed indices are per-sequence, so no query can reach
+            # another sequence's keys.
+            n_heads, head_dim = q.size(1), q.size(2)
+            kv = swa_k.view(bsz, seqlen, head_dim)
+            if cmp_k is not None:
+                kv = torch.cat([kv, cmp_k.view(bsz, n_cmp, head_dim)], dim=1)
+            kv_len = kv.size(1)
+            kv = kv.unsqueeze(2).expand(-1, -1, n_heads, -1)
+            q_in = q.view(bsz, seqlen, n_heads, head_dim)
+            if idx_q is not None:
+                idx_q = idx_q.view(bsz, seqlen, idx_q.size(1), idx_q.size(2))
+                idx_k = idx_k.view(bsz, n_cmp, idx_k.size(1))
+                idx_w = idx_w.view(bsz, seqlen, idx_w.size(1))
 
         with spmd.no_typecheck():
             selected_indices = [
-                self.get_window_topk_idxs(bsz=1, seqlen=seqlen, device=q.device)
+                self.get_window_topk_idxs(bsz=bsz, seqlen=seqlen, device=q.device)
             ]
             if self.compress_ratio == 4:
                 if idx_q is None or idx_k is None or idx_w is None:
@@ -279,7 +309,9 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
                     seqlen=seqlen,
                     ratio=self.compress_ratio,
                     topk=self.index_topk,
-                ).unsqueeze(0)
+                )
+                if cmp_topk.ndim == 2:  # folded layout -> add the batch dim
+                    cmp_topk = cmp_topk.unsqueeze(0)
                 causal_limit = (
                     torch.arange(1, seqlen + 1, device=q.device).unsqueeze(1)
                     // self.compress_ratio
@@ -291,26 +323,41 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
             elif self.compress_ratio > 1:
                 selected_indices.append(
                     self.get_compress_topk_idxs(
-                        bsz=1, seqlen=seqlen, n_cmp=n_cmp, device=q.device
+                        bsz=bsz, seqlen=seqlen, n_cmp=n_cmp, device=q.device
                     )
                 )
             selected_indices = torch.cat(selected_indices, dim=-1)
 
             block_mask = self._build_block_mask(
-                1, seqlen, kv.size(0), selected_indices, q.device
+                bsz, seqlen, kv_len, selected_indices, q.device
             )
 
             def apply_sink(out_THV, lse_TH):
                 return apply_attention_sink_rescale(out_THV, lse_TH, attn_sink)
 
             return super().forward(
-                q,
+                q_in,
                 kv,
                 kv,
                 attention_masks=block_mask,
                 scale=self.softmax_scale,
                 out_transform=apply_sink,
             )
+
+    def _batch_shape(self, num_tokens: int) -> tuple[int, int]:
+        """Split the per-rank token stream into ``(bsz, seq_len)``.
+
+        ``seq_len`` unset, or a stream exactly one sequence long, keeps the
+        original single-sequence behaviour.
+        """
+        if not self.seq_len or num_tokens == self.seq_len:
+            return 1, num_tokens
+        if num_tokens % self.seq_len != 0:
+            raise ValueError(
+                f"token stream ({num_tokens}) must be a multiple of "
+                f"seq_len ({self.seq_len})"
+            )
+        return num_tokens // self.seq_len, self.seq_len
 
 
 class SlidingWindowAttention(DSV4FlexInnerAttention):
