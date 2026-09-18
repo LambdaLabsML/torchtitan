@@ -1275,3 +1275,30 @@ headroom. **New recommended config: 4x microbatch at EP=2, 170.86 TFLOP/s.**
 79.23), so the ceiling is between 6x and 8x -- job 521 tests 7x/EP=2. Also
 queued: 4x/EP=2 (520) to re-sweep the batch curve at the better EP degree, and
 a 6x/EP=2 profile (522) to attribute the win.
+
+## Status on merged main (job 534, 8 nodes, 20 steps)
+
+Both branches are merged (`dsv4_leaf_compile`, `dsv4_batched_dsa_clean`;
+main at 6857b67b6). Best recipe expressible on main -- 4x batched microbatch,
+EP=2, all leaf compiles, `NCCL_PROTO=Simple`, CUDA graphs off:
+
+**149.51 TFLOP/s**, 1,687 tok/s/GPU, 239 GiB torch reserved (246.7 GiB driver
+peak, 29.8 GiB free), loss descending normally.
+
+That is **8.2x the 18.29 flash baseline**, and 12.5% below our best measured
+170.86. The whole gap is upstream drift, not a regression in the merged work:
+
+| difference on main | cost |
+|---|---|
+| MinimalAsyncEP removed upstream (#4627) -> standard all-to-all | ~13-15% |
+| FlexAttention autotune left on (deliberately not merged) | throughput-neutral at 1x, but 228 s per block of startup and the likely cause of +60 GiB peak vs our 178 GiB |
+
+Three further pieces of upstream drift found while getting this to run:
+
+1. main imports the `renderers` package (#4691), absent from the shared venv;
+   installed to `/mnt/dgxc/pydeps` (shadowing copies removed) and put on
+   PYTHONPATH by the launcher. Without it nothing on main starts.
+2. CUDA graphs now default ON and reject any dispatcher with a host sync, so
+   the standard all-to-all needs `--training.disable_cuda_graphs`.
+3. `DSV4FlexAttention` -> `DSV4FlexInnerAttention`, and the expert SwiGLU now
+   sits behind a pluggable `activation_fn`.
