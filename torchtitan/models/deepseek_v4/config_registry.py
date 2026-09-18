@@ -266,3 +266,23 @@ def deepseek_v4_flash_8k_gb300(seq_len: int | None = 8192) -> Trainer.Config:
     config.training.max_context_length = seq_len or 8192
     config.training.steps = 30
     return config
+
+
+def deepseek_v4_flash_8k_gb300_batched(
+    microbatch: int = 4, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The GB300 recipe with ``microbatch`` packed sequences per rank.
+
+    Only useful with the batched DSA path: folded, the indexer scores every
+    query against every compressed key of the whole stream, so a 2x microbatch
+    cost -19% per token and 4x never reached step 1. Batched, the attention
+    cost is linear in tokens and the curve rises: measured on 32x GB300,
+    1x 137.28 -> 2x 150.57 -> 4x 158.74 TFLOP/s (and 170.86 at EP=2).
+
+    4x is the operating point: 6x adds ~1% for 47 GiB, and 8x exhausts the
+    card. Note the trainer's reported memory excludes the MoE dispatcher's
+    symmetric buffers, which grow with the microbatch.
+    """
+    config = deepseek_v4_flash_8k_gb300(seq_len)
+    config.training.num_tokens_per_microbatch_per_dp_rank = microbatch * (seq_len or 8192)
+    return config
