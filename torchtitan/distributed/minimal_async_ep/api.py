@@ -88,7 +88,7 @@ _buffer_key: (
 def maybe_update_minimal_async_ep_config(model_config: Any, config: Any) -> None:
     """Validate and fill MinimalAsyncEP dispatcher configs from runtime config."""
     from torchtitan.config import ParallelismConfig, TORCH_DTYPE_MAP
-    from torchtitan.distributed.activation_checkpoint import FullAC
+    from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
     from torchtitan.models.common.moe import MoE
     from torchtitan.models.common.token_dispatcher import MinimalAsyncEPTokenDispatcher
 
@@ -131,8 +131,16 @@ def maybe_update_minimal_async_ep_config(model_config: Any, config: Any) -> None
         )
 
     memory_policy = getattr(config.compile, "memory_policy", None)
+    # Eager selective AC also qualifies. The requirement exists because
+    # _dispatch_to_experts returns the process-global symmetric receive buffer
+    # itself, so without a recompute autograd would hold expert inputs that
+    # alias a buffer the next layer overwrites. SelectiveAC's save set covers
+    # matmuls, attention and comms collectives -- no dispatcher op is in it --
+    # so dispatch and combine are re-executed during the block's recompute
+    # exactly as under FullAC. No AC at all (None) is still rejected.
+    full_recompute_policies = (FullAC.Config, SelectiveAC.Config)
     if (
-        not isinstance(config.activation_checkpoint, FullAC.Config)
+        not isinstance(config.activation_checkpoint, full_recompute_policies)
         and memory_policy != "full"
     ):
         raise ValueError(
