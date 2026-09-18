@@ -388,3 +388,21 @@ def deepseek_v4_flash_8k_gb300_free_bwd_tiles(
             }
             inner.max_autotune = autotune
     return config
+
+
+def deepseek_v4_flash_8k_gb300_fp32_params(
+    microbatch: int = 4, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """fp32 parameters with bf16 optimizer states -- the configuration
+    ``fused_opt_states_bf16`` is actually for.
+
+    On top of ``training.dtype="bfloat16"`` the flag is a no-op: full bf16
+    training already puts parameters, gradients AND optimizer states in bf16,
+    so there is nothing left for it to halve (measured: 192.71 GiB either
+    way, 162.62 vs 162.68 TFLOP/s). Its real use is the other trade -- keep
+    fp32 master weights for convergence safety and pay for them with bf16
+    moments instead of fp32 ones. This config measures what that costs.
+    """
+    config = deepseek_v4_flash_8k_gb300_batched(microbatch, seq_len)
+    config.training.dtype = "float32"
+    return config
