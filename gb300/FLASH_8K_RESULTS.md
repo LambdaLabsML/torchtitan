@@ -1234,3 +1234,36 @@ headroom).
 6x is +1-3 % for +47 GiB and only 30 GiB of headroom. The batch lever is spent;
 the remaining ceiling is the flex attention kernel (54 % of kernel time) and
 the ~12 % exposed MoE dispatch.
+
+## Making 8x fit -- and finding a better lever on the way (jobs 502-505)
+
+Two independent ways to halve the 24 GiB of symmetric buffers were tried.
+
+**Single buffering does not work.** `MINIMAL_ASYNC_EP_BUFFERS=1` (jobs 502,
+504) frees the memory as intended -- driver peak drops to 202 GiB at EP=4 and
+190 GiB at EP=2, with 75-87 GiB free -- but both runs die in
+`combine_backward`: the backward reads the buffer the forward dispatched into,
+so single buffering corrupts it. The knob was reverted and the reason recorded
+at the constant in `minimal_async_ep/api.py`.
+
+**Lowering the EP degree works, and is a throughput win, not a compromise:**
+
+| job | config | TFLOP/s | tok/s/GPU | torch reserved | driver peak / free | allocator faults |
+|---|---|---|---|---|---|---|
+| 495 | 6x, EP=4 | 160.04 | 1,806 | 221 GiB | 246 / 30 GiB | 0 |
+| 505 | **6x, EP=2** | **172.74** | **1,949** | 220 GiB | 236.5 / 40.0 GiB | 0 |
+| 496 | 8x, EP=4 | 27.96 | 315 | 245 GiB | -- / ~0 | 956 |
+| 503 | 8x, EP=2 | 79.23 | 894 | 257 GiB | 276.4 / **0.1 GiB** | 488 |
+
+**6x at EP=2 is the new best: 172.74 TFLOP/s**, +7.9 % over 6x/EP=4 and
++8.8 % over the 4x/EP=4 operating point, at the same memory and with 40 GiB of
+driver headroom. That reverses the 1x EP sweep, where EP=4 led EP=2 by ~1 %
+(25.45 vs 25.22): at a large microbatch the EP group size drives both the
+symmetric-buffer footprint and the dispatch fan-out, so halving it pays.
+Every earlier EP conclusion in this ledger was measured at 1x and does not
+transfer to batch scale.
+
+8x still does not fit even at EP=2 (0.1 GiB free, 488 allocator faults,
+79.23), so the ceiling is between 6x and 8x -- job 521 tests 7x/EP=2. Also
+queued: 4x/EP=2 (520) to re-sweep the batch curve at the better EP degree, and
+a 6x/EP=2 profile (522) to attribute the win.
