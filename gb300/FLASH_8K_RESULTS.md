@@ -1263,6 +1263,14 @@ symmetric-buffer footprint and the dispatch fan-out, so halving it pays.
 Every earlier EP conclusion in this ledger was measured at 1x and does not
 transfer to batch scale.
 
+| 493 | 4x, EP=4 | 158.74 | 1,791 | 174 GiB | 193 / 83 GiB | 0 |
+| 520 | **4x, EP=2** | **170.86** | **1,928** | 178 GiB | 191.0 / 85.5 GiB | 0 |
+
+4x/EP=2 confirms the effect is not specific to 6x: **+7.6 %** there,
+**+7.9 %** at 6x. And 4x/EP=2 (170.86, 85.5 GiB free) is the better operating
+point than 6x/EP=2 (172.74, 40.0 GiB free) -- +1.1 % is not worth halving the
+headroom. **New recommended config: 4x microbatch at EP=2, 170.86 TFLOP/s.**
+
 8x still does not fit even at EP=2 (0.1 GiB free, 488 allocator faults,
 79.23), so the ceiling is between 6x and 8x -- job 521 tests 7x/EP=2. Also
 queued: 4x/EP=2 (520) to re-sweep the batch curve at the better EP degree, and
