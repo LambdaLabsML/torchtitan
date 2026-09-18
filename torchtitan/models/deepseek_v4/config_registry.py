@@ -356,3 +356,37 @@ def deepseek_v4_flash_8k_gb300_fp32_params(
     config = deepseek_v4_flash_8k_gb300_batched(microbatch, seq_len)
     config.training.dtype = "float32"
     return config
+
+
+def deepseek_v4_flash_8k_gb300_fastdata(
+    microbatch: int = 4, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The GB300 recipe with the input pipeline widened.
+
+    This tree uses Grain, not the PyTorch DataLoader, so the familiar
+    ``num_workers`` / ``prefetch_factor`` / ``persistent_workers`` /
+    ``pin_memory`` knobs do not exist. The equivalents are:
+
+    - ``read_options.num_threads`` (default 16) -- Grain's reader threads,
+      the analogue of ``num_workers``;
+    - ``read_options.prefetch_buffer_size`` (default 500) -- records read
+      ahead, the analogue of ``prefetch_factor``;
+    - ``num_prefetch_batches`` (default 2) -- assembled batches held ready.
+
+    Grain's workers are persistent and its output is already pinned, so those
+    two flags have no counterpart to set. ``resize_fn`` / ``max_patches`` are
+    vision knobs and do not apply to a text model.
+
+    Expectation: little or nothing. The 4x profile has the GPU idle 1.2% of
+    the step, which bounds anything the input pipeline can win -- a starved
+    loader would show up as idle gaps. Measured here so the question is
+    settled rather than assumed.
+    """
+    config = deepseek_v4_flash_8k_gb300_batched(microbatch, seq_len)
+    import grain
+
+    config.dataloader.read_options = grain.ReadOptions(
+        num_threads=32, prefetch_buffer_size=2000
+    )
+    config.dataloader.num_prefetch_batches = 8
+    return config
