@@ -1302,3 +1302,34 @@ Three further pieces of upstream drift found while getting this to run:
    the standard all-to-all needs `--training.disable_cuda_graphs`.
 3. `DSV4FlexAttention` -> `DSV4FlexInnerAttention`, and the expert SwiGLU now
    sits behind a pluggable `activation_fn`.
+
+## Selective AC sweep (jobs 557-561, 8 nodes, 20 steps, on the 181.69 recipe)
+
+Hypothesis tested: selective AC plus more parallelism plus a smaller
+microbatch might beat FullAC, since SAC keeps the expensive outputs instead of
+recomputing the whole block.
+
+| microbatch | EP | result | torch reserved | driver peak / free |
+|---|---|---|---|---|
+| 1x | 2 | **140.66 TFLOP/s** | 217.33 GiB | -- |
+| 2x | 2 | **OOM** (4 GiB request) | -- | 275.7 / 0.8 GiB |
+| 4x | 2 | **OOM** | -- | -- |
+| 2x | 4 | **OOM** (4 GiB request) | -- | 273.9 / 2.6 GiB |
+| 2x | 8 | killed | -- | -- |
+
+**Refuted, and not marginally.** SAC only fits at a 1x microbatch, and there
+it scores 140.66 against FullAC's 181.69 at 4x -- 23% worse -- while using
+MORE memory (217 GiB vs 193). The recompute FullAC pays for is worth less
+than the microbatch that SAC's saved activations force you to give up.
+
+Raising the EP degree does not rescue it: EP=4 and EP=8 at 2x OOM just as
+EP=2 does, because expert parallelism shards expert *weights*, not the
+activations SAC is storing (expert weights are already sharded across all 32
+ranks either way, since ep * edp is constant).
+
+Two fixes were needed before the sweep could run at all, both previously
+found on the old stack and re-applied here: the out-of-place relu in
+``Indexer.select`` (in-place mutation of a tensor SAC caches), and widening
+MinimalAsyncEP's ``isinstance(..., FullAC.Config)`` gate to accept eager SAC
+policies (they recompute the dispatcher's ops, so the symmetric-buffer
+aliasing the gate protects against cannot happen).
