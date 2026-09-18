@@ -1172,3 +1172,59 @@ Inductor leaves 8.1 %, elementwise 4.1 %, and the DSA index/sort work is
 **0.9 %** (it was the quadratic term before). Attention is now 52 % of kernel
 time and everything else is small: the next lever is a DSA-specific attention
 kernel, nothing else.
+
+## Why 6x barely helps and 8x collapses (jobs 499-501)
+
+**The "spare" memory was not spare.** The trainer's `memory: X GiB(Y%)` line
+is PyTorch's peak *reserved* over the card total, so it misses the CUDA
+context, NCCL buffers and -- the big one -- MinimalAsyncEP's symmetric-memory
+receive buffers, which are sized
+`ep_size * num_max_tokens_per_rank * min(top_k, num_local_experts)` and grow
+linearly with the microbatch: 3 GiB at 1x, 12 at 4x, 18 at 6x, **24 at 8x**.
+Driver-level sampling (new `MEM_SAMPLE=1` knob in the launcher) gives the real
+picture:
+
+| microbatch | torch reserved | driver peak used | driver min free |
+|---|---|---|---|
+| 4x | 174 GiB | 193.3 GiB | 83.2 GiB |
+| 6x | 221 GiB | 246.4 GiB | 30.1 GiB |
+| 8x (async EP) | 245 GiB | -- (not sampled) | ~0: 245 + 24 symm + ~8.5 ctx = 277.5 = the whole card |
+| 8x (standard dispatch) | 250 GiB | 258.4 GiB | 18.1 GiB |
+
+**The 8x collapse is the symmetric buffers, proven by removing them.** Same 8x
+microbatch with standard all-to-all dispatch (which allocates none):
+
+| 8x run | TFLOP/s | allocator "mapping failed"/retries | trend |
+|---|---|---|---|
+| MinimalAsyncEP | 27.96 | **956** | decaying: 35.4 -> 33.7 -> 21.3 |
+| standard all-to-all | **141.11** | **0** | rising: 138.5 -> 140.4 -> 141.9 |
+
+So 8x is perfectly feasible; it just cannot be paid for twice. 141.11 is still
+below 4x async EP (158.74) because standard dispatch costs ~13 % on its own,
+so the trade is not worth taking -- but the failure was memory, not batch.
+
+**6x flattens because there is nothing left to amortize.** Batch only ever
+amortizes *per-step* costs, and by 4x those are nearly gone. Comparing the two
+profiles (`dsv4_flash_bdsa_bs4_32xgb300` vs `dsv4_flash_bdsa_bs6_32xgb300`):
+
+| | 4x | 6x |
+|---|---|---|
+| compute busy | 87.0 % | 86.7 % |
+| exposed comm | 11.8 % | 12.1 % |
+| idle | 1.2 % | 1.1 % |
+| NCCL (parameter collectives, per-step fixed) | 8.3 % | **5.8 %** |
+| flex bwd + fwd | 51.9 % | **53.8 %** |
+| MoE dispatch/combine (`symm/AG`, per-token) | 10.4 % | 11.1 % |
+| kernel ms per 1k tokens | 604.5 | **575.4** |
+
+The only line that improves is the per-step NCCL parameter traffic (8.3 % ->
+5.8 %, worth the ~2-3 % actually observed); everything else is per-token and
+its share is flat or rising. Attention alone is 54 % of kernel time and
+exactly linear in tokens, so it sets a per-token floor that no microbatch can
+lower. Exposed communication does not amortize either, because it is now
+dominated by the MoE dispatch/combine, which is per-token by nature.
+
+**Conclusion: 4x is the operating point** (158.74, 83 GiB of driver headroom).
+6x is +1-3 % for +47 GiB and only 30 GiB of headroom. The batch lever is spent;
+the remaining ceiling is the flex attention kernel (54 % of kernel time) and
+the ~12 % exposed MoE dispatch.
