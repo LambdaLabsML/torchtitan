@@ -1106,3 +1106,26 @@ Also: `NCCL_ALGO=AllGather:NVLS` (job 488) = **140.74**, below the 142.72 of
 `NCCL_PROTO=Simple` alone. NVLS multicast is not a win for FSDP's all-gather
 here, and it has no bf16 reduce-scatter at all. **Communication round closed
 at 142.72** (leaf2 + reshard-never + `NCCL_PROTO=Simple`).
+
+### Batched DSA: microbatch is now a WIN (8 nodes, 30 steps, `NCCL_PROTO=Simple`)
+
+| job | config | microbatch | base | TFLOP/s | tok/s/GPU | peak mem |
+|---|---|---|---|---|---|---|
+| 494 | `bdsa_bs1` | 1x | reshard-never | 141.23 | 1,593 | 241.17 GiB |
+| 492 | `bdsa_bs2` | **2x** | leaf2 (137.28) | **150.57** | 1,699 | 127.70 GiB |
+| 493 | `bdsa_bs4` | **4x** | leaf2 (137.28) | **158.74** | 1,791 | 173.96 GiB |
+
+No recompiles, no graph breaks, no CheckpointError, loss descending normally.
+
+**The sign flipped.** On the folded path a 2x microbatch cost -19 %
+(107.85 vs 133.77); batched it gains **+9.7 %** (150.57 vs 137.28) and 4x
+gains **+15.7 %** -- a ~35-point swing, and 4x is the best number this
+campaign has produced, **158.74 TFLOP/s**, 8.7x the 18.29 flash baseline and
++11 % over the previous best (142.72). Memory also behaves as predicted now
+that the transients are per-sequence: 2x costs only +22 GiB over 1x on the
+same base (128 vs 106) where the folded 2x needed 241.
+
+Note the 1x row uses the reshard-never base (241 GiB) and so is not directly
+comparable to 2x/4x; the honest comparisons are 2x/4x against the leaf2 base
+at 1x (137.28), and the two memory-heavy levers cannot be stacked naively
+(see job 490's OOM). `bdsa_bs2_rn` tests whether reshard-never + 2x fits.
