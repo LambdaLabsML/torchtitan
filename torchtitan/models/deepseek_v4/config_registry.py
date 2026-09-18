@@ -236,6 +236,9 @@ def deepseek_v4_flash_8k_gb300(seq_len: int | None = 8192) -> Trainer.Config:
     The tuned recipe behind the leaf-compile measurements in this branch.
     Levers, each measured against the one before it:
 
+    - ``optimizer.implementation = "fused_opt_states_bf16"`` -- fused AdamW
+      with bf16 moment buffers, halving optimizer state again on top of the
+      bf16 training dtype.
     - ``training.dtype = "bfloat16"`` -- full bf16 training: parameters,
       gradients and optimizer states, with no fp32 master copy. This is the
       lever that makes the model fit at all; torchtitan's ``float32`` default
@@ -274,6 +277,9 @@ def deepseek_v4_flash_8k_gb300(seq_len: int | None = 8192) -> Trainer.Config:
         expert_parallel_degree=4,
     )
     config.activation_checkpoint = FullAC.Config()
+    optimizer = default_adamw(lr=8e-4)
+    optimizer.implementation = "fused_opt_states_bf16"
+    config.optimizer = optimizer
     config.training.dtype = "bfloat16"
     config.training.mixed_precision_reduce = "bfloat16"
     config.training.num_tokens_per_microbatch_per_dp_rank = seq_len or 8192
@@ -299,4 +305,36 @@ def deepseek_v4_flash_8k_gb300_batched(
     """
     config = deepseek_v4_flash_8k_gb300(seq_len)
     config.training.num_tokens_per_microbatch_per_dp_rank = microbatch * (seq_len or 8192)
+    return config
+
+
+def deepseek_v4_flash_8k_gb300_free_bwd_tiles(
+    microbatch: int = 4, seq_len: int | None = 8192, autotune: bool = True
+) -> Trainer.Config:
+    """The GB300 recipe with the BACKWARD flex tiles unpinned.
+
+    ``BLOCK_M1/N1/M2/N2`` were pinned because at head_dim=512 the backward
+    otherwise died with "CUDA error: unspecified launch failure", and the pin
+    also caps those tiles at ``block_size`` (32), which is why the backward
+    kernel has been the single largest cost in every profile (40%+ of kernel
+    time). If a newer Inductor can pick valid backward tiles on its own, they
+    may be larger than 32 and the backward may get cheaper. Autotune defaults
+    back ON here, since with nothing pinned Inductor has to search for a
+    configuration that fits in 232,448 B of shared memory.
+
+    The forward tiles stay pinned: those were needed for the forward to
+    compile at all.
+    """
+    from torchtitan.models.common.attention import FlexInnerAttention
+
+    config = deepseek_v4_flash_8k_gb300_batched(microbatch, seq_len)
+    for layer in config.model_spec.model.layers:
+        inner = getattr(getattr(layer, "attention", None), "inner_attention", None)
+        if isinstance(inner, FlexInnerAttention.Config):
+            inner.kernel_options = {
+                k: v
+                for k, v in _GB300_FLEX_KERNEL_OPTIONS.items()
+                if not k.startswith(("BLOCK_M1", "BLOCK_N1", "BLOCK_M2", "BLOCK_N2"))
+            }
+            inner.max_autotune = autotune
     return config
