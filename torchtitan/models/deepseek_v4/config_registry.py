@@ -236,6 +236,12 @@ def deepseek_v4_flash_8k_gb300(seq_len: int | None = 8192) -> Trainer.Config:
     The tuned recipe behind the leaf-compile measurements in this branch.
     Levers, each measured against the one before it:
 
+    - ``training.dtype = "bfloat16"`` -- full bf16 training: parameters,
+      gradients and optimizer states, with no fp32 master copy. This is the
+      lever that makes the model fit at all; torchtitan's ``float32`` default
+      costs ~80 GiB per rank here (measured: 178 GiB peak with it, 260 GiB
+      without, which on a 277 GiB card means allocator pressure and ~4% lost
+      throughput).
     - ``expert_parallel_degree=4`` -- one node's NVLink group per expert
       group; the stock 64 scored 18.29 TFLOP/s against 21.2 here.
     - ``block_size=32`` on the DSA block mask (+15.8%), plus the GB300 tile
@@ -268,6 +274,7 @@ def deepseek_v4_flash_8k_gb300(seq_len: int | None = 8192) -> Trainer.Config:
         expert_parallel_degree=4,
     )
     config.activation_checkpoint = FullAC.Config()
+    config.training.dtype = "bfloat16"
     config.training.mixed_precision_reduce = "bfloat16"
     config.training.num_tokens_per_microbatch_per_dp_rank = seq_len or 8192
     config.training.max_context_length = seq_len or 8192
