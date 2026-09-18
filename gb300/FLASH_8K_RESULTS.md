@@ -1224,7 +1224,13 @@ exactly linear in tokens, so it sets a per-token floor that no microbatch can
 lower. Exposed communication does not amortize either, because it is now
 dominated by the MoE dispatch/combine, which is per-token by nature.
 
-**Conclusion: 4x is the operating point** (158.74, 83 GiB of driver headroom).
+The memory-sampled 4x re-run (job 501) also settles the 4x-vs-6x question by
+replication: **159.97** TFLOP/s, against 160.04 at 6x. The two are
+indistinguishable, so 6x buys nothing at all for its extra 47 GiB -- the
+earlier +0.8 % was noise.
+
+**Conclusion: 4x is the operating point** (158.74-159.97, 83 GiB of driver
+headroom).
 6x is +1-3 % for +47 GiB and only 30 GiB of headroom. The batch lever is spent;
 the remaining ceiling is the flex attention kernel (54 % of kernel time) and
 the ~12 % exposed MoE dispatch.
