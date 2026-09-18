@@ -47,6 +47,7 @@ from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
+from torchtitan.tools.leaf_compile import leaf_compile
 from torchtitan.tools.utils import round_up
 
 
@@ -122,6 +123,7 @@ def local_head_split(
     return out
 
 
+@leaf_compile(group="sink")
 def apply_attention_sink_rescale(
     out: torch.Tensor, lse: torch.Tensor, sinks: torch.Tensor
 ) -> torch.Tensor:

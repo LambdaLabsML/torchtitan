@@ -194,3 +194,75 @@ def deepseek_v4_pro(seq_len: int | None = None) -> Trainer.Config:
             interval=100,
         ),
     )
+
+
+# GB300 (sm_103) requires these FlexAttention tiles at head_dim=512. Without
+# them the first forward dies with "No valid triton configs ... Required:
+# 294912, Hardware limit: 232448", and without the backward tiles specifically
+# the backward hits "CUDA error: unspecified launch failure". Measured on one
+# GB300: every larger forward tile fails, and 32x32 only works with num_stages
+# and num_warps pinned too. This is a correctness requirement on this hardware,
+# not a tuning choice.
+_GB300_FLEX_KERNEL_OPTIONS = {
+    "BLOCK_M": 32,
+    "BLOCK_N": 32,
+    "num_stages": 1,
+    "num_warps": 4,
+    "BLOCK_M1": 16,
+    "BLOCK_N1": 32,
+    "BLOCK_M2": 32,
+    "BLOCK_N2": 16,
+}
+
+
+def _pin_gb300_flex_tiles(config: Trainer.Config, block_size: int = 32) -> None:
+    """Pin the flex tiles and sparse block size on every flex layer."""
+    from torchtitan.models.common.attention import FlexInnerAttention
+
+    for layer in config.model_spec.model.layers:
+        inner = getattr(getattr(layer, "attention", None), "inner_attention", None)
+        if isinstance(inner, FlexInnerAttention.Config):
+            inner.kernel_options = dict(_GB300_FLEX_KERNEL_OPTIONS)
+            inner.block_size = block_size
+
+
+def deepseek_v4_flash_8k_gb300(seq_len: int | None = 8192) -> Trainer.Config:
+    """DeepSeek-V4 flash at seq_len 8192 on 64x GB300 (16 nodes x 4 GPUs).
+
+    The tuned recipe behind the leaf-compile measurements in this branch.
+    Levers, each measured against the one before it:
+
+    - ``expert_parallel_degree=4`` -- one node's NVLink group per expert
+      group; the stock 64 scored 18.29 TFLOP/s against 21.2 here.
+    - ``block_size=32`` on the DSA block mask (+15.8%), plus the GB300 tile
+      pin above, which is mandatory rather than optional.
+    - ``FullAC`` -- at 8192 the model OOMs without it.
+    - ``mixed_precision_reduce = bfloat16`` (+3.7%).
+    - the leaf compiles in this branch, worth +34% on top.
+
+    MoE dispatch: the measurements behind this branch used
+    ``moe_comm_backend="minimal_async_ep"`` (+4.9% over standard all-to-all,
+    and +15% once the leaf compiles made compute cheaper), but that dispatcher
+    was deprecated upstream in #4627 and is no longer in the tree. Of what
+    remains, ``deepep`` measured 7.4% above ``standard`` on this hardware and
+    needs a source build (DeepEP v2, arch 10.3a); ``standard`` is the default
+    here because it needs nothing.
+
+    Run with ``TORCHTITAN_LEAF_COMPILE=all`` (the default) and, for a numerics
+    reference, ``TORCHTITAN_LEAF_COMPILE=0``.
+    """
+    from torchtitan.distributed.activation_checkpoint import FullAC
+
+    config = deepseek_v4_flash(seq_len)
+    config.model_spec = model_registry("deepseek_v4_flash", seq_len=seq_len)
+    _pin_gb300_flex_tiles(config)
+    config.parallelism = ParallelismConfig(
+        data_parallel_shard_degree=-1,
+        expert_parallel_degree=4,
+    )
+    config.activation_checkpoint = FullAC.Config()
+    config.training.mixed_precision_reduce = "bfloat16"
+    config.training.num_tokens_per_microbatch_per_dp_rank = seq_len or 8192
+    config.training.max_context_length = seq_len or 8192
+    config.training.steps = 30
+    return config

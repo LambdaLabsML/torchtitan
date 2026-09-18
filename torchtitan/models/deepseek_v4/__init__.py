@@ -1011,7 +1011,10 @@ def _deepseek_v4_pro(
 
 deepseek_v4_configs = {
     "debugmodel": (_debugmodel, 16384),
-    "deepseek_v4_flash": (_deepseek_v4_flash, 4096),
+    # 4096 was a recipe cap, not a model limit: _deepseek_v4_flash builds its
+    # compressed RoPE with YaRN against original_seq_len=65536. Raised to the
+    # model's own design point; memory is the real constraint.
+    "deepseek_v4_flash": (_deepseek_v4_flash, 65536),
     "deepseek_v4_pro": (_deepseek_v4_pro, 4096),
 }
 
