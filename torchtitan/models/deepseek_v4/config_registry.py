@@ -208,9 +208,16 @@ _GB300_FLEX_KERNEL_OPTIONS = {
     "BLOCK_N": 32,
     "num_stages": 1,
     "num_warps": 4,
+    # All 16, not the 16/32/32/16 pinned when this workaround was first
+    # written. Letting Inductor autotune the backward freely (job 545) picked
+    # 16 across the board and ran 11.6% faster end to end -- 181.53 vs 162.62
+    # TFLOP/s -- at identical memory. Smaller tiles mean less shared memory
+    # per block, so more blocks stay resident; at head_dim=512 occupancy
+    # matters more than tile size. The original 16/32/32/16 was chosen to
+    # stop a launch failure, never benchmarked against alternatives.
     "BLOCK_M1": 16,
-    "BLOCK_N1": 32,
-    "BLOCK_M2": 32,
+    "BLOCK_N1": 16,
+    "BLOCK_M2": 16,
     "BLOCK_N2": 16,
 }
 
