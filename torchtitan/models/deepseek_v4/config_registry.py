@@ -447,3 +447,37 @@ def deepseek_v4_flash_8k_gb300_fastdata(
     )
     config.dataloader.num_prefetch_batches = 8
     return config
+
+
+def deepseek_v4_flash_8k_gb300_sac(
+    microbatch: int = 1, ep: int = 2, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The GB300 recipe with per-op selective AC instead of FullAC.
+
+    FullAC recomputes the whole block, so every kernel in the forward runs
+    twice. SelectiveAC keeps the expensive outputs (matmuls, attention,
+    comms) and recomputes only the cheap elementwise work, trading memory for
+    that second forward. The trade has to be paid for out of the microbatch
+    or the parallelism, which is what this sweep varies.
+
+    Prior evidence, all superseded but worth stating: on the pre-batched
+    recipe at 1x, stock SelectiveAC measured 96.96 TFLOP/s against FullAC's
+    99.50 and cost +118 GiB, i.e. it lost on both counts. Two things have
+    changed since -- the backward is ~12% cheaper (retuned flex tiles), which
+    raises the relative cost of the recomputed forward, and full bf16
+    training freed ~67 GiB of headroom to spend.
+
+    Requires the out-of-place relu in ``Indexer.select``; with the in-place
+    version every SAC run died on "Tensor cached during selective activation
+    checkpoint has been mutated".
+    """
+    from torchtitan.distributed.activation_checkpoint import SelectiveAC
+
+    config = deepseek_v4_flash_8k_gb300_batched(microbatch, seq_len)
+    config.parallelism.expert_parallel_degree = ep
+    # The default FQN list expects an nn.Linear named moe.router.gate; this
+    # model routes differently, so the list is emptied rather than matched.
+    config.activation_checkpoint = SelectiveAC.Config(
+        force_recompute_mm_shapes_by_fqns=[]
+    )
+    return config
