@@ -21,7 +21,11 @@ import unittest
 
 import torch
 
-from torchtitan.models.deepseek_v4.attention import CompressedSparseAttention
+from torchtitan.models.deepseek_v4.attention import (
+    CompressedSparseAttention,
+    HeavilyCompressedAttention,
+    SlidingWindowAttention,
+)
 from torchtitan.models.deepseek_v4.cudnn_dsa import cudnn_dsa_available
 
 _HAS_GPU = torch.cuda.is_available()
@@ -182,6 +186,76 @@ class TestCudnnDsaBackward(unittest.TestCase):
 
     def test_csa_packed_batch_4x(self):
         self._check(seqlen=512, n_heads=64, n_idx_heads=8, seed=4, microbatch=4)
+
+    def _check_variant(self, cls, ratio, seqlen, seed, microbatch=1):
+        """HCA and SWA share ``_forward_impl``, so the fused path changes them
+        too -- 22 of the model's 43 attention layers. Neither uses the indexer:
+        the selection branches on compress_ratio (128 -> fixed compressed
+        blocks, 1 -> window only), so they exercise index shapes the
+        CompressedSparseAttention cases never produce.
+        """
+        def cfg(fused_bwd, fused_fwd):
+            return cls.Config(
+                block_size=32, kernel_options=dict(_TILES), window_size=WINDOW,
+                compress_ratio=ratio, softmax_scale=HEAD_DIM**-0.5,
+                index_topk=TOPK, seq_len=seqlen, max_autotune=False,
+                fused_dsa_backward=fused_bwd, fused_dsa_forward=fused_fwd,
+            )
+
+        tokens = microbatch * seqlen
+        n_cmp = microbatch * max(seqlen // ratio, 1) if ratio > 1 else 0
+        g = torch.Generator(device="cuda").manual_seed(seed)
+
+        def r(*shape, std=1.0, grad=False):
+            t = (torch.randn(*shape, generator=g, device="cuda") * std).to(torch.bfloat16)
+            return t.requires_grad_(grad)
+
+        base = dict(
+            q=r(tokens, 64, HEAD_DIM, grad=True),
+            swa_k=r(tokens, HEAD_DIM, grad=True),
+            attn_sink=r(64, std=0.5, grad=True),
+            cot=r(tokens, 64, HEAD_DIM),
+        )
+        if ratio > 1:
+            base["cmp_k"] = r(n_cmp, HEAD_DIM, grad=True)
+
+        names = ("q", "swa_k", "attn_sink") + (("cmp_k",) if ratio > 1 else ())
+
+        def run(module, inp):
+            args = ([inp["q"], inp["swa_k"]]
+                    + ([inp["cmp_k"]] if ratio > 1 else [])
+                    + [inp["attn_sink"]])
+            out = module(*args)
+            (out.float() * inp["cot"].float()).sum().backward()
+            return out.detach(), {k: inp[k].grad.detach() for k in names}
+
+        flex = cfg(False, False).build().cuda()
+        fused = cfg(True, True).build().cuda()
+        out_flex, g_flex = run(flex, _clone(base))
+        out_fused, g_fused = run(fused, _clone(base))
+
+        print(f"\n  {cls.__name__} ratio={ratio} T={seqlen} microbatch={microbatch}")
+        print(f"    {'tensor':<10} {'cudnn-vs-flex':>15}")
+        for k in ("out",) + names:
+            a, b = (out_fused, out_flex) if k == "out" else (g_fused[k], g_flex[k])
+            d = _rel(a, b)
+            print(f"    {k:<10} {d:>15.3e}")
+            # Both are bf16 kernels over the same selection; the CSA cases put
+            # flex and cuDNN within 4.6e-3 of each other against fp64, so hold
+            # these to the same order rather than to bitwise equality.
+            self.assertLessEqual(d, 2e-2, f"{cls.__name__} {k} diverges")
+
+    def test_heavily_compressed(self):
+        self._check_variant(HeavilyCompressedAttention, 128, 512, seed=7)
+
+    def test_heavily_compressed_packed_batch(self):
+        self._check_variant(HeavilyCompressedAttention, 128, 512, seed=8, microbatch=4)
+
+    def test_sliding_window(self):
+        self._check_variant(SlidingWindowAttention, 1, 512, seed=9)
+
+    def test_sliding_window_packed_batch(self):
+        self._check_variant(SlidingWindowAttention, 1, 512, seed=10, microbatch=4)
 
     def test_fused_forward(self):
         self._check(seqlen=512, n_heads=64, n_idx_heads=8, seed=5, fused_fwd=True)
