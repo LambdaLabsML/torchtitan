@@ -243,8 +243,19 @@ class Indexer(Module):
         )
         if batched:
             compress_causal_mask = compress_causal_mask.unsqueeze(0)
-        index_score = index_score + torch.where(
-            compress_causal_mask, torch.finfo(idx_q.dtype).min, 0
+        index_score = index_score.masked_fill(
+            compress_causal_mask, torch.finfo(index_score.dtype).min
         )
-        _, topk_indices = index_score.topk(min(topk, seqlen // ratio), dim=-1)
-        return topk_indices
+        # Deterministic selection. bf16 index scores are quantised (~0.1 apart
+        # near their top), so the k-th boundary is frequently a tie, and
+        # torch.topk's order among tied values is arbitrary -- and on the code
+        # path taken for wide fp32 rows, not even stable call to call. That
+        # made the FORWARD non-deterministic: the same inputs selected
+        # different keys on a re-run, which breaks the activation-checkpoint
+        # recompute (the MoE routed-token counts then differ) and makes any
+        # A/B comparison of two backward kernels meaningless. A stable
+        # descending sort breaks ties toward the lower key index; where there
+        # is no boundary tie the selection is identical to topk's.
+        k = min(topk, seqlen // ratio)
+        order = torch.sort(index_score, dim=-1, descending=True, stable=True).indices
+        return order[..., :k]
