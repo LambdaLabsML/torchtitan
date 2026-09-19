@@ -111,10 +111,16 @@ def compact_topk_indices(idx_TK: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
 
 
 class _CudnnDsaBackward(torch.autograd.Function):
-    """Flex forward, cuDNN backward.
+    """cuDNN backward, with the forward on either flex or cuDNN.
 
     The forward runs under ``no_grad`` precisely because its graph would be
     dead weight: this Function supplies the gradients itself.
+
+    With ``flex_fwd=None`` the forward is cuDNN's ``sparse_attention_forward``,
+    which takes ``attn_sink`` directly and returns the sink-included output
+    alongside the KV-only LSE -- exactly the pair the backward wants, so no
+    rescale is applied on top. That also retires the flex block mask, whose
+    construction is pure overhead once no flex kernel consumes it.
     """
 
     @staticmethod
@@ -122,6 +128,24 @@ class _CudnnDsaBackward(torch.autograd.Function):
         ctx, q_THD, kv_ND, attn_sink_H, topk_idxs_TK, topk_length_T, softmax_scale, flex_fwd
     ):
         from torchtitan.models.common.attention import apply_attention_sink_rescale
+
+        if flex_fwd is None:
+            with torch.no_grad():
+                res = _dsa_namespace().sparse_attention_forward_wrapper(
+                    q_THD.contiguous(),
+                    kv_ND.contiguous(),
+                    topk_idxs_TK,
+                    attn_sink=attn_sink_H.float().contiguous(),
+                    topk_length=topk_length_T,
+                    softmax_scale=softmax_scale,
+                )
+                # out already carries the sink; lse excludes it.
+                out, lse = res["out"].to(q_THD.dtype), res["lse"]
+            ctx.save_for_backward(
+                q_THD, kv_ND, out, lse, attn_sink_H, topk_idxs_TK, topk_length_T
+            )
+            ctx.softmax_scale = softmax_scale
+            return out
 
         with torch.no_grad():
             out_no_sink, lse_no_sink = flex_fwd(q_THD, kv_ND)
@@ -174,7 +198,7 @@ def fused_dsa_attention(
     selected_indices: torch.Tensor,
     *,
     softmax_scale: float,
-    flex_fwd,
+    flex_fwd=None,
 ) -> torch.Tensor:
     """Sink-scaled DSA output whose backward is cuDNN's fused kernel.
 
@@ -184,7 +208,8 @@ def fused_dsa_attention(
         attn_sink_H: per-head sink logit ``[H]``.
         selected_indices: ``[T, K]`` int64/int32 global KV positions, -1 padded.
         softmax_scale: the QK scale (the sink logit is NOT scaled).
-        flex_fwd: callable ``(q, kv) -> (out_no_sink, lse_no_sink)``.
+        flex_fwd: callable ``(q, kv) -> (out_no_sink, lse_no_sink)``, or
+            None to run cuDNN's sparse-attention forward instead.
     """
     topk_align, head_align = _alignments()
     n_heads = q_THD.size(1)
