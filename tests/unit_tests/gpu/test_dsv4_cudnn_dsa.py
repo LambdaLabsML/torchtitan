@@ -36,7 +36,7 @@ HEAD_DIM, WINDOW, RATIO, TOPK, IDX_D = 512, 128, 4, 64, 128
 GRADS = ("q", "swa_k", "cmp_k", "attn_sink")
 
 
-def _cfg(fused: bool, seq_len: int):
+def _cfg(fused: bool, seq_len: int, fused_fwd: bool = False):
     return CompressedSparseAttention.Config(
         block_size=32,
         kernel_options=dict(_TILES),
@@ -47,6 +47,7 @@ def _cfg(fused: bool, seq_len: int):
         seq_len=seq_len,
         max_autotune=False,
         fused_dsa_backward=fused,
+        fused_dsa_forward=fused_fwd,
     )
 
 
@@ -132,9 +133,9 @@ def _rel(a, b):
 
 @unittest.skipUnless(_HAS_CUDNN_DSA, "requires a GPU with cuDNN's DSA kernel")
 class TestCudnnDsaBackward(unittest.TestCase):
-    def _check(self, seqlen, n_heads, n_idx_heads, seed, microbatch=1):
+    def _check(self, seqlen, n_heads, n_idx_heads, seed, microbatch=1, fused_fwd=False):
         flex = _cfg(False, seqlen).build().cuda()
-        fused = _cfg(True, seqlen).build().cuda()
+        fused = _cfg(True, seqlen, fused_fwd).build().cuda()
 
         base = _inputs(seqlen, n_heads, n_idx_heads, seed, microbatch)
         i_flex, i_fused, i_ref = _clone(base), _clone(base), _clone(base)
@@ -145,8 +146,16 @@ class TestCudnnDsaBackward(unittest.TestCase):
         print(f"\n  T={seqlen} H={n_heads} D={HEAD_DIM} topk={TOPK} "
               f"seed={seed} microbatch={microbatch}")
         print(f"    {'tensor':<10} {'flex-vs-fp64':>14} {'cudnn-vs-fp64':>15} {'cudnn-vs-flex':>15}")
-        # the forward is shared, so outputs must be identical
-        self.assertTrue(torch.equal(out_flex, out_fused), "forward differs")
+        if fused_fwd:
+            # A different forward kernel: hold it to the fp64 reference the
+            # flex forward is held to, rather than to bitwise equality.
+            rf_o, rc_o = _rel(out_flex, out_ref), _rel(out_fused, out_ref)
+            print(f"    {'out':<10} {rf_o:>14.3e} {rc_o:>15.3e} "
+                  f"{_rel(out_fused, out_flex):>15.3e}")
+            self.assertLessEqual(rc_o, max(1.5 * rf_o, 1e-3), "forward too far from fp64")
+        else:
+            # the forward is shared, so outputs must be identical
+            self.assertTrue(torch.equal(out_flex, out_fused), "forward differs")
         for k in GRADS:
             rf, rc = _rel(g_flex[k], g_ref[k]), _rel(g_fused[k], g_ref[k])
             print(f"    {k:<10} {rf:>14.3e} {rc:>15.3e} {_rel(g_fused[k], g_flex[k]):>15.3e}")
@@ -173,6 +182,13 @@ class TestCudnnDsaBackward(unittest.TestCase):
 
     def test_csa_packed_batch_4x(self):
         self._check(seqlen=512, n_heads=64, n_idx_heads=8, seed=4, microbatch=4)
+
+    def test_fused_forward(self):
+        self._check(seqlen=512, n_heads=64, n_idx_heads=8, seed=5, fused_fwd=True)
+
+    def test_fused_forward_packed_batch(self):
+        self._check(seqlen=512, n_heads=64, n_idx_heads=8, seed=6, microbatch=4,
+                    fused_fwd=True)
 
 
 if __name__ == "__main__":
