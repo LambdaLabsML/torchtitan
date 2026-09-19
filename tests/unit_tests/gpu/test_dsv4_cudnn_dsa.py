@@ -1,0 +1,147 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""cuDNN's fused DSA backward against the FlexAttention backward.
+
+The contract is not "the two agree to some tolerance" -- both round P and dS
+to bf16 inside their kernels, so they legitimately differ by their own error.
+It is the same contract used for the gather-CSA work earlier: measure BOTH
+against an fp64 reference built from the same bf16 inputs and the same
+selection, and require the fused kernel to be no worse than the flex backward
+it replaces.
+
+The forward is shared (flex computes it either way), so ``out`` must match
+exactly; only the gradients are at issue.
+"""
+
+import unittest
+
+import torch
+
+from torchtitan.models.deepseek_v4.attention import CompressedSparseAttention
+from torchtitan.models.deepseek_v4.cudnn_dsa import cudnn_dsa_available
+
+_HAS_GPU = torch.cuda.is_available()
+_HAS_CUDNN_DSA = _HAS_GPU and cudnn_dsa_available()
+
+# Required on GB300 at head_dim=512; also what production pins.
+_TILES = {
+    "BLOCK_M": 32, "BLOCK_N": 32, "num_stages": 1, "num_warps": 4,
+    "BLOCK_M1": 16, "BLOCK_N1": 16, "BLOCK_M2": 16, "BLOCK_N2": 16,
+}
+HEAD_DIM, WINDOW, RATIO, TOPK, IDX_D = 512, 128, 4, 64, 128
+GRADS = ("q", "swa_k", "cmp_k", "attn_sink")
+
+
+def _cfg(fused: bool, seq_len: int):
+    return CompressedSparseAttention.Config(
+        block_size=32,
+        kernel_options=dict(_TILES),
+        window_size=WINDOW,
+        compress_ratio=RATIO,
+        softmax_scale=HEAD_DIM**-0.5,
+        index_topk=TOPK,
+        seq_len=seq_len,
+        max_autotune=False,
+        fused_dsa_backward=fused,
+    )
+
+
+def _inputs(seqlen, n_heads, n_idx_heads, seed):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    n_cmp = seqlen // RATIO
+
+    def r(*shape, std=1.0, grad=False):
+        t = (torch.randn(*shape, generator=g, device="cuda") * std).to(torch.bfloat16)
+        return t.requires_grad_(grad)
+
+    return dict(
+        q=r(seqlen, n_heads, HEAD_DIM, grad=True),
+        swa_k=r(seqlen, HEAD_DIM, grad=True),
+        cmp_k=r(n_cmp, HEAD_DIM, grad=True),
+        idx_q=r(seqlen, n_idx_heads, IDX_D),
+        idx_k=r(n_cmp, IDX_D),
+        idx_w=r(seqlen, n_idx_heads, std=0.1),
+        attn_sink=r(n_heads, std=0.5, grad=True),
+        cot=r(seqlen, n_heads, HEAD_DIM),
+    )
+
+
+def _clone(inp):
+    out = {}
+    for k, v in inp.items():
+        c = v.detach().clone()
+        out[k] = c.requires_grad_(True) if v.requires_grad else c
+    return out
+
+
+def _run(module, inp):
+    out = module(inp["q"], inp["swa_k"], inp["cmp_k"], inp["idx_q"], inp["idx_k"],
+                 inp["idx_w"], inp["attn_sink"])
+    (out.float() * inp["cot"].float()).sum().backward()
+    return out.detach(), {k: inp[k].grad.detach() for k in GRADS}
+
+
+def _reference(module, inp, seqlen):
+    """fp64 attention over exactly the positions the module selects."""
+    q, swa_k, cmp_k, sink = inp["q"], inp["swa_k"], inp["cmp_k"], inp["attn_sink"]
+    n_cmp = cmp_k.size(0)
+    with torch.no_grad():
+        idx = module.selected_kv_indices(
+            bsz=1, seqlen=seqlen, n_cmp=n_cmp, idx_q=inp["idx_q"],
+            idx_k=inp["idx_k"], idx_w=inp["idx_w"], device=q.device,
+        )[0]
+    kv = torch.cat([swa_k, cmp_k], dim=0).double()     # differentiable
+    qd = q.double()
+    sel = idx.clamp_min(0)
+    gathered = kv[sel]                                  # [T, K, D]
+    s = torch.einsum("thd,tkd->thk", qd, gathered) * module.softmax_scale
+    s = s.masked_fill(~(idx >= 0).unsqueeze(1), float("-inf"))
+    s = torch.cat([s, sink.double().view(1, -1, 1).expand(s.size(0), s.size(1), 1)], -1)
+    p = torch.softmax(s, dim=-1)
+    out = torch.einsum("thk,tkd->thd", p[..., :-1], gathered)
+    (out * inp["cot"].double()).sum().backward()
+    return out.detach(), {k: inp[k].grad.detach() for k in GRADS}
+
+
+def _rel(a, b):
+    return ((a.double() - b.double()).norm() / b.double().norm().clamp_min(1e-12)).item()
+
+
+@unittest.skipUnless(_HAS_CUDNN_DSA, "requires a GPU with cuDNN's DSA kernel")
+class TestCudnnDsaBackward(unittest.TestCase):
+    def _check(self, seqlen, n_heads, n_idx_heads, seed):
+        flex = _cfg(False, seqlen).build().cuda()
+        fused = _cfg(True, seqlen).build().cuda()
+
+        base = _inputs(seqlen, n_heads, n_idx_heads, seed)
+        i_flex, i_fused, i_ref = _clone(base), _clone(base), _clone(base)
+        out_flex, g_flex = _run(flex, i_flex)
+        out_fused, g_fused = _run(fused, i_fused)
+        out_ref, g_ref = _reference(flex, i_ref, seqlen)
+
+        print(f"\n  T={seqlen} H={n_heads} D={HEAD_DIM} topk={TOPK} seed={seed}")
+        print(f"    {'tensor':<10} {'flex-vs-fp64':>14} {'cudnn-vs-fp64':>15} {'cudnn-vs-flex':>15}")
+        # the forward is shared, so outputs must be identical
+        self.assertTrue(torch.equal(out_flex, out_fused), "forward differs")
+        for k in GRADS:
+            rf, rc = _rel(g_flex[k], g_ref[k]), _rel(g_fused[k], g_ref[k])
+            print(f"    {k:<10} {rf:>14.3e} {rc:>15.3e} {_rel(g_fused[k], g_flex[k]):>15.3e}")
+            # no worse than the backward it replaces (1.5x slack for tie-breaking)
+            self.assertLessEqual(
+                rc, max(1.5 * rf, 1e-3),
+                f"{k}: cudnn rel-err {rc:.3e} worse than flex {rf:.3e}",
+            )
+
+    def test_csa_small(self):
+        self._check(seqlen=512, n_heads=64, n_idx_heads=8, seed=1)
+
+    def test_csa_longer(self):
+        self._check(seqlen=1024, n_heads=64, n_idx_heads=8, seed=2)
+
+
+if __name__ == "__main__":
+    unittest.main()
