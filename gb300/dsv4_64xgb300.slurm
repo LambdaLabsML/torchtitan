@@ -32,7 +32,9 @@ source "$VENV/bin/activate"
 # main requires the `renderers` package (upstream #4691), which is not in the
 # shared venv; installed into /mnt/dgxc/pydeps with its shadowing copies of
 # venv packages removed, so it adds only what is missing.
-export PYTHONPATH="$WORKTREE:/mnt/dgxc/pydeps"
+# EXTRA_PYTHONPATH appends side dependency dirs (e.g. the cuDNN DSA frontend
+# in /mnt/dgxc/pydeps-cudnn) without touching the shared venv.
+export PYTHONPATH="$WORKTREE:/mnt/dgxc/pydeps${EXTRA_PYTHONPATH:+:$EXTRA_PYTHONPATH}"
 
 BRANCH=$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD)
 COMMIT=$(git -C "$WORKTREE" rev-parse --short HEAD)

@@ -431,3 +431,28 @@ def deepseek_v4_flash_8k_gb300_sac(
         force_recompute_mm_shapes_by_fqns=[]
     )
     return config
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_dsa(
+    microbatch: int = 4, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The batched GB300 recipe with the DSA backward on cuDNN's kernel.
+
+    The flex backward is the single largest kernel in the step (~72% of
+    backward time). cuDNN ships a fused sparse-attention backward for exactly
+    this pattern; routing to it leaves the forward on flex, so the forward is
+    bitwise unchanged and only the backward differs.
+
+    Microbenchmarked at the production shape (T=8192, H=64, D=512, topk=512):
+    3.62x faster fwd+bwd, 79.4 -> 22.0 ms. Gradients land at 2.4e-3 relative
+    to an fp64 reference for both dq and d_sink, against 3.4e-3 for the flex
+    backward it replaces.
+    """
+    from torchtitan.models.deepseek_v4.attention import DSV4FlexInnerAttention
+
+    config = deepseek_v4_flash_8k_gb300_batched(microbatch, seq_len)
+    for layer in config.model_spec.model.layers:
+        inner = getattr(getattr(layer, "attention", None), "inner_attention", None)
+        if isinstance(inner, DSV4FlexInnerAttention.Config):
+            inner.fused_dsa_backward = True
+    return config
