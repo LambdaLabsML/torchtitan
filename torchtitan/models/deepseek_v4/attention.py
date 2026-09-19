@@ -110,6 +110,7 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
         softmax_scale: float
         index_topk: int
         fused_dsa_backward: bool = False
+        fused_dsa_forward: bool = False
         """Compute the DSA gradients with cuDNN's fused kernel instead of the
         FlexAttention backward. The forward is unchanged. The flex backward is
         ~40 % of kernel time on GB300 at head_dim=512 -- a generic Triton
@@ -137,6 +138,7 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
         self.index_topk = config.index_topk
         self.seq_len = config.seq_len
         self.fused_dsa_backward = config.fused_dsa_backward
+        self.fused_dsa_forward = config.fused_dsa_forward
         self.block_size = config.block_size
 
     def get_window_topk_idxs(
@@ -361,8 +363,15 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
                 device=q.device,
             )
 
-            block_mask = self._build_block_mask(
-                bsz, seqlen, kv_len, selected_indices, q.device
+            # The block mask exists only to drive a flex kernel. With both
+            # halves of the attention on cuDNN nothing reads it, and building
+            # it is a dense [B, n_q_blocks, n_kv_blocks] scatter per layer.
+            block_mask = (
+                None
+                if self.fused_dsa_forward
+                else self._build_block_mask(
+                    bsz, seqlen, kv_len, selected_indices, q.device
+                )
             )
 
             def apply_sink(out_THV, lse_TH):
@@ -383,7 +392,7 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
             )
 
     def _fused_dsa(self, q_in, kv, attn_sink, selected_indices, block_mask, bsz, kv_len):
-        """Flex forward, cuDNN backward, over the flat (unbatched) layout.
+        """cuDNN backward (and optionally forward) over the flat layout.
 
         The kernel takes one KV stream and global indices, so a batched
         ``[B, L, ...]`` input is flattened and each sequence's indices are
@@ -425,13 +434,15 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
             f"kv_flat has {kv_flat.shape[0]} rows, expected {bsz * kv_len}"
         )
         idx_flat = flatten_batched_indices(selected_indices, kv_len)
+        # Both kernels return the flat [B*L, H, V] stream, which is also what
+        # FlexInnerAttention.forward hands back, so no reshape is needed here.
         return fused_dsa_attention(
             q_flat,
             kv_flat,
             attn_sink,
             idx_flat,
             softmax_scale=self.softmax_scale,
-            flex_fwd=flex_fwd,
+            flex_fwd=None if self.fused_dsa_forward else flex_fwd,
         )
 
     def _batch_shape(self, num_tokens: int) -> tuple[int, int]:

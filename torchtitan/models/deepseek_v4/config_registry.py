@@ -546,3 +546,38 @@ def deepseek_v4_flash_8k_gb300_cudnn_dsa_stages2(
     config = deepseek_v4_flash_8k_gb300_cudnn_dsa_ep2(microbatch, seq_len)
     _set_flex_num_stages(config, 2)
     return config
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full(
+    microbatch: int = 4, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """Both halves of DSA on cuDNN: sparse-attention forward and backward.
+
+    The backward alone was worth +48.5% (170.5 -> 253.2 TFLOP/s). This also
+    retires the flex forward and, with it, the block mask -- a dense
+    [B, n_q_blocks, n_kv_blocks] scatter built per layer per step purely to
+    drive a flex kernel that no longer runs.
+
+    Note that ``num_stages`` becomes irrelevant here: every DSA layer is off
+    flex, so there is no Triton template left for it to pipeline.
+
+    cuDNN's forward is closer to an fp64 reference than the flex forward it
+    replaces (out 2.1e-3 vs 2.7e-3), gradients likewise.
+    """
+    from torchtitan.models.deepseek_v4.attention import DSV4FlexInnerAttention
+
+    config = deepseek_v4_flash_8k_gb300_cudnn_dsa(microbatch, seq_len)
+    for layer in config.model_spec.model.layers:
+        inner = getattr(getattr(layer, "attention", None), "inner_attention", None)
+        if isinstance(inner, DSV4FlexInnerAttention.Config):
+            inner.fused_dsa_forward = True
+    return config
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """``_cudnn_full`` at the 6x/EP=2 operating point, to compare with stages2."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full(microbatch, seq_len)
+    config.parallelism.expert_parallel_degree = 2
+    return config
