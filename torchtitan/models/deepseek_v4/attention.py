@@ -20,6 +20,8 @@ from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.tools.leaf_compile import leaf_compile
 
+from .cudnn_dsa import flatten_batched_indices, fused_dsa_attention
+
 from .compressor import Compressor, Indexer
 
 
@@ -107,6 +109,14 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
         compress_ratio: int
         softmax_scale: float
         index_topk: int
+        fused_dsa_backward: bool = False
+        """Compute the DSA gradients with cuDNN's fused kernel instead of the
+        FlexAttention backward. The forward is unchanged. The flex backward is
+        ~40 % of kernel time on GB300 at head_dim=512 -- a generic Triton
+        template whose tiles are capped by the sparse block size -- while
+        cuDNN ships a CuTe-DSL kernel written for this exact shape. Needs
+        ``nvidia-cudnn-frontend[cutedsl]`` and SM90+."""
+
         seq_len: int = 0
         """Length of one packed sequence. 0 (the original behaviour) treats the
         whole per-rank token stream as a single sequence, which makes the DSA
@@ -126,6 +136,7 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
         self.softmax_scale = config.softmax_scale
         self.index_topk = config.index_topk
         self.seq_len = config.seq_len
+        self.fused_dsa_backward = config.fused_dsa_backward
         self.block_size = config.block_size
 
     def get_window_topk_idxs(
@@ -245,6 +256,53 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
             seq_lengths=(seqlen, kv_len),
         )
 
+    @torch.no_grad()
+    def selected_kv_indices(
+        self, *, bsz, seqlen, n_cmp, idx_q, idx_k, idx_w, device
+    ) -> torch.Tensor:
+        """The KV positions each query attends, ``[B, L, K]``, -1 padded.
+
+        Window positions live in ``[0, L)`` and compressed ones are offset by
+        ``L``, so the indices address the concatenated per-sequence KV stream
+        directly. Exposed as a method because the block mask, the fused
+        backward and the tests all need exactly this selection.
+        """
+        selected_indices = [
+            self.get_window_topk_idxs(bsz=bsz, seqlen=seqlen, device=device)
+        ]
+        if self.compress_ratio == 4:
+            if idx_q is None or idx_k is None or idx_w is None:
+                raise ValueError(
+                    "DSV4FlexInnerAttention requires idx_q, idx_k, "
+                    "and idx_w when compress_ratio=4"
+                )
+            cmp_topk = Indexer.select(
+                idx_q,
+                idx_k,
+                idx_w,
+                seqlen=seqlen,
+                ratio=self.compress_ratio,
+                topk=self.index_topk,
+            )
+            if cmp_topk.ndim == 2:  # folded layout -> add the batch dim
+                cmp_topk = cmp_topk.unsqueeze(0)
+            causal_limit = (
+                torch.arange(1, seqlen + 1, device=device).unsqueeze(1)
+                // self.compress_ratio
+            )
+            cmp_topk = torch.where(
+                cmp_topk < causal_limit.unsqueeze(0), seqlen + cmp_topk, -1
+            )
+            selected_indices.append(cmp_topk)
+        elif self.compress_ratio > 1:
+            selected_indices.append(
+                self.get_compress_topk_idxs(
+                    bsz=bsz, seqlen=seqlen, n_cmp=n_cmp, device=device
+                )
+            )
+        selected_indices = torch.cat(selected_indices, dim=-1)
+        return selected_indices
+
     def _forward_impl(
         self,
         q,
@@ -293,40 +351,15 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
                 idx_w = idx_w.view(bsz, seqlen, idx_w.size(1))
 
         with spmd.no_typecheck():
-            selected_indices = [
-                self.get_window_topk_idxs(bsz=bsz, seqlen=seqlen, device=q.device)
-            ]
-            if self.compress_ratio == 4:
-                if idx_q is None or idx_k is None or idx_w is None:
-                    raise ValueError(
-                        "DSV4FlexInnerAttention requires idx_q, idx_k, "
-                        "and idx_w when compress_ratio=4"
-                    )
-                cmp_topk = Indexer.select(
-                    idx_q,
-                    idx_k,
-                    idx_w,
-                    seqlen=seqlen,
-                    ratio=self.compress_ratio,
-                    topk=self.index_topk,
-                )
-                if cmp_topk.ndim == 2:  # folded layout -> add the batch dim
-                    cmp_topk = cmp_topk.unsqueeze(0)
-                causal_limit = (
-                    torch.arange(1, seqlen + 1, device=q.device).unsqueeze(1)
-                    // self.compress_ratio
-                )
-                cmp_topk = torch.where(
-                    cmp_topk < causal_limit.unsqueeze(0), seqlen + cmp_topk, -1
-                )
-                selected_indices.append(cmp_topk)
-            elif self.compress_ratio > 1:
-                selected_indices.append(
-                    self.get_compress_topk_idxs(
-                        bsz=bsz, seqlen=seqlen, n_cmp=n_cmp, device=q.device
-                    )
-                )
-            selected_indices = torch.cat(selected_indices, dim=-1)
+            selected_indices = self.selected_kv_indices(
+                bsz=bsz,
+                seqlen=seqlen,
+                n_cmp=n_cmp,
+                idx_q=idx_q,
+                idx_k=idx_k,
+                idx_w=idx_w,
+                device=q.device,
+            )
 
             block_mask = self._build_block_mask(
                 bsz, seqlen, kv_len, selected_indices, q.device
@@ -334,6 +367,11 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
 
             def apply_sink(out_THV, lse_TH):
                 return apply_attention_sink_rescale(out_THV, lse_TH, attn_sink)
+
+            if self.fused_dsa_backward:
+                return self._fused_dsa(
+                    q_in, kv, attn_sink, selected_indices, block_mask, bsz, kv_len
+                )
 
             return super().forward(
                 q_in,
@@ -343,6 +381,48 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
                 scale=self.softmax_scale,
                 out_transform=apply_sink,
             )
+
+    def _fused_dsa(self, q_in, kv, attn_sink, selected_indices, block_mask, bsz, kv_len):
+        """Flex forward, cuDNN backward, over the flat (unbatched) layout.
+
+        The kernel takes one KV stream and global indices, so a batched
+        ``[B, L, ...]`` input is flattened and each sequence's indices are
+        offset into its own slice -- which is exactly the isolation the
+        batched path already guarantees.
+        """
+
+        def flex_fwd(q_flat, kv_flat):
+            del q_flat, kv_flat  # the flex kernel wants the original layout
+            out, lse = None, None
+
+            def capture(out_THV, lse_TH):
+                nonlocal out, lse
+                out, lse = out_THV, lse_TH
+                return out_THV
+
+            super(DSV4FlexInnerAttention, self).forward(
+                q_in,
+                kv,
+                kv,
+                attention_masks=block_mask,
+                scale=self.softmax_scale,
+                out_transform=capture,
+            )
+            return out, lse
+
+        # [B, L, H, D] -> [B*L, H, D]; [B, N, H, D] -> [B*N, D] (head 0: all
+        # heads share one KV stream, the expand is a view).
+        q_flat = q_in.flatten(0, 1) if q_in.ndim == 4 else q_in
+        kv_flat = (kv[..., 0, :].flatten(0, 1) if kv.ndim == 4 else kv[:, 0, :]).contiguous()
+        idx_flat = flatten_batched_indices(selected_indices, kv_len)
+        return fused_dsa_attention(
+            q_flat,
+            kv_flat,
+            attn_sink,
+            idx_flat,
+            softmax_scale=self.softmax_scale,
+            flex_fwd=flex_fwd,
+        )
 
     def _batch_shape(self, num_tokens: int) -> tuple[int, int]:
         """Split the per-rank token stream into ``(bsz, seq_len)``.
