@@ -286,3 +286,53 @@ def deepseek_v4_flash_8k_gb300_batched(
     config = deepseek_v4_flash_8k_gb300(seq_len)
     config.training.num_tokens_per_microbatch_per_dp_rank = microbatch * (seq_len or 8192)
     return config
+
+
+def deepseek_v4_flash_8k_gb300_batched_stages2(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The batched GB300 recipe at EP=2 with ``num_stages=2``.
+
+    ``_GB300_FLEX_KERNEL_OPTIONS`` pins ``num_stages=1``, which is part of the
+    correctness pin for head_dim=512 and was never tuned for speed. Raising it
+    to 2 gives the Triton loop the software pipelining it had none of -- the
+    profile showed ``num_stages=1``, ``limitingFactors=SMEM`` and no overlap
+    between a tile's global-to-shared load and the previous tile's compute.
+
+    Measured on 32x GB300 at 6x/EP=2: 214.11 vs 172.45 TFLOP/s, +24.2 %, with
+    slightly lower memory (220.16 vs 223.36 GiB) and the loss curve tracking
+    the control. It applies to the forward template as well as the backward.
+
+    Worth knowing this was neutral at 1x microbatch (25.44 vs 25.45 on an
+    earlier attention): pipelining pays in proportion to the independent work
+    a launch has, and the batch axis is what supplies it. So it belongs with
+    ``_batched``, not with the 1x recipe.
+    """
+    from torchtitan.models.common.attention import FlexInnerAttention
+
+    config = deepseek_v4_flash_8k_gb300_batched(microbatch, seq_len)
+    config.parallelism.expert_parallel_degree = 2
+    for layer in config.model_spec.model.layers:
+        inner = getattr(getattr(layer, "attention", None), "inner_attention", None)
+        if isinstance(inner, FlexInnerAttention.Config):
+            opts = dict(inner.kernel_options or {})
+            opts["num_stages"] = 2
+            inner.kernel_options = opts
+    return config
+
+
+def deepseek_v4_flash_8k_gb300_batched_stages2_profile(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """``_stages2`` with the torch profiler on for two steps.
+
+    ``warmup=3, active=2`` matches the other GB300 traces, so the kernel
+    breakdown is comparable. Profiling distorts step time -- the numbers inside
+    a profiled run are not throughput datapoints.
+    """
+    config = deepseek_v4_flash_8k_gb300_batched_stages2(microbatch, seq_len)
+    config.profiler.enable_profiling = True
+    config.profiler.profile_freq = 10
+    config.profiler.profiler_warmup = 3
+    config.profiler.profiler_active = 2
+    return config
