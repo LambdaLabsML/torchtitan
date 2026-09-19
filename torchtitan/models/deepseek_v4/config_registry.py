@@ -506,3 +506,43 @@ def deepseek_v4_flash_8k_gb300_cudnn_dsa(
         if isinstance(inner, DSV4FlexInnerAttention.Config):
             inner.fused_dsa_backward = True
     return config
+
+
+def _set_flex_num_stages(config: Trainer.Config, num_stages: int) -> None:
+    """Override the pinned ``num_stages`` on every flex layer."""
+    from torchtitan.models.common.attention import FlexInnerAttention
+
+    for layer in config.model_spec.model.layers:
+        inner = getattr(getattr(layer, "attention", None), "inner_attention", None)
+        if isinstance(inner, FlexInnerAttention.Config):
+            opts = dict(inner.kernel_options or {})
+            opts["num_stages"] = num_stages
+            inner.kernel_options = opts
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_dsa_ep2(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The cuDNN DSA backward at the 6x/EP=2 operating point, stages still 1.
+
+    The control that separates ``num_stages=2`` from the cuDNN backward: both
+    were measured against different baselines, and with the DSA backward off
+    flex, ``num_stages`` now reaches only the forward template.
+    """
+    config = deepseek_v4_flash_8k_gb300_cudnn_dsa(microbatch, seq_len)
+    config.parallelism.expert_parallel_degree = 2
+    return config
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_dsa_stages2(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """Both wins together: cuDNN DSA backward + ``num_stages=2``, 6x/EP=2.
+
+    They target different kernels -- cuDNN replaces the flex backward outright,
+    while ``num_stages`` pipelines what flex still runs -- so they should stack,
+    but only the forward is left for pipelining to help.
+    """
+    config = deepseek_v4_flash_8k_gb300_cudnn_dsa_ep2(microbatch, seq_len)
+    _set_flex_num_stages(config, 2)
+    return config
