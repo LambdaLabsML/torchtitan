@@ -412,8 +412,19 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
 
         # [B, L, H, D] -> [B*L, H, D]; [B, N, H, D] -> [B*N, D] (head 0: all
         # heads share one KV stream, the expand is a view).
-        q_flat = q_in.flatten(0, 1) if q_in.ndim == 4 else q_in
-        kv_flat = (kv[..., 0, :].flatten(0, 1) if kv.ndim == 4 else kv[:, 0, :]).contiguous()
+        # All query heads share one KV stream, so head 0 is the whole stream and
+        # dropping the head axis is a view. Batched kv is [B, N, H, D] and
+        # single-sequence kv is [N, H, D], so ndim distinguishes them.
+        if q_in.ndim == 4:
+            q_flat = q_in.flatten(0, 1)
+            kv_flat = kv[..., 0, :].flatten(0, 1)
+        else:
+            q_flat = q_in
+            kv_flat = kv[:, 0, :]
+        kv_flat = kv_flat.contiguous()
+        assert kv_flat.shape[0] == bsz * kv_len, (
+            f"kv_flat has {kv_flat.shape[0]} rows, expected {bsz * kv_len}"
+        )
         idx_flat = flatten_batched_indices(selected_indices, kv_len)
         return fused_dsa_attention(
             q_flat,
