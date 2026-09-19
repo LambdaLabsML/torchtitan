@@ -92,14 +92,17 @@ class _CudnnDsaBackward(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q_THD, kv_ND, attn_sink_H, topk_idxs_TK, softmax_scale, flex_fwd):
+        from torchtitan.models.common.attention import apply_attention_sink_rescale
+
         with torch.no_grad():
             out_no_sink, lse_no_sink = flex_fwd(q_THD, kv_ND)
-            # Reconstruct what a sink-inside-the-softmax kernel would produce.
+            # Exactly the rescale the unfused path applies -- the same
+            # (compiled) function, so the two forwards agree bitwise and any
+            # difference in a comparison is attributable to the backward.
+            out = apply_attention_sink_rescale(out_no_sink, lse_no_sink, attn_sink_H)
+            # What a sink-inside-the-softmax kernel would have produced for lse.
             sink = attn_sink_H.to(lse_no_sink.dtype).view(
                 *([1] * (lse_no_sink.ndim - 1)), -1
-            )
-            out = out_no_sink * torch.sigmoid(lse_no_sink - sink).unsqueeze(-1).to(
-                out_no_sink.dtype
             )
             lse = torch.logaddexp(lse_no_sink, sink.expand_as(lse_no_sink))
         ctx.save_for_backward(q_THD, kv_ND, out, lse, attn_sink_H, topk_idxs_TK)
