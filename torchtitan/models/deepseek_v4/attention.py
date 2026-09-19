@@ -410,11 +410,10 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
             )
             return out, lse
 
-        # [B, L, H, D] -> [B*L, H, D]; [B, N, H, D] -> [B*N, D] (head 0: all
-        # heads share one KV stream, the expand is a view).
-        # All query heads share one KV stream, so head 0 is the whole stream and
-        # dropping the head axis is a view. Batched kv is [B, N, H, D] and
-        # single-sequence kv is [N, H, D], so ndim distinguishes them.
+        # [B, L, H, D] -> [B*L, H, D] and [B, N, H, D] -> [B*N, D]. All query
+        # heads share one KV stream, so head 0 is the whole stream and dropping
+        # the head axis is a view. Batched kv is [B, N, H, D] against
+        # [N, H, D] unbatched, so ndim tells the two layouts apart.
         if q_in.ndim == 4:
             q_flat = q_in.flatten(0, 1)
             kv_flat = kv[..., 0, :].flatten(0, 1)
