@@ -50,23 +50,24 @@ def _cfg(fused: bool, seq_len: int):
     )
 
 
-def _inputs(seqlen, n_heads, n_idx_heads, seed):
+def _inputs(seqlen, n_heads, n_idx_heads, seed, microbatch=1):
     g = torch.Generator(device="cuda").manual_seed(seed)
-    n_cmp = seqlen // RATIO
+    n_cmp = microbatch * (seqlen // RATIO)
+    tokens = microbatch * seqlen
 
     def r(*shape, std=1.0, grad=False):
         t = (torch.randn(*shape, generator=g, device="cuda") * std).to(torch.bfloat16)
         return t.requires_grad_(grad)
 
     return dict(
-        q=r(seqlen, n_heads, HEAD_DIM, grad=True),
-        swa_k=r(seqlen, HEAD_DIM, grad=True),
+        q=r(tokens, n_heads, HEAD_DIM, grad=True),
+        swa_k=r(tokens, HEAD_DIM, grad=True),
         cmp_k=r(n_cmp, HEAD_DIM, grad=True),
-        idx_q=r(seqlen, n_idx_heads, IDX_D),
+        idx_q=r(tokens, n_idx_heads, IDX_D),
         idx_k=r(n_cmp, IDX_D),
-        idx_w=r(seqlen, n_idx_heads, std=0.1),
+        idx_w=r(tokens, n_idx_heads, std=0.1),
         attn_sink=r(n_heads, std=0.5, grad=True),
-        cot=r(seqlen, n_heads, HEAD_DIM),
+        cot=r(tokens, n_heads, HEAD_DIM),
     )
 
 
@@ -85,16 +86,34 @@ def _run(module, inp):
     return out.detach(), {k: inp[k].grad.detach() for k in GRADS}
 
 
-def _reference(module, inp, seqlen):
-    """fp64 attention over exactly the positions the module selects."""
+def _reference(module, inp, seqlen, microbatch=1):
+    """fp64 attention over exactly the positions the module selects.
+
+    Written against the flattened stream so one code path covers both the
+    single-sequence and the packed-batch layouts: sequence b's KV occupies its
+    own ``kv_len`` slice, which is the isolation the batched path guarantees.
+    """
+    from torchtitan.models.deepseek_v4.cudnn_dsa import flatten_batched_indices
+
     q, swa_k, cmp_k, sink = inp["q"], inp["swa_k"], inp["cmp_k"], inp["attn_sink"]
-    n_cmp = cmp_k.size(0)
+    bsz = microbatch
+    n_cmp = cmp_k.size(0) // bsz
+    kv_len = seqlen + n_cmp
+    # selected_kv_indices takes the batched views, as the module's forward does
+    idx_q, idx_k, idx_w = inp["idx_q"], inp["idx_k"], inp["idx_w"]
+    if bsz > 1:
+        idx_q = idx_q.view(bsz, seqlen, idx_q.size(1), idx_q.size(2))
+        idx_k = idx_k.view(bsz, n_cmp, idx_k.size(1))
+        idx_w = idx_w.view(bsz, seqlen, idx_w.size(1))
     with torch.no_grad():
         idx = module.selected_kv_indices(
-            bsz=1, seqlen=seqlen, n_cmp=n_cmp, idx_q=inp["idx_q"],
-            idx_k=inp["idx_k"], idx_w=inp["idx_w"], device=q.device,
-        )[0]
-    kv = torch.cat([swa_k, cmp_k], dim=0).double()     # differentiable
+            bsz=bsz, seqlen=seqlen, n_cmp=n_cmp, idx_q=idx_q,
+            idx_k=idx_k, idx_w=idx_w, device=q.device,
+        )
+        idx = flatten_batched_indices(idx, kv_len) if bsz > 1 else idx[0]
+    kv = torch.cat(
+        [swa_k.view(bsz, seqlen, HEAD_DIM), cmp_k.view(bsz, n_cmp, HEAD_DIM)], dim=1
+    ).reshape(bsz * kv_len, HEAD_DIM).double()          # differentiable
     qd = q.double()
     sel = idx.clamp_min(0)
     gathered = kv[sel]                                  # [T, K, D]
@@ -113,26 +132,30 @@ def _rel(a, b):
 
 @unittest.skipUnless(_HAS_CUDNN_DSA, "requires a GPU with cuDNN's DSA kernel")
 class TestCudnnDsaBackward(unittest.TestCase):
-    def _check(self, seqlen, n_heads, n_idx_heads, seed):
+    def _check(self, seqlen, n_heads, n_idx_heads, seed, microbatch=1):
         flex = _cfg(False, seqlen).build().cuda()
         fused = _cfg(True, seqlen).build().cuda()
 
-        base = _inputs(seqlen, n_heads, n_idx_heads, seed)
+        base = _inputs(seqlen, n_heads, n_idx_heads, seed, microbatch)
         i_flex, i_fused, i_ref = _clone(base), _clone(base), _clone(base)
         out_flex, g_flex = _run(flex, i_flex)
         out_fused, g_fused = _run(fused, i_fused)
-        out_ref, g_ref = _reference(flex, i_ref, seqlen)
+        out_ref, g_ref = _reference(flex, i_ref, seqlen, microbatch)
 
-        print(f"\n  T={seqlen} H={n_heads} D={HEAD_DIM} topk={TOPK} seed={seed}")
+        print(f"\n  T={seqlen} H={n_heads} D={HEAD_DIM} topk={TOPK} "
+              f"seed={seed} microbatch={microbatch}")
         print(f"    {'tensor':<10} {'flex-vs-fp64':>14} {'cudnn-vs-fp64':>15} {'cudnn-vs-flex':>15}")
         # the forward is shared, so outputs must be identical
         self.assertTrue(torch.equal(out_flex, out_fused), "forward differs")
         for k in GRADS:
             rf, rc = _rel(g_flex[k], g_ref[k]), _rel(g_fused[k], g_ref[k])
             print(f"    {k:<10} {rf:>14.3e} {rc:>15.3e} {_rel(g_fused[k], g_flex[k]):>15.3e}")
-            # no worse than the backward it replaces (1.5x slack for tie-breaking)
+            # No worse than the backward it replaces. attn_sink gets more slack:
+            # it is one value per head reduced over every token, so it
+            # accumulates tie-breaking noise the per-token grads do not.
+            slack, floor = (2.0, 2e-3) if k == "attn_sink" else (1.5, 1e-3)
             self.assertLessEqual(
-                rc, max(1.5 * rf, 1e-3),
+                rc, max(slack * rf, floor),
                 f"{k}: cudnn rel-err {rc:.3e} worse than flex {rf:.3e}",
             )
 
@@ -141,6 +164,15 @@ class TestCudnnDsaBackward(unittest.TestCase):
 
     def test_csa_longer(self):
         self._check(seqlen=1024, n_heads=64, n_idx_heads=8, seed=2)
+
+    def test_csa_packed_batch(self):
+        # Two packed sequences per rank. The kernel is flat and unbatched, so
+        # this is the case where the [B, kv_len, D] KV stream has to be
+        # flattened and each sequence's indices offset into its own slice.
+        self._check(seqlen=512, n_heads=64, n_idx_heads=8, seed=3, microbatch=2)
+
+    def test_csa_packed_batch_4x(self):
+        self._check(seqlen=512, n_heads=64, n_idx_heads=8, seed=4, microbatch=4)
 
 
 if __name__ == "__main__":
