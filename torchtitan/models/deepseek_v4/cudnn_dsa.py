@@ -26,7 +26,9 @@ the same thing (see ``apply_attention_sink_rescale``), which means the
 kernel's inputs can be reconstructed exactly:
 
     out_with_sink = out_no_sink * sigmoid(lse_no_sink - sink)
-    lse_with_sink = logaddexp(lse_no_sink, sink)
+
+so the kernel gets ``out_with_sink`` together with the raw ``lse_no_sink`` --
+its ``lse`` argument is defined as the KV-only LSE, sink excluded.
 
 Layout. The kernel is flat and unbatched: ``q [T, H, D]``, ``kv [N, D]`` (one
 KV head shared by all query heads, K and V being the same tensor here),
@@ -127,11 +129,12 @@ class _CudnnDsaBackward(torch.autograd.Function):
             # (compiled) function, so the two forwards agree bitwise and any
             # difference in a comparison is attributable to the backward.
             out = apply_attention_sink_rescale(out_no_sink, lse_no_sink, attn_sink_H)
-            # What a sink-inside-the-softmax kernel would have produced for lse.
-            sink = attn_sink_H.to(lse_no_sink.dtype).view(
-                *([1] * (lse_no_sink.ndim - 1)), -1
-            )
-            lse = torch.logaddexp(lse_no_sink, sink.expand_as(lse_no_sink))
+            # The kernel wants the KV-only LSE, EXCLUDING the sink (see
+            # sparse_attention_backward/_interface_sm100.py:200): it folds
+            # attn_sink in itself. Passing logaddexp(lse, sink) double-counts
+            # the sink and corrupts dq/d_sink in proportion to the sink's share
+            # of the softmax mass -- worst on short rows, where it dominates.
+            lse = lse_no_sink
         ctx.save_for_backward(
             q_THD, kv_ND, out, lse, attn_sink_H, topk_idxs_TK, topk_length_T
         )
