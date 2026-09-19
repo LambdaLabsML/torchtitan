@@ -83,6 +83,33 @@ def _alignments() -> tuple[int, int]:
     return _TOPK_ALIGN_SM90, _HEAD_ALIGN_SM90
 
 
+def compact_topk_indices(idx_TK: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack each row's valid indices into a prefix, with the per-row length.
+
+    The kernel consumes ``topk_idxs`` together with ``topk_length`` and reads
+    only the first ``length`` entries of a row. Our selection has -1 holes
+    scattered through it (causally masked compressed positions, and the short
+    window at the start of a sequence), so the holes must be squeezed out
+    rather than left in place; feeding an uncompacted row silently produces
+    wrong gradients. cuDNN exposes a kernel for this, with a torch fallback.
+    """
+    if idx_TK.is_cuda:
+        try:
+            result = _dsa_namespace().compactify_wrapper(idx_TK.int().contiguous())
+            return (
+                result["indices"].int().contiguous(),
+                result["topk_length"].int().contiguous(),
+            )
+        except Exception:  # noqa: BLE001 - fall back to the portable path
+            pass
+    valid = idx_TK >= 0
+    order = valid.int().argsort(dim=-1, descending=True, stable=True)
+    return (
+        idx_TK.gather(-1, order).int().contiguous(),
+        valid.sum(dim=-1).int().contiguous(),
+    )
+
+
 class _CudnnDsaBackward(torch.autograd.Function):
     """Flex forward, cuDNN backward.
 
@@ -91,7 +118,9 @@ class _CudnnDsaBackward(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, q_THD, kv_ND, attn_sink_H, topk_idxs_TK, softmax_scale, flex_fwd):
+    def forward(
+        ctx, q_THD, kv_ND, attn_sink_H, topk_idxs_TK, topk_length_T, softmax_scale, flex_fwd
+    ):
         from torchtitan.models.common.attention import apply_attention_sink_rescale
 
         with torch.no_grad():
@@ -105,13 +134,15 @@ class _CudnnDsaBackward(torch.autograd.Function):
                 *([1] * (lse_no_sink.ndim - 1)), -1
             )
             lse = torch.logaddexp(lse_no_sink, sink.expand_as(lse_no_sink))
-        ctx.save_for_backward(q_THD, kv_ND, out, lse, attn_sink_H, topk_idxs_TK)
+        ctx.save_for_backward(
+            q_THD, kv_ND, out, lse, attn_sink_H, topk_idxs_TK, topk_length_T
+        )
         ctx.softmax_scale = softmax_scale
         return out
 
     @staticmethod
     def backward(ctx, d_out):
-        q, kv, out, lse, attn_sink, topk_idxs = ctx.saved_tensors
+        q, kv, out, lse, attn_sink, topk_idxs, topk_length = ctx.saved_tensors
         dsa = _dsa_namespace()
         result = dsa.sparse_attention_backward_wrapper(
             q.contiguous(),
@@ -122,7 +153,7 @@ class _CudnnDsaBackward(torch.autograd.Function):
             attn_sink.float().contiguous(),
             topk_idxs,
             softmax_scale=ctx.softmax_scale,
-            topk_length=None,
+            topk_length=topk_length,
             # Bitwise-reproducible gradients: this model's MoE router flips on
             # near-ties, and a non-deterministic backward would reintroduce the
             # forward-vs-recompute mismatch that activation checkpointing
@@ -132,7 +163,7 @@ class _CudnnDsaBackward(torch.autograd.Function):
         dq = result["dq"].to(q.dtype)
         dkv = result["dkv"].to(kv.dtype)
         d_sink = result["d_sink"].to(attn_sink.dtype)
-        return dq, dkv, d_sink, None, None, None
+        return dq, dkv, d_sink, None, None, None, None
 
 
 def fused_dsa_attention(
@@ -164,11 +195,13 @@ def fused_dsa_attention(
     if k % topk_align:
         pad = topk_align - k % topk_align
         selected_indices = torch.nn.functional.pad(selected_indices, (0, pad), value=-1)
+    compact_idx, topk_length = compact_topk_indices(selected_indices)
     return _CudnnDsaBackward.apply(
         q_THD,
         kv_ND,
         attn_sink_H,
-        selected_indices.to(torch.int32).contiguous(),
+        compact_idx,
+        topk_length,
         softmax_scale,
         flex_fwd,
     )
