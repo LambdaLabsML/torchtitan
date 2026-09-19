@@ -456,3 +456,68 @@ def deepseek_v4_flash_8k_gb300_cudnn_dsa(
         if isinstance(inner, DSV4FlexInnerAttention.Config):
             inner.fused_dsa_backward = True
     return config
+
+
+def _set_flex_num_stages(config: Trainer.Config, num_stages: int) -> None:
+    """Override the pinned ``num_stages`` on every flex layer."""
+    from torchtitan.models.common.attention import FlexInnerAttention
+
+    for layer in config.model_spec.model.layers:
+        inner = getattr(getattr(layer, "attention", None), "inner_attention", None)
+        if isinstance(inner, FlexInnerAttention.Config):
+            opts = dict(inner.kernel_options or {})
+            opts["num_stages"] = num_stages
+            inner.kernel_options = opts
+
+
+def deepseek_v4_flash_8k_gb300_batched_stages2(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The batched GB300 recipe at EP=2 with ``num_stages=2``.
+
+    ``_GB300_FLEX_KERNEL_OPTIONS`` pins ``num_stages=1``, which was part of the
+    head_dim=512 correctness workaround and was never tuned for speed. Raising
+    it to 2 gives the Triton loop software pipelining it had none of: the
+    profile showed ``limitingFactors=SMEM`` and no overlap between a tile's
+    global-to-shared load and the previous tile's compute. The all-16 backward
+    tiles freed the shared memory that made 2 stages fit.
+
+    Measured on 32x GB300 at 6x/EP=2: 214.11 vs 172.45 TFLOP/s, +24.2%, at
+    slightly lower memory (220.16 vs 223.36 GiB), loss tracking the control.
+
+    Neutral at 1x microbatch (25.44 vs 25.45 on an earlier attention):
+    pipelining pays in proportion to the independent work a launch has, and the
+    batch axis is what supplies it. So it belongs with ``_batched``, not 1x.
+    """
+    config = deepseek_v4_flash_8k_gb300_batched(microbatch, seq_len)
+    config.parallelism.expert_parallel_degree = 2
+    _set_flex_num_stages(config, 2)
+    return config
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_dsa_ep2(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The cuDNN DSA backward at the 6x/EP=2 operating point, stages still 1.
+
+    The control that separates ``num_stages=2`` from the cuDNN backward: both
+    were measured against different baselines, and with the DSA backward off
+    flex, ``num_stages`` now reaches only the forward template.
+    """
+    config = deepseek_v4_flash_8k_gb300_cudnn_dsa(microbatch, seq_len)
+    config.parallelism.expert_parallel_degree = 2
+    return config
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_dsa_stages2(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """Both wins together: cuDNN DSA backward + ``num_stages=2``, 6x/EP=2.
+
+    They target different kernels -- cuDNN replaces the flex backward outright,
+    while ``num_stages`` pipelines what flex still runs -- so they should stack,
+    but only the forward is left for pipelining to help.
+    """
+    config = deepseek_v4_flash_8k_gb300_cudnn_dsa_ep2(microbatch, seq_len)
+    _set_flex_num_stages(config, 2)
+    return config
