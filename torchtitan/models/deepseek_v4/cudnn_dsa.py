@@ -84,30 +84,28 @@ def _alignments() -> tuple[int, int]:
 
 
 def compact_topk_indices(idx_TK: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pack each row's valid indices into a prefix, with the per-row length.
+    """Sort each row's valid indices ascending into a prefix, with its length.
 
-    The kernel consumes ``topk_idxs`` together with ``topk_length`` and reads
-    only the first ``length`` entries of a row. Our selection has -1 holes
-    scattered through it (causally masked compressed positions, and the short
-    window at the start of a sequence), so the holes must be squeezed out
-    rather than left in place; feeding an uncompacted row silently produces
-    wrong gradients. cuDNN exposes a kernel for this, with a torch fallback.
+    Two things the kernel wants that our selection does not provide:
+
+    * **Compaction.** It reads the first ``topk_length`` entries of a row, so
+      the -1 holes in our selection (causally masked compressed positions, and
+      the short window at the start of a sequence) must be squeezed out.
+    * **Ascending order.** The compressed half of the selection comes back in
+      top-k score order, not key order. Attention is permutation-invariant over
+      the key set, so sorting is semantically free, but it measurably improves
+      the kernel's accuracy: on an fp64 reference, dq went from 2.0e-2 with
+      shuffled indices to 9.8e-3 with sorted ones.
+
+    Sorting with the invalid entries mapped to ``INT32_MAX`` does both at once:
+    valid indices come out ascending at the front, -1 padding at the back.
     """
-    if idx_TK.is_cuda:
-        try:
-            result = _dsa_namespace().compactify_wrapper(idx_TK.int().contiguous())
-            return (
-                result["indices"].int().contiguous(),
-                result["topk_length"].int().contiguous(),
-            )
-        except Exception:  # noqa: BLE001 - fall back to the portable path
-            pass
-    valid = idx_TK >= 0
-    order = valid.int().argsort(dim=-1, descending=True, stable=True)
-    return (
-        idx_TK.gather(-1, order).int().contiguous(),
-        valid.sum(dim=-1).int().contiguous(),
-    )
+    sentinel = torch.iinfo(torch.int32).max
+    key = torch.where(idx_TK >= 0, idx_TK.int(), sentinel)
+    ordered = key.sort(dim=-1).values
+    lengths = (ordered != sentinel).sum(dim=-1).int()
+    ordered = torch.where(ordered == sentinel, -1, ordered)
+    return ordered.int().contiguous(), lengths.contiguous()
 
 
 class _CudnnDsaBackward(torch.autograd.Function):
