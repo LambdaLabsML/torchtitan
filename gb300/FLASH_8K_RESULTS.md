@@ -2109,3 +2109,19 @@ now-enforced problem (single-rack rule, ``/mnt/dgxc/sbatch_rack.sh``).
 Relaunched single-rack on r02: 792 (``dualmb_s8_6x_v2``) and 793 (balanced).
 Baseline for the comparison: job 777 (dense-never, 4 slots = correct
 gradients, r03): **401.3 TFLOP/s**, loss 3.00 @20.
+
+**Dual-microbatch, first valid 8-node run (job 792, 8 slots, r02, 20 steps):
+374.2 TFLOP/s steady (steps 13-20: 369-375) vs 401.3 for the 4-slot baseline
+(777), memory 233.5 vs 236.3 GiB, loss 3.22 @20 (normal band).** -6.8%.
+Cause identified in the FSDP wiring, not the schedule: under dense-never the
+experts are their own FSDP unit with reshard-after-forward, so two forward
+calls per block all-gather the expert weights twice and two backward passes
+reduce-scatter their grads twice -- ~2 x 258 GiB/step of extra traffic, about
+the size of the loss. Fix (commit on ``dsv4_dual_microbatch``): keep the
+unit unsharded between the halves' forwards (``set_reshard_after_forward(False)``
++ manual ``reshard()`` after the second), and defer gradient sync to the
+second backward with a flag-flip autograd Function on half A's expert output
+(``set_requires_gradient_sync`` / ``set_reshard_after_backward``), so FSDP2
+accumulates half B's grads in the reduce dtype and reduce-scatters once. Side
+effect: the two halves' expert grads now sum in fp32, removing the bf16
+two-contribution rounding noted above. Smoke + relaunch follow.
