@@ -2256,3 +2256,10 @@ tensorwise is 3x slower than bf16, so compile is mandatory. Raw tensorwise
 (``fp8dense_tw_comp_6x``, r03, ``FP8_DENSE_RECIPE=tensorwise
 FP8_DENSE_COMPILE=1``) closes the question; the numerics caveat is that
 per-tensor dynamic scaling is the coarsest fp8 recipe.
+
+**Job 809 (dual, 8 slots, forced round-robin routing, r02): 381.9 TFLOP/s vs
+395-397 for the balanced baseline (757, cross-rack caveat): -3.5%,** against
+-6% under collapsed routing. Balanced routing removes the imbalance wait the
+dual schedule would otherwise hide, so the smaller gap says the schedule does
+recover some of the exposed comm; its own overhead is simply larger than the
+recovery at 6x. Profile (815) pending to name that overhead.
