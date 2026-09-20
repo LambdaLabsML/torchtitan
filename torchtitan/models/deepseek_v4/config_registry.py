@@ -674,3 +674,15 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_fp8ag(
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(microbatch, seq_len)
     config.parallelism.fp8_expert_all_gather = True
     return config
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_fp8ag_profile(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """fp8 expert all-gather with the profiler on (warmup 3, active 2, at step 10)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_fp8ag(microbatch, seq_len)
+    config.profiler.enable_profiling = True
+    config.profiler.profile_freq = 10
+    config.profiler.profiler_warmup = 3
+    config.profiler.profiler_active = 2
+    return config
