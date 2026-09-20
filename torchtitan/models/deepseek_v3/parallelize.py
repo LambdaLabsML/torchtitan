@@ -65,6 +65,13 @@ def parallelize_deepseekv3(
             len(fp8_linears),
             ", ".join(fp8_linears[:4]),
         )
+    if any("CustomFloat8" in type(m).__name__ for m in model.modules()):
+        from torchtitan.quantization.custom_fp8 import warmup_custom_fp8
+
+        warmup_custom_fp8(
+            model, num_tokens=training.num_tokens_per_microbatch_per_dp_rank
+        )
+
     if os.environ.get("FP8_DENSE_COMPILE", "0") == "1":
         # Compile each Float8Linear on its own (the block itself stays eager:
         # whole-block compile graph-breaks in the SPMD typecheck context) so
