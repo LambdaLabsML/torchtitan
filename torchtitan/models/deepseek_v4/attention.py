@@ -21,6 +21,7 @@ from torchtitan.models.common.rope import RoPE
 from torchtitan.tools.leaf_compile import leaf_compile
 
 from .cudnn_dsa import flatten_batched_indices, fused_dsa_attention
+from .cudnn_indexer import cudnn_indexer_select
 
 from .compressor import Compressor, Indexer
 
@@ -118,6 +119,11 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
         cuDNN ships a CuTe-DSL kernel written for this exact shape. Needs
         ``nvidia-cudnn-frontend[cutedsl]`` and SM90+."""
 
+        cudnn_indexer: bool = False
+        """Select the CSA top-k with cuDNN's fused indexer kernel instead of
+        the eager einsum + stable sort (see ``cudnn_indexer.py``). Forward
+        only; the indexer has no gradient path in torchtitan."""
+
         seq_len: int = 0
         """Length of one packed sequence. 0 (the original behaviour) treats the
         whole per-rank token stream as a single sequence, which makes the DSA
@@ -139,6 +145,7 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
         self.seq_len = config.seq_len
         self.fused_dsa_backward = config.fused_dsa_backward
         self.fused_dsa_forward = config.fused_dsa_forward
+        self.cudnn_indexer = config.cudnn_indexer
         self.block_size = config.block_size
 
     def get_window_topk_idxs(self, *, bsz, seqlen, device):
@@ -289,7 +296,8 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
                     "DSV4FlexInnerAttention requires idx_q, idx_k, "
                     "and idx_w when compress_ratio=4"
                 )
-            cmp_topk = Indexer.select(
+            select = cudnn_indexer_select if self.cudnn_indexer else Indexer.select
+            cmp_topk = select(
                 idx_q,
                 idx_k,
                 idx_w,
@@ -303,9 +311,10 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
                 torch.arange(1, seqlen + 1, device=device).unsqueeze(1)
                 // self.compress_ratio
             )
-            cmp_topk = torch.where(
-                cmp_topk < causal_limit.unsqueeze(0), seqlen + cmp_topk, -1
-            )
+            # The cuDNN path pads invalid slots with -1; the eager path never
+            # produces negatives, so the extra test is free for it.
+            valid = (cmp_topk >= 0) & (cmp_topk < causal_limit.unsqueeze(0))
+            cmp_topk = torch.where(valid, seqlen + cmp_topk, -1)
             selected_indices.append(cmp_topk)
         elif self.compress_ratio > 1:
             selected_indices.append(
