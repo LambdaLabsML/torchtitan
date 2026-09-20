@@ -35,6 +35,10 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         hc_attn_pre: HcPre.Config
         hc_ffn_pre: HcPre.Config
         hc_post: HcPost.Config
+        # Split the block's tokens into two microbatches and overlap one
+        # half's EP dispatch/combine (comm stream) with the other half's
+        # attention/experts (compute stream). See ``_forward_dual_microbatch``.
+        dual_microbatch: bool = False
 
     def __init__(self, config: Config):
         super().__init__()
@@ -56,6 +60,7 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         self.hc_attn_pre = cfg.hc_attn_pre.build()
         self.hc_ffn_pre = cfg.hc_ffn_pre.build()
         self.hc_post = cfg.hc_post.build()
+        self.dual_microbatch = cfg.dual_microbatch
 
     def forward(
         self,
@@ -78,6 +83,10 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         Returns:
             Hidden states of shape ``[T, hc_mult, D]``.
         """
+        if self.dual_microbatch and self.moe_enabled and x.shape[0] % 2 == 0:
+            return self._forward_dual_microbatch(
+                x, input_ids_T, attention_masks, positions, padding_mask
+            )
         residual = x
         x, post, comb = self.hc_attn_pre(x)
         x = self.attention(self.attention_norm(x), attention_masks, positions)
@@ -99,6 +108,128 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
             x = self.feed_forward(self.ffn_norm(x))
         x = self.hc_post(x, residual, post, comb)
         return x
+
+    def _attn_and_ffn_pre(self, x, attention_masks, positions):
+        """Attention sub-block plus the FFN's HC pre-mix and norm."""
+        residual = x
+        x, post, comb = self.hc_attn_pre(x)
+        x = self.attention(self.attention_norm(x), attention_masks, positions)
+        x = self.hc_post(x, residual, post, comb)
+        residual = x
+        x, post, comb = self.hc_ffn_pre(x)
+        return self.ffn_norm(x), residual, post, comb
+
+    def _forward_dual_microbatch(
+        self, x, input_ids_T, attention_masks, positions, padding_mask
+    ):
+        """Two-microbatch schedule that hides the EP dispatch/combine.
+
+        Profiles of the GB300 recipe show MinimalAsyncEP's dispatch copy and EP
+        barrier fully exposed (~10% of GPU time): the dispatcher is a
+        synchronous custom-op boundary, so on one stream nothing runs while
+        rows are copied to peers and the group barrier spins. Megatron's
+        combined-1F1B fine-grained schedule (``overlap_moe_expert_parallel_comm``)
+        hides it by interleaving two microbatches; this is that idea inside one
+        block:
+
+            compute stream: attn(A) | attn(B)   | experts(A) | experts(B) | post(A) post(B)
+            comm stream:            | dispatch(A)| dispatch(B)| combine(A) | combine(B)
+
+        Every rank issues the four comm ops in the same order, and the receive
+        pool holds four slots (``set_microbatch_split(2)``) so a slot is never
+        rewritten before its consumer has run. Autograd replays each op on the
+        stream it ran on, so backward (and FullAC's recompute) overlap the same
+        way. The halves are whole sequences (``T/2`` must be a multiple of the
+        sequence length), so attention, routing and HC mixing are unchanged
+        per token and the result matches the single-microbatch forward.
+        """
+        from torchtitan.models.common.moe import maybe_set_sparse_mesh
+
+        moe = self.moe
+        assert moe is not None
+        half = x.shape[0] // 2
+
+        def split(t):
+            return (None, None) if t is None else (t[:half], t[half:])
+
+        xs, ids, pos, pad = split(x), split(input_ids_T), split(positions), split(padding_mask)
+        use_hash = bool(getattr(moe.router, "hash", False))
+        main = torch.cuda.current_stream()
+        comm = _dual_mb_comm_stream()
+
+        def dispatch(ffn_in, i):
+            kw = {"input_ids_T": ids[i]} if use_hash else {}
+            scores, eids, rmap = moe.router(
+                ffn_in, moe.expert_bias_E, padding_mask_T=pad[i], **kw
+            )
+            counts = rmap.sum(dim=0)
+            return moe.routed_experts.token_dispatcher.dispatch(
+                ffn_in, scores, eids, counts
+            )
+
+        def experts(routed_in, n_e):
+            with maybe_set_sparse_mesh():
+                return moe.routed_experts.inner_experts(routed_in, n_e)
+
+        def combine(routed_out, meta, ffn_in):
+            return moe.routed_experts.token_dispatcher.combine(routed_out, meta, ffn_in)
+
+        def finish(out, ffn_in, residual, post, comb):
+            if moe.shared_experts is not None:
+                out = out + moe.shared_experts(ffn_in)
+            return self.hc_post(out, residual, post, comb)
+
+        def on_comm(fn, *args):
+            ev = torch.cuda.Event()
+            ev.record(main)
+            with torch.cuda.stream(comm):
+                comm.wait_event(ev)
+                for a in args:
+                    _record_stream(a, comm)
+                out = fn(*args)
+            done = torch.cuda.Event()
+            done.record(comm)
+            return out, done
+
+        def join(done, *tensors):
+            main.wait_event(done)
+            for t in tensors:
+                _record_stream(t, main)
+
+        f_a = self._attn_and_ffn_pre(xs[0], attention_masks, pos[0])
+        d_a, ev_da = on_comm(dispatch, f_a[0], 0)
+        f_b = self._attn_and_ffn_pre(xs[1], attention_masks, pos[1])
+        d_b, ev_db = on_comm(dispatch, f_b[0], 1)
+        join(ev_da, d_a[0], d_a[1])
+        e_a = experts(d_a[0], d_a[1])
+        c_a, ev_ca = on_comm(combine, e_a, d_a[2], f_a[0])
+        join(ev_db, d_b[0], d_b[1])
+        e_b = experts(d_b[0], d_b[1])
+        c_b, ev_cb = on_comm(combine, e_b, d_b[2], f_b[0])
+        join(ev_ca, c_a)
+        out_a = finish(c_a, *f_a)
+        join(ev_cb, c_b)
+        out_b = finish(c_b, *f_b)
+        return torch.cat([out_a, out_b], dim=0)
+
+
+_DUAL_MB_COMM_STREAM = None
+
+
+def _dual_mb_comm_stream():
+    global _DUAL_MB_COMM_STREAM
+    if _DUAL_MB_COMM_STREAM is None:
+        _DUAL_MB_COMM_STREAM = torch.cuda.Stream()
+    return _DUAL_MB_COMM_STREAM
+
+
+def _record_stream(t, stream) -> None:
+    """Tell the caching allocator ``t`` is used on ``stream`` (cross-stream use)."""
+    if torch.is_tensor(t) and t.is_cuda:
+        try:
+            t.record_stream(stream)
+        except RuntimeError:
+            pass  # symmetric-memory buffers are not caching-allocator tensors
 
 
 class DeepSeekV4Model(Decoder):
