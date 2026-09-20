@@ -2164,3 +2164,14 @@ which compiles each Float8Linear module alone so the amax/scale/cast kernels
 fuse -- whole-block compile graph-breaks here. The debug model cannot
 exercise either (all its linears fall under the small-K/N filter), so the
 8-node runs are the first real test.
+
+**200-step run (job 758, dense-never 6x, probe sampled every 10 steps,
+cross-rack r02+r03 so throughput carries that caveat):** the collapse does not
+recover on any benchmark-relevant horizon. 93% of layer forwards stay on the
+same 6 experts from step 4 through step 150; the bias correction only begins
+to spread routing at step ~160 (88%) and reaches 86% collapsed at step 191.
+EP-rank receive imbalance stays at 1.24-1.28x mean throughout. Throughput was
+flat the whole way (steps 20-200: p50 399.2, min 383, max 402 TFLOP/s; loss
+2.744 @200, grad_norm 0.24). So the 20-step numbers are representative of the
+first ~200 steps of a from-scratch run with this router, and the forced
+round-robin variant (395-397) remains the way to see the balanced regime.
