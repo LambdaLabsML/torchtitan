@@ -2369,3 +2369,46 @@ additively. No recompile-limit hits in 828/829. Ideas from the DSv4 tracker
 review, final: idea 2 (cuDNN indexer) +10%, idea 1 (fp8 dense) +2-4% but
 only without torchao; dual-microbatch (other session, jobs 808/812) -5.6%,
 not adopted.
+
+## Transformer Engine instead of torchao: grouped expert GEMMs (microbenchmarks, 1 GPU)
+
+torchao is left in four places: fp8 dense linears (now replaced by the
+torchao-free custom linear, 450.8), MXFP8 grouped experts (torchao's CUTLASS
+path aborts on sm_103 for fp8 and needed the padded TorchAO dispatcher for
+MXFP8, -7.5%), NVFP4 experts (unused), and the fp8 all-gather subclass (-0.9%,
+dead). The one that matters is the expert grouped GEMM, ~28% of kernel time.
+TE 2.19 was built for this cluster into ``/mnt/dgxc/pydeps-te``
+(``EXTRA_PYTHONPATH``): aarch64 wheel for the core, torch extension built from
+sdist against the nightly with the torch wheel's cuDNN/NCCL headers (14 min).
+Two gotchas: pip ``--target`` silently dropped the extension's ``.so`` because
+``transformer_engine/`` already existed (extracted from the cached wheel), and
+TE's fused grouped-tensor path needs cuBLASLt >= 13.3 while torch ships
+13.1.1 -- ``LD_PRELOAD`` of the ``nvidia-cublas==13.8.0.4`` wheel's
+``libcublasLt.so.13`` (same soname; torch preloads by absolute path so
+``LD_LIBRARY_PATH`` alone does nothing) gives 13.8 and works.
+
+Real per-rank expert shapes (128 local experts, D=4096, F=2048, 294,912 routed
+rows; fwd+bwd of w1/w3/w2), jobs 831-836:
+
+| routing | torch ``_grouped_mm`` bf16 | TE legacy path MXFP8 | TE fused path (2x64 experts) MXFP8, weights requantized / cached |
+| --- | --- | --- | --- |
+| balanced (2304 rows/expert) | 31.8 ms | 0.55x | 0.99x / **1.12x** |
+| skewed | 35.6 ms | -- | 1.09x / 1.24x |
+| collapsed (6 experts) | 39.1 ms | 1.05x | 1.18x / 1.34x |
+
+The legacy path (what TE uses with the shipped cuBLAS, and the only path for
+>64 groups) quantizes per expert (1152 launches) and runs 128 separate MXFP8
+GEMMs whose M=2304 leaves them no faster than torch's tiled bf16 grouped GEMM.
+The fused cuBLASLt grouped GEMM is capped at 64 groups per kernel, so 128
+local experts need two calls and one host sync per layer for the row cut.
+Weight quantization costs ~4 ms per layer-call; in a step it is paid once per
+forward and reused by recompute and backward, so the effective gain on expert
+time is ~+1% balanced and ~+22% collapsed, i.e. ~0.3% and ~4% of the step,
+before the 32-row padding every expert group needs (MinimalAsyncEP emits
+unpadded groups; a pad/unpad copy is ~0.6% of the step). fp8 current-scaling
+matches MXFP8 when cached, NVFP4 fails in the grouped Hadamard amax kernel.
+**Verdict: marginal -- a real gain only in the collapsed-routing benchmark
+regime, ~nothing in steady-state balanced training; not queued at 8 nodes.**
+Branch/worktree ``dsv4_te_experts`` (/mnt/dgxc/worktrees/teexp) has TE on the
+path and the benchmarks (``/mnt/dgxc/bench_te_grouped*.py``) if it is wanted
+later. TE dense ``te.Linear`` vs the custom fp8 linear: job 837, below.
