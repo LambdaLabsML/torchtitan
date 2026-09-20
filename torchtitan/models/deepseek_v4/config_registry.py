@@ -746,8 +746,12 @@ FP8_DENSE_FILTER_FQNS = [
     "router.gate",
     "indexer",
     "compressor",
-    # torchao: skip linears whose K/N are too small to gain from fp8.
-    "auto_filter_small_kn",
+    # Too small to gain: attn_sink is 1x64, wkv is 4096->512, wq_a 4096->1024.
+    # torchao's H100-tuned auto filter also rejected wq_b (K=1024, N=32768),
+    # the single largest dense GEMM in the model, so it is not used here.
+    "attn_sink",
+    "attention.wkv",
+    "attention.wq_a",
 ]
 
 
