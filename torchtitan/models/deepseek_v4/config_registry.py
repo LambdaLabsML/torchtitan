@@ -640,6 +640,7 @@ def deepseek_v4_debugmodel_asyncep_policy(
     config.activation_checkpoint = FullAC.Config()
     config.parallelism.expert_parallel_degree = 2
     config.parallelism.fsdp_reshard_after_forward = os.environ.get("FSDP_POLICY", "default")
+    config.parallelism.fp8_expert_all_gather = os.environ.get("FP8_EXPERT_AG", "0") == "1"
     config.training.disable_cuda_graphs = True
     config.debug.seed = 0
     config.debug.deterministic = True
@@ -656,4 +657,20 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_profile(
     config.profiler.profile_freq = 10
     config.profiler.profiler_warmup = 3
     config.profiler.profiler_active = 2
+    return config
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_fp8ag(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The 401.4 best (dense-never) plus fp8 all-gather of the expert weights.
+
+    Expert all-gathers are ~95% of FSDP gather bytes and run twice per block per
+    step under FullAC (forward + backward recompute), ~1 s/step. Gathering
+    them as row-wise e4m3 halves that; the bf16 grouped GEMM and MinimalAsyncEP
+    are untouched. Numerics: GEMMs see fp8-rounded weights (row-wise scales),
+    the standard fp8 weight recipe -- measure, do not assume.
+    """
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(microbatch, seq_len)
+    config.parallelism.fp8_expert_all_gather = True
     return config
