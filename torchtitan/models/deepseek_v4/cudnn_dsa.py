@@ -125,7 +125,16 @@ class _CudnnDsaBackward(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx, q_THD, kv_ND, attn_sink_H, topk_idxs_TK, topk_length_T, softmax_scale, flex_fwd
+        ctx,
+        q_THD,
+        kv_ND,
+        attn_sink_H,
+        topk_idxs_TK,
+        topk_length_T,
+        softmax_scale,
+        flex_fwd,
+        out_rope_cache=None,
+        out_rope_rd=0,
     ):
         from torchtitan.models.common.attention import apply_attention_sink_rescale
 
@@ -141,10 +150,13 @@ class _CudnnDsaBackward(torch.autograd.Function):
                 )
                 # out already carries the sink; lse excludes it.
                 out, lse = res["out"].to(q_THD.dtype), res["lse"]
+                out = _apply_out_rope_(out, out_rope_cache, out_rope_rd)
             ctx.save_for_backward(
-                q_THD, kv_ND, out, lse, attn_sink_H, topk_idxs_TK, topk_length_T
+                q_THD, kv_ND, out, lse, attn_sink_H, topk_idxs_TK, topk_length_T,
+                *(() if out_rope_cache is None else (out_rope_cache,)),
             )
             ctx.softmax_scale = softmax_scale
+            ctx.out_rope_rd = out_rope_rd if out_rope_cache is not None else 0
             return out
 
         with torch.no_grad():
@@ -159,15 +171,30 @@ class _CudnnDsaBackward(torch.autograd.Function):
             # the sink and corrupts dq/d_sink in proportion to the sink's share
             # of the softmax mass -- worst on short rows, where it dominates.
             lse = lse_no_sink
+            out = _apply_out_rope_(out, out_rope_cache, out_rope_rd)
         ctx.save_for_backward(
-            q_THD, kv_ND, out, lse, attn_sink_H, topk_idxs_TK, topk_length_T
+            q_THD, kv_ND, out, lse, attn_sink_H, topk_idxs_TK, topk_length_T,
+            *(() if out_rope_cache is None else (out_rope_cache,)),
         )
         ctx.softmax_scale = softmax_scale
+        ctx.out_rope_rd = out_rope_rd if out_rope_cache is not None else 0
         return out
 
     @staticmethod
     def backward(ctx, d_out):
-        q, kv, out, lse, attn_sink, topk_idxs, topk_length = ctx.saved_tensors
+        q, kv, out, lse, attn_sink, topk_idxs, topk_length, *rest = ctx.saved_tensors
+        if ctx.out_rope_rd:
+            # The saved `out` is the ROTATED output the block consumed (and
+            # whose consumers have already run their backward, so mutating it
+            # now is safe). Un-rotate it in place to recover the raw attention
+            # output the kernel needs, and push d_out through the rotation's
+            # VJP -- a forward rotation of its tail -- out of place, since
+            # d_out may alias other gradient buffers. Megatron-LM #7036/#5526.
+            (cache,) = rest
+            from .fused_rope import rotate_tail, rotate_tail_
+
+            rotate_tail_(out, cache, rd=ctx.out_rope_rd, inverse=False)
+            d_out = rotate_tail(d_out.contiguous(), cache, rd=ctx.out_rope_rd, inverse=False)
         dsa = _dsa_namespace()
         result = dsa.sparse_attention_backward_wrapper(
             q.contiguous(),
@@ -188,7 +215,22 @@ class _CudnnDsaBackward(torch.autograd.Function):
         dq = result["dq"].to(q.dtype)
         dkv = result["dkv"].to(kv.dtype)
         d_sink = result["d_sink"].to(attn_sink.dtype)
-        return dq, dkv, d_sink, None, None, None, None
+        return dq, dkv, d_sink, None, None, None, None, None, None
+
+
+def _apply_out_rope_(out, cache_ri, rd):
+    """Inverse-rotate the rope tail of the Function-owned output in place.
+
+    Fusing the output inverse RoPE here (Megatron-LM #7036) means no separate
+    rotated [T, H, D] activation is retained for backward, and the rotation
+    touches only the rd-wide tail instead of copying the whole output -- the
+    standalone op was 2.33% + 0.90% of GPU time in the 8-node profile.
+    """
+    if cache_ri is None:
+        return out
+    from .fused_rope import rotate_tail_
+
+    return rotate_tail_(out.contiguous(), cache_ri, rd=rd, inverse=True)
 
 
 def fused_dsa_attention(
@@ -199,6 +241,7 @@ def fused_dsa_attention(
     *,
     softmax_scale: float,
     flex_fwd=None,
+    out_rope=None,
 ) -> torch.Tensor:
     """Sink-scaled DSA output whose backward is cuDNN's fused kernel.
 
@@ -210,6 +253,8 @@ def fused_dsa_attention(
         softmax_scale: the QK scale (the sink logit is NOT scaled).
         flex_fwd: callable ``(q, kv) -> (out_no_sink, lse_no_sink)``, or
             None to run cuDNN's sparse-attention forward instead.
+        out_rope: optional ``(cache_ri, rd)`` -- apply the output inverse RoPE
+            in place inside the Function (see ``_apply_out_rope_``).
     """
     topk_align, head_align = _alignments()
     n_heads = q_THD.size(1)
@@ -222,6 +267,7 @@ def fused_dsa_attention(
         pad = topk_align - k % topk_align
         selected_indices = torch.nn.functional.pad(selected_indices, (0, pad), value=-1)
     compact_idx, topk_length = compact_topk_indices(selected_indices)
+    cache, rd = (None, 0) if out_rope is None else out_rope
     return _CudnnDsaBackward.apply(
         q_THD,
         kv_ND,
@@ -230,6 +276,8 @@ def fused_dsa_attention(
         topk_length,
         softmax_scale,
         flex_fwd,
+        cache,
+        rd,
     )
 
 
