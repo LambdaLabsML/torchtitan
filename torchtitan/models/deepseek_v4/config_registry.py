@@ -647,3 +647,26 @@ def deepseek_v4_debugmodel_asyncep_densenever(
     config.training.disable_cuda_graphs = True
     config.training.steps = 2
     return config
+
+
+def deepseek_v4_debugmodel_asyncep_policy(
+    seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
+) -> Trainer.Config:
+    """One-node EP=2 pair: FSDP_POLICY env selects the reshard policy; fixed
+    seed and deterministic mode so the two arms differ in nothing else."""
+    import os
+
+    from torchtitan.distributed.activation_checkpoint import FullAC
+
+    config = deepseek_v4_debugmodel(seq_len)
+    config.model_spec = model_registry(
+        "debugmodel", seq_len=seq_len, moe_comm_backend="minimal_async_ep"
+    )
+    config.activation_checkpoint = FullAC.Config()
+    config.parallelism.expert_parallel_degree = 2
+    config.parallelism.fsdp_reshard_after_forward = os.environ.get("FSDP_POLICY", "default")
+    config.training.disable_cuda_graphs = True
+    config.debug.seed = 0
+    config.debug.deterministic = True
+    config.training.steps = 2
+    return config
