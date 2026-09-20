@@ -368,6 +368,11 @@ def apply_fsdp_to_decoder(
                         )
 
                 if reshard_after_forward_policy == "dense-never":
+                    logger.info(
+                        "fsdp dense-never: layer %s experts sharded separately "
+                        "(reshard=True), dense params kept unsharded (reshard=False)",
+                        layer_id,
+                    )
                     # Experts as their own FSDP unit on the sparse mesh, still
                     # resharding after forward; the enclosing block then owns
                     # only the dense parameters and keeps them unsharded.
