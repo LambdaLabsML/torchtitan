@@ -32,6 +32,16 @@ from torchtitan.models.common.linear import Linear
 
 _E4M3_MAX = 448.0
 
+# The cast graphs are compiled per (shape, stride, dtype) variant: five weight
+# shapes, four activation shapes, three grad shapes, plus whatever the warm-up
+# adds. Dynamo's default limit of 8 variants per function silently falls back
+# to eager past that (job 825: 380 vs 416 TFLOP/s, "hit config.recompile_limit
+# (8)" x32 in the log). Lift it well clear of what this model needs.
+torch._dynamo.config.recompile_limit = 64
+torch._dynamo.config.accumulated_recompile_limit = max(
+    torch._dynamo.config.accumulated_recompile_limit, 1024
+)
+
 
 @torch.compile(dynamic=False)
 def _cast_both(x: torch.Tensor):
