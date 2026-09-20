@@ -2175,3 +2175,26 @@ flat the whole way (steps 20-200: p50 399.2, min 383, max 402 TFLOP/s; loss
 2.744 @200, grad_norm 0.24). So the 20-step numbers are representative of the
 first ~200 steps of a from-scratch run with this router, and the forced
 round-robin variant (395-397) remains the way to see the balanced regime.
+
+**Idea 2 result (job 807, ``cudnnidx_6x``, rack r02, 20 steps): 441.4 TFLOP/s
+vs 401 for the 4-slot baseline (job 777, r03) -- +10%, new best.**
+
+| steps 9-20 | baseline 777 | cuDNN indexer 807 |
+| --- | --- | --- |
+| TFLOP/s | 399.7-402.1 (step 20: 400.9) | 430.9-443.6 (step 20: **441.4**) |
+| peak memory | 236.25 GiB | **224.84 GiB** (-11.4 GiB) |
+| loss @15 / @20 | 3.41 / 3.00 | 4.39 / 3.32 |
+
+Far more than the ~2.5% the kernel-time share suggested. The eager select
+was not just the sort: per CSA layer it materialised a dense
+``[T, T/ratio]`` score (49152 x 12288 fp32/bf16, ~2.4 GB), a same-size
+causal mask, a masked_fill and a full-row stable sort, all on the critical
+path of every attention layer (twice per step under FullAC), and the memory
+drop says the score tensor was also part of the peak. cuDNN never
+materialises the score, so this converts to wall time at ~100% instead of
+the ~20% every previous elementwise fusion managed. Loss: 807 sat above 777
+through steps 8-15 and ended inside the same-config spread (600/602 ended
+3.30 vs 3.87); the probe says the selection is closer to fp32 truth than the
+eager path, so no mechanism points at worse learning, but a longer run is
+the only way to close that. Next: stack with fp8 dense linears (810/811)
+and the dual-microbatch schedule.
