@@ -2412,3 +2412,18 @@ regime, ~nothing in steady-state balanced training; not queued at 8 nodes.**
 Branch/worktree ``dsv4_te_experts`` (/mnt/dgxc/worktrees/teexp) has TE on the
 path and the benchmarks (``/mnt/dgxc/bench_te_grouped*.py``) if it is wanted
 later. TE dense ``te.Linear`` vs the custom fp8 linear: job 837, below.
+
+**TE ``te.Linear`` vs the torchao-free custom fp8 linear (job 837, 1 GPU, the
+five converted dense shapes at T=49152, fwd+bwd, weights requantized every
+call, per-set totals):**
+
+| torch bf16 | custom fp8 (probe 821) | TE fp8 current-scaling | TE MXFP8 | TE fp8 delayed-scaling | TE NVFP4 |
+| --- | --- | --- | --- | --- | --- |
+| 20.8 ms | 14.95 ms | 14.22 ms | 13.50 ms | **12.81 ms** | **10.88 ms** |
+
+TE is faster than the custom linear on every shape with every recipe (its
+casts emit row- and column-major fp8 in one fused kernel and the GEMM
+epilogues are cuBLASLt's). Delayed scaling is the fastest fp8 recipe here
+(no per-call amax reduction on the critical path); NVFP4 is another 15% but is
+the aggressive recipe. Expected on the step over 829's 450.8: ~+0.8%
+(delayed/MXFP8) to ~+1.6% (NVFP4). Queued as branch ``dsv4_te_dense``.
