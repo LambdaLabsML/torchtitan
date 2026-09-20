@@ -38,7 +38,7 @@ export PYTHONPATH="$WORKTREE:/mnt/dgxc/pydeps${EXTRA_PYTHONPATH:+:$EXTRA_PYTHONP
 # Nodes yqb01-qa01-mgx-[00001-00008] have no python3.12-dev, so Triton cannot
 # build its CUDA driver shim there ("Python.h: No such file", job 686). gcc
 # honours CPATH; the headers are copied from a node that has them.
-export CPATH="/mnt/dgxc/pyinclude/python3.12${CPATH:+:$CPATH}"
+export CPATH="/mnt/dgxc/pyinclude/python3.12:/mnt/dgxc/pyinclude${CPATH:+:$CPATH}"
 # Optional fp32 matmul precision override (bfx9 default / tf32 / ieee).
 export TORCHTITAN_FP32_MATMUL_PRECISION=${TORCHTITAN_FP32_MATMUL_PRECISION:-bfx9}
 
