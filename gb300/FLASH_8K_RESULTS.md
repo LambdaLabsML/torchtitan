@@ -2291,3 +2291,8 @@ copy-kernel + barrier transport the overlap costs more than it recovers.
 **Not adopted.** Kept on ``dsv4_dual_microbatch`` (correct, validated, with
 the slot-alias and lazy-load fixes that are useful on their own). Stacked on
 the 441 cuDNN-indexer baseline as job 812 for completeness.
+
+**Job 812 (dual + cuDNN fused indexer, 8 slots, r02): 416.7 TFLOP/s vs 441.4
+for the indexer baseline (807, same rack): -5.6%,** consistent with -6% on
+the 401 base. The two do not interact; the dual schedule's cost is the same
+in absolute terms (~0.6 s/step). Closes the dual-microbatch line: not adopted.
