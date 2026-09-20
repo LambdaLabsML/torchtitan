@@ -78,4 +78,8 @@ def parallelize_deepseekv3(
         symm_mem_scope=parallelism.fsdp_symm_mem_scope,
     )
 
+    if parallelism.fp8_expert_all_gather:
+        from torchtitan.distributed.fp8_allgather import debug_log_fsdp_expert_storage
+
+        debug_log_fsdp_expert_storage(model)
     return model

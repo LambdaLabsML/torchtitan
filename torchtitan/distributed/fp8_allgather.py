@@ -115,7 +115,15 @@ class ExpertWeightFP8AllGather(torch.Tensor):
         return f"ExpertWeightFP8AllGather({self._tensor!r})"
 
     # ---- FSDP2 extension ---------------------------------------------------
+    _logged = {"pre": False, "post": False}
+
     def fsdp_pre_all_gather(self, mesh):
+        if not ExpertWeightFP8AllGather._logged["pre"]:
+            ExpertWeightFP8AllGather._logged["pre"] = True
+            logger.info(
+                "fp8 expert all-gather: pre hook engaged (shard %s %s -> e4m3 + fp32 scales)",
+                tuple(self._tensor.shape), self._tensor.dtype,
+            )
         q, scale = _quantize_rowwise(self._tensor)
         return (q, scale), None
 
@@ -128,6 +136,12 @@ class ExpertWeightFP8AllGather(torch.Tensor):
         out: torch.Tensor | None = None,
     ):
         q, scale = all_gather_outputs
+        if not ExpertWeightFP8AllGather._logged["post"]:
+            ExpertWeightFP8AllGather._logged["post"] = True
+            logger.info(
+                "fp8 expert all-gather: post hook engaged (gathered %s %s, scales %s)",
+                tuple(q.shape), q.dtype, tuple(scale.shape),
+            )
         if out is not None:
             # FSDP re-allocated our bf16 storage; refill it in place.
             with torch.no_grad():
@@ -166,3 +180,32 @@ def wrap_expert_weights_for_fp8_all_gather(model: nn.Module) -> int:
             n += 1
     logger.info("fp8 expert all-gather: wrapped %d expert weights", n)
     return n
+
+
+def debug_log_fsdp_expert_storage(model: nn.Module) -> None:
+    """After FSDP: what does FSDP actually hold as the sharded local tensor of
+    each expert weight, and did it register the all-gather extension?"""
+    import torch.distributed as dist
+    from torch.distributed.fsdp._fully_shard._fsdp_state import _get_module_fsdp_state
+    from torchtitan.models.common.moe import GroupedExperts
+
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+    seen = 0
+    for name, module in model.named_modules():
+        state = _get_module_fsdp_state(module)
+        if state is None or state._fsdp_param_group is None:
+            continue
+        for fp in state._fsdp_param_group.fsdp_params:
+            pname = getattr(fp._module_info, "param_name", "?")
+            if pname not in _EXPERT_WEIGHTS:
+                continue
+            lt = fp._sharded_local_tensor
+            logger.info(
+                "fp8 debug: %s.%s sharded_local=%s has_hook=%s extension=%s",
+                name, pname, type(lt).__name__, hasattr(lt, "fsdp_pre_all_gather"),
+                getattr(fp, "_extensions_data", None) is not None,
+            )
+            seen += 1
+            if seen >= 3:
+                return
