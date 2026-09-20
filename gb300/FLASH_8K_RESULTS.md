@@ -2125,3 +2125,42 @@ second backward with a flag-flip autograd Function on half A's expert output
 accumulates half B's grads in the reduce dtype and reduce-scatters once. Side
 effect: the two halves' expert grads now sum in fp32, removing the bf16
 two-contribution rounding noted above. Smoke + relaunch follow.
+
+## Ideas 1 and 2 from the DSv4 tracker review: fp8 dense linears, cuDNN fused indexer
+
+Base for both: dense-never + 4 receive slots (job 777, 401 TFLOP/s, rack r03).
+
+**Idea 2, cuDNN fused indexer top-k (branch ``dsv4_cudnn_indexer``).** Our
+cuDNN frontend 1.29 already ships ``indexer_forward_top_k_wrapper`` (the
+kernel behind Megatron #5992); torchtitan's ``Indexer.select`` does a bf16
+einsum, a dense mask and a stable sort. The indexer has no gradient path in
+torchtitan (aux loss dropped), so this is a forward-only swap behind
+``DSV4FlexInnerAttention.Config.cudnn_indexer``. Probe (1 GPU, real shapes
+B=2, L=8192, H=64, D=128, ratio 4, top-k 512; jobs 799/804):
+
+| | eager ``Indexer.select`` | cuDNN fused |
+| --- | --- | --- |
+| time per call | 8.12 ms | **0.48 ms** (17x) |
+| rows whose top-k set equals an fp32-scored reference | 36% (set overlap 99.7%) | **100%** (set overlap 1.0000) |
+| deterministic call to call | yes (stable sort) | yes (``deterministic=True``) |
+
+Two contract details found by the probe: the default output ids are global
+across the batch (``b * S_k`` offset), so ``topk_indices_global=False`` is
+required; invalid slots are ``-1``, which the consumer now treats as invalid
+alongside the causal-limit test. The bf16 kernel needs 32 or 64 index heads
+(flash has 64; the debug model's 8 fall back to eager). Note the quality
+angle: the eager bf16 scores quantise the top-k boundary, so ~64% of queries
+currently attend a slightly different compressed set than fp32 scoring would
+pick; cuDNN removes that. 8-node run queued (``cudnnidx_6x``).
+
+**Idea 1, fp8 dense linears (branch ``dsv4_fp8_dense``).** torchao rowwise
+Float8Linear via torchtitan's ``Float8LinearConverter`` on the model config,
+filtering ``lm_head``, ``router.gate``, ``indexer``, ``compressor`` and
+torchao's small-K/N auto filter (the Megatron DSv4 correctness list keeps the
+compressor/indexer in high precision). Expert grouped GEMMs untouched (fp8
+grouped aborts on sm_103; MXFP8 grouped measured -7.5%). Two variants
+queued on r03: eager casts (job 803) and ``FP8_DENSE_COMPILE=1`` (job 806),
+which compiles each Float8Linear module alone so the amax/scale/cast kernels
+fuse -- whole-block compile graph-breaks here. The debug model cannot
+exercise either (all its linears fall under the small-K/N filter), so the
+8-node runs are the first real test.
