@@ -58,6 +58,16 @@ _PRESERVE = {
 }
 
 
+def _preserve(func) -> bool:
+    if func in _PRESERVE:
+        return True
+    # torchtitan's SPMD layout sharding (Module._spmd_distribute_state ->
+    # spmd_types.shard) takes the local expert chunk through a custom op,
+    # not aten.split; without this the sharded parameter comes back as a plain
+    # tensor and FSDP never sees the fp8 all-gather hooks.
+    return getattr(func, "namespace", None) == "spmd_types"
+
+
 @torch.compile(dynamic=False)
 def _quantize_rowwise(w: torch.Tensor):
     """[E, O, I] -> (e4m3 [E, O, I], fp32 scale [E, O, 1]); row = output channel."""
@@ -100,7 +110,7 @@ class ExpertWeightFP8AllGather(torch.Tensor):
             ExpertWeightFP8AllGather, lambda t: t._tensor, (args, kwargs or {})
         )
         out = func(*args, **kwargs)
-        if func not in _PRESERVE:
+        if not _preserve(func):
             return out
         return pytree.tree_map_only(torch.Tensor, ExpertWeightFP8AllGather, out)
 
