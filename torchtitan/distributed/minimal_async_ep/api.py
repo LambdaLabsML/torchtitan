@@ -51,6 +51,23 @@ logger = logging.getLogger(__name__)
 # with 2 slots the backward ops rewrite it first (a 0.12% gradient error,
 # jobs 754 vs 768). 4 slots keep the alias intact through a block's backward.
 _HIDDEN_RECV_BUFFER_COUNT = int(os.environ.get("MINIMAL_ASYNC_EP_SLOTS", "4"))
+# Dual-microbatch schedule (deepseek_v4 ``dual_microbatch``): each MoE layer
+# issues dispatch(A), dispatch(B), combine(A), combine(B) on a comm stream while
+# the experts of the other half run on the compute stream. Each in-flight half
+# needs its own 4 slots (alias rule above), each sized for 1/split of the
+# tokens (same total bytes).
+_MICROBATCH_SPLIT = 1
+
+
+def set_microbatch_split(split: int) -> None:
+    """Size the receive pool for ``split`` interleaved microbatches per layer."""
+    global _MICROBATCH_SPLIT, _HIDDEN_RECV_BUFFER_COUNT
+    if split < 1:
+        raise ValueError(f"microbatch split must be >= 1, got {split}")
+    if _buffer_state is not None and split != _MICROBATCH_SPLIT:
+        raise RuntimeError("MinimalAsyncEP buffer already initialized; set the split first")
+    _MICROBATCH_SPLIT = split
+    _HIDDEN_RECV_BUFFER_COUNT = max(_HIDDEN_RECV_BUFFER_COUNT, 4 * split)
 
 _HIDDEN_READY_CHANNEL = 0
 _COUNTS_READY_CHANNEL = 0
@@ -217,21 +234,24 @@ def init_buffer(
             )
         return
 
+    tokens_per_slot = -(-num_max_tokens_per_rank // _MICROBATCH_SPLIT)
     max_routed_tokens = (
-        group.size() * num_max_tokens_per_rank * min(top_k, num_local_experts)
+        group.size() * tokens_per_slot * min(top_k, num_local_experts)
     )
     num_experts = group.size() * num_local_experts
 
     logger.info(
         "Initializing MinimalAsyncEP buffer: hidden_dim=%d, "
         "num_max_tokens_per_rank=%d, "
-        "top_k=%d, num_local_experts=%d, ep_size=%d, max_routed_tokens=%d",
+        "top_k=%d, num_local_experts=%d, ep_size=%d, max_routed_tokens=%d, slots=%d (split=%d)",
         hidden_dim,
         num_max_tokens_per_rank,
         top_k,
         num_local_experts,
         group.size(),
         max_routed_tokens,
+        _HIDDEN_RECV_BUFFER_COUNT,
+        _MICROBATCH_SPLIT,
     )
     backend = symm_mem.get_backend(device)
     if backend != "CUDA":
@@ -427,6 +447,11 @@ def _compute_direct_metadata(
     torch.Tensor,
 ]:
     assert _buffer_state is not None
+    assert receive_capacity <= _buffer_state.hidden_recv_buffers[0].shape[0], (
+        f"MinimalAsyncEP receive buffer ({_buffer_state.hidden_recv_buffers[0].shape[0]} rows) "
+        f"is smaller than this dispatch's capacity ({receive_capacity}); a dual-microbatch "
+        "pool only fits half-size microbatches."
+    )
 
     rank = _buffer_state.group.rank()
     num_experts = num_local_tokens_per_expert_E.numel()
