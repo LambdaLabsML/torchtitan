@@ -2033,3 +2033,58 @@ and it is not bitwise reproducible even on one stream (accumulation order of
 3-4 contributions per shared weight). Acceptable for evaluation; production
 would want fp32 gradient accumulation. 8-node runs: job 763 (collapsed
 routing, vs 402.4) and the balanced variant (vs 395-397).
+
+**Balanced end of the range measured (job 757, forced round-robin routing,
+dense-never 6x, same code otherwise):**
+
+| steps 8-20 | natural (collapsed) routing, job 701 | forced balanced, job 757 |
+| --- | --- | --- |
+| TFLOP/s | 401.6-403.7 (step 20: 402.4) | 395.3-401.9 (step 20: **394.9**) |
+| peak memory | 236.25 GiB | 236.25 GiB |
+
+Balanced routing is **1.7% slower**: the barrier's imbalance wait disappears,
+but 256 small expert groups run the grouped GEMMs less efficiently than 6
+huge ones, and the GEMM effect is the larger of the two. So the collapsed
+regime flatters the absolute number by only ~2%, both regimes bracket the
+real-training value, and the ledger's config comparisons stand. Quote the
+best as ~395-402 TFLOP/s depending on routing regime.
+
+**Correction from the slot-count test (jobs 768-773): the bf16 drift above is
+NOT accumulation order, it is a MinimalAsyncEP receive-slot alias, and it
+also affects the production single-microbatch path.** Mechanism:
+``_dispatch_to_experts`` returns the raw ``hidden_recv_buffer`` slot, and
+``GroupedExperts.forward`` feeds ``x_RD.bfloat16()`` to the grouped GEMM --
+a no-op alias when activations are already bf16 -- so autograd saves the
+slot itself for the wgrad GEMM. Every comm op (fwd dispatch, fwd combine, bwd
+combine, bwd dispatch) rotates the pool. With 2 slots the two backward ops
+rewrite the experts' saved input before the wgrad reads it: deterministic
+corruption on the single path (the "0.13% FullAC-through-pool deviation"
+noted earlier in this ledger). With the dual schedule's 4 ops per forward the
+rewrite comes from the other half's op and its peer-side timing, hence the
+run-to-run drift. The fp32-parameter pair (761/762) hid it because with fp32
+activations ``.bfloat16()`` makes a copy, breaking the alias.
+
+Fix: ``MINIMAL_ASYNC_EP_SLOTS`` -- 4 slots for the single path (fwd d, fwd c,
+bwd c, bwd d per block), 8 half-size slots for dual (same bytes as 4 full
+ones; +9.7 GB per rank at 6x, 236 -> ~246 GiB).
+
+| debugmodel, seed 0, deterministic, batch 4 | step-1 grad_norm | step-2 loss | repeat |
+| --- | --- | --- | --- |
+| single, 2 slots (754, 764, 766) -- production today | 3.3059 | 6.97696 | bitwise |
+| **single, 4 slots (768, 769) -- correct gradient** | **3.3100** | **6.93813** | **bitwise** |
+| dual one-stream, 4 slots (759, 765, 767) | 3.3067 | 6.93827 / .13 / .38 | drifts |
+| dual streamed, 4 slots (755, 760) | 3.3060 / 3.3061 | 6.94076 / 6.94014 | drifts |
+| **dual one-stream, 8 slots (770, 771)** | **3.3100** | **6.93818** | **bitwise** |
+| **dual streamed, 8 slots (772, 773)** | **3.3100** | **6.93818** | **bitwise** |
+
+With enough slots the dual schedule is bitwise reproducible, on one stream or
+two, and equals the correct single-path gradient at step 1 to every printed
+digit; the 5e-5 step-2 difference is the two per-half wgrad GEMMs summed
+instead of one (legitimate). The 2-slot production baseline's gradient
+differs from the correct one by 0.12% in norm -- every 20-step loss in this
+ledger carries that, equally on both sides of each comparison. 8-node runs
+with the fix: 777 (single, 4 slots -- the corrected baseline), 776 (dual, 8
+slots, collapsed routing), 778 (dual, 8 slots, balanced routing). A
+memory-neutral alternative is to clone the expert input out of the slot
+(one 4.8 GB copy per layer per forward/recompute, ~50 ms/step) -- not
+implemented; the extra slots are free in time and fit in memory.
