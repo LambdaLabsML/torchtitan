@@ -2457,3 +2457,38 @@ band (see 600/602). **Adopt: 457.6 is the new number.** This closes the
 "torchao vs TE" review: the dense linears were the one place TE pays; the
 grouped experts (above) do not, and nothing else torchao-backed remains in
 the recipe.
+
+## Coworker's `dsv4_elementwise_fusion` stacked on the 457.6 recipe (jobs 845/846)
+
+The branch is one commit (dd22156e2): ``Indexer.select``'s relu * per-head
+weight * head-sum over the [6, 8192, 64, 2048] index-score tensor becomes one
+leaf-compiled reduction (``leaf_ops._index_scores``), 869 ms/step eager in the
+job 670 profile; on its own base it measured +6.7% (682 -> 681: 369.6 ->
+394.5; 428.6 with TF32). Stacked as branch ``dsv4_stack_all`` (worktree
+/mnt/dgxc/worktrees/stackall = cudnnidx + TE dense (delayed) + fusion; clean
+cherry-pick). Correctness: debugmodel fusion vs no-fusion under MXFP8 match to
+4 digits (843 vs 838: grad_norm 3.2913 vs 3.2912).
+
+| run (r02, nodes 1-8, 20 steps) | TFLOP/s step 20 (steps 12-20) | memory |
+| --- | --- | --- |
+| 840: cudnnidx + TE delayed (best) | 457.6 (451-459) | 221.2 GiB |
+| 845: 840 + fusion, everything stacked | 454.0 (see line above) | 221.2 GiB |
+| 846: fusion INSTEAD of cudnnidx (+ TE delayed) | 437.2 | 219.9 GiB |
+
+**The fusion cannot add to the stack: it is dead code under the cuDNN
+indexer.** The indexer only exists on the ratio-4 CSA layers, and
+``cudnn_indexer_select`` replaces ``Indexer.select`` on exactly those layers
+(64 index heads), so the fused reduction never runs -- identical peak memory
+and a -0.8% difference inside run-to-run noise. Head to head on the same
+base, cuDNN's fused scoring + top-k (457.6) beats the leaf-compiled eager
+reduction + stable sort (437.2) by 4.7%: the fusion removes the three
+elementwise passes but keeps the dense bmm, the masked fill and
+``aten::sort``; cuDNN removes all of them. Both are large wins over the
+unfused eager path; take cudnnidx. **Best stays 457.6 (job 840).**
+
+Note on delayed scaling (from 840/844/845): TE's ``DelayedScaling`` runs its
+first step with the initial fp8 scale of 1.0, so small gradients underflow in
+e4m3 (step-1 grad_norm 13 vs 52-55 for the other recipes; debugmodel 1.24 vs
+3.29) and the step-1 update is poor; the amax history fills and it is normal by
+step 5. Acceptable behind a warm-up; for step-1-sensitive comparisons use
+``TE_DENSE_RECIPE=mxfp8`` (449, no artifact).
