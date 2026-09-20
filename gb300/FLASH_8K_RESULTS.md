@@ -2206,3 +2206,22 @@ the schedule is still -6% vs the 401.3 baseline (777). Profiled dual run
 queued to see whether the comm-stream ops actually overlap compute and where
 the extra time sits (half-batch attention/expert efficiency, the spinning
 barrier's SM footprint, or the dispatch copies themselves).
+
+**Idea 1 result (jobs 813 eager, 814 per-linear compiled; rack r03, vs 777
+on r03): fp8 dense linears are -18% here. Not adopted.**
+
+| steps 8-20 | baseline 777 | 813 fp8 eager | 814 fp8 compiled |
+| --- | --- | --- | --- |
+| TFLOP/s | 399.7-402.1 (400.9 @20) | 326.6-329.3 (**327.5** @20) | 327.0-330.5 (**329.4** @20) |
+| peak memory | 236.25 GiB | 234.61 GiB | 234.55 GiB |
+| loss @20 | 3.00 | 3.11 | 3.17 |
+
+215 linears converted (wq_b, wo_a, wo_b, shared w13, w2; 43 layers), verified
+in the log. Compiling each Float8Linear changed nothing, so the loss is not
+torchao's cast kernels -- it is the fp8 GEMMs themselves or the recipe's
+extra transposed casts in backward. Two earlier runs (803, 806) converted
+zero linears because torchao's H100-tuned ``_auto_filter_for_recipe``
+rejects every one of these shapes (K=1024 for wq_b), and ran at exactly the
+baseline; do not use that filter on this model. A 1-GPU microbenchmark of
+the converted shapes (bf16 vs rowwise fp8, eager and compiled, and raw
+``_scaled_mm`` vs ``mm``) follows to pin the mechanism.
