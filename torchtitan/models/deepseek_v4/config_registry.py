@@ -568,3 +568,16 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_5x(
     number cannot be attributed between the two.
     """
     return deepseek_v4_flash_8k_gb300_cudnn_full_ep2(5, seq_len)
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_profile(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The best recipe with the profiler on for two steps (warmup 3, active 2,
+    at step 10), so kernel buckets are comparable with job 610's trace."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2(microbatch, seq_len)
+    config.profiler.enable_profiling = True
+    config.profiler.profile_freq = 10
+    config.profiler.profiler_warmup = 3
+    config.profiler.profiler_active = 2
+    return config
