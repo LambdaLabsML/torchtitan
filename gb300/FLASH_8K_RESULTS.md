@@ -2198,3 +2198,11 @@ through steps 8-15 and ended inside the same-config spread (600/602 ended
 eager path, so no mechanism points at worse learning, but a longer run is
 the only way to close that. Next: stack with fp8 dense linears (810/811)
 and the dual-microbatch schedule.
+
+**Job 808 (dual, 8 slots, single expert AG/RS per pass, r02): 377.6 TFLOP/s
+steady (steps 17-20: 377-378), memory 233.5 GiB, loss normal.** Only +0.9%
+over 792, so the doubled expert gather/reduce-scatter was not the main cost;
+the schedule is still -6% vs the 401.3 baseline (777). Profiled dual run
+queued to see whether the comm-stream ops actually overlap compute and where
+the extra time sits (half-batch attention/expert efficiency, the spinning
+barrier's SM footprint, or the dispatch copies themselves).
