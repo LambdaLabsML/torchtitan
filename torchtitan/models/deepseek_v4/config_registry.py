@@ -642,6 +642,8 @@ def deepseek_v4_debugmodel_asyncep_policy(
     config.parallelism.expert_parallel_degree = 2
     config.parallelism.fsdp_reshard_after_forward = os.environ.get("FSDP_POLICY", "default")
     config.parallelism.fp8_expert_all_gather = os.environ.get("FP8_EXPERT_AG", "0") == "1"
+    if os.environ.get("TE_DENSE", "0") == "1":
+        _apply_te_dense(config)
     if os.environ.get("CUDNN_INDEXER", "0") == "1":
         assert _enable_cudnn_indexer(config) > 0
     if os.environ.get("FP8_DENSE", "0") == "1":
@@ -798,3 +800,38 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_fp8dense(
     + fp8 dense linears (wq_b, wo_a, wo_b, shared w13/w2)."""
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx(microbatch, seq_len)
     return _apply_fp8_dense(config)
+
+
+def _apply_te_dense(config: Trainer.Config) -> Trainer.Config:
+    """Swap the same dense ``Linear`` configs ``_apply_fp8_dense`` converts to
+    Transformer Engine's ``te.Linear`` (torchtitan/quantization/te_linear.py;
+    recipe via TE_DENSE_RECIPE). Job 837: TE beat the custom fp8 linear on
+    every shape and recipe."""
+    from torchtitan.models.common.linear import Linear
+    from torchtitan.quantization.te_linear import convert_linear_config
+    from torchtitan.quantization.utils import module_filter_fn
+
+    fqns = [f for f in FP8_DENSE_FILTER_FQNS if f != "auto_filter_small_kn"]
+    n = 0
+    for fqn, lc, parent, attr in list(config.model_spec.model.traverse(Linear.Config)):
+        if type(lc) is not Linear.Config or not module_filter_fn(lc, fqn, fqns):
+            continue
+        new_cfg = convert_linear_config(lc)
+        if isinstance(parent, list):
+            parent[attr] = new_cfg
+        else:
+            setattr(parent, attr, new_cfg)
+        n += 1
+    assert n > 0, "te dense: no linear converted"
+    config.comm.init_timeout_seconds = 1800
+    return config
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """Stack: dense-never + 4 slots + cuDNN fused indexer (441.4, job 807)
+    + Transformer Engine fp8/fp4 dense linears (TE_DENSE_RECIPE) in place of
+    the custom fp8 linear of the 450.8 config (job 829)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx(microbatch, seq_len)
+    return _apply_te_dense(config)
