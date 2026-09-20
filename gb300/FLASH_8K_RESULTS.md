@@ -2094,3 +2094,18 @@ i.e. across rack_r02 and rack_r03, and the inter-rack IB is not optimized.
 The 1.7% balanced-routing deficit therefore includes an unknown cross-rack
 penalty; 701 (r02) and 667 (r01) were single-rack. From here on all 8-node
 runs go through ``/mnt/dgxc/sbatch_rack.sh`` (or ``--partition=rack_rNN``).
+
+**8-node dual runs 776/778 deadlocked at the first backward (fixed).** py-spy on
+a hung EP pair (job 776, node 00002) showed both ranks' main threads blocked
+in Triton's first-time kernel load (``_init_handles`` for
+``reduce_topk_slots_kernel`` inside ``dispatch_backward_op``) while both GPUs
+sat at 100% spinning in an EP barrier on the comm stream. That is CUDA lazy
+module loading's documented hazard: loading a kernel needs the device idle,
+the device is spinning for the peer, and the peer is blocked in the same
+load. The single-stream schedule cannot hit it (the CPU never waits behind
+its own spin kernel). Fix: ``CUDA_MODULE_LOADING=EAGER`` in the dualmb
+launcher (commit 6424cf387). Cross-rack placement of 776/778 was a separate,
+now-enforced problem (single-rack rule, ``/mnt/dgxc/sbatch_rack.sh``).
+Relaunched single-rack on r02: 792 (``dualmb_s8_6x_v2``) and 793 (balanced).
+Baseline for the comparison: job 777 (dense-never, 4 slots = correct
+gradients, r03): **401.3 TFLOP/s**, loss 3.00 @20.
