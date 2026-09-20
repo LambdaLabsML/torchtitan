@@ -2296,3 +2296,24 @@ the 441 cuDNN-indexer baseline as job 812 for completeness.
 for the indexer baseline (807, same rack): -5.6%,** consistent with -6% on
 the 401 base. The two do not interact; the dual schedule's cost is the same
 in absolute terms (~0.6 s/step). Closes the dual-microbatch line: not adopted.
+
+**Without torchao (probe 821):** a minimal fp8 linear built the way
+Transformer Engine does it for Megatron -- one fused cast kernel emitting
+the row- and column-major e4m3 copies plus a per-tensor scale, weight cast
+cached across forward/recompute/backward, three ``torch._scaled_mm`` calls
+-- against bf16 and torchao's best (tensorwise, compiled), same node, fwd+bwd:
+
+| linear | bf16 | torchao tensorwise compiled | custom fp8 |
+| --- | --- | --- | --- |
+| wq_b | 5.66 ms | 6.58 | **4.97** |
+| wo_a | 5.10 | 4.40 | **3.41** |
+| wo_b | 5.10 | 4.68 | **3.41** |
+| w13 | 2.69 | 2.68 | **1.94** |
+| w2 | 1.42 | 1.68 | **1.22** |
+| per layer / per step (x86) | 19.97 ms / 1.72 s | 20.02 / 1.72 | **14.95 / 1.29 s** |
+
+Weight cast 0.2 ms per step per layer; output rel error vs bf16 3.7e-2
+(e4m3 per-tensor). So the library is the problem: same GEMMs, 25% less time
+per linear, ~0.43 s/step (~4% ceiling). Implemented as
+``torchtitan/quantization/custom_fp8.py`` (``CustomFloat8Linear``, enabled
+with ``FP8_DENSE_IMPL=custom``); 8-node run follows the debug smoke.
