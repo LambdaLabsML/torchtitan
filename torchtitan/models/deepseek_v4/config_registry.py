@@ -785,3 +785,12 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_fp8dense(
     """
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(microbatch, seq_len)
     return _apply_fp8_dense(config)
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_fp8dense(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """Stack: dense-never + 4 slots + cuDNN fused indexer (441.4, job 807)
+    + fp8 dense linears (wq_b, wo_a, wo_b, shared w13/w2)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx(microbatch, seq_len)
+    return _apply_fp8_dense(config)
