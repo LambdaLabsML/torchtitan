@@ -606,3 +606,44 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_profile(
     config.profiler.profiler_warmup = 3
     config.profiler.profiler_active = 2
     return config
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The best recipe with the dense parameters never resharded after forward.
+
+    The job-665 profile put the step near its communication floor (exposed
+    comm 14.1% of wall, FSDP all-gather 10.3% of kernel time). A plain
+    ``fsdp_reshard_after_forward="never"`` cannot run here: in the EP>1 path one
+    ``fully_shard`` covers experts and dense params alike, and the experts are
+    258 GiB per rank unsharded. ``dense-never`` splits them: experts keep
+    resharding, the 13.6 GiB of dense params stay resident so backward does
+    not re-gather them.
+
+    Expectation stated up front: dense params are ~5% of all-gather bytes, so
+    this removes ~2.5% of all-gather traffic, ~0.25% of GPU time. The lever
+    that would matter is gather BYTES (lower-precision parameter all-gather),
+    not gather count.
+    """
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2(microbatch, seq_len)
+    config.parallelism.fsdp_reshard_after_forward = "dense-never"
+    return config
+
+
+def deepseek_v4_debugmodel_asyncep_densenever(
+    seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
+) -> Trainer.Config:
+    """One-node EP=2 smoke test of the dense-never FSDP grouping."""
+    from torchtitan.distributed.activation_checkpoint import FullAC
+
+    config = deepseek_v4_debugmodel(seq_len)
+    config.model_spec = model_registry(
+        "debugmodel", seq_len=seq_len, moe_comm_backend="minimal_async_ep"
+    )
+    config.activation_checkpoint = FullAC.Config()
+    config.parallelism.expert_parallel_degree = 2
+    config.parallelism.fsdp_reshard_after_forward = "dense-never"
+    config.training.disable_cuda_graphs = True
+    config.training.steps = 2
+    return config
