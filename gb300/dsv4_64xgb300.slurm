@@ -35,6 +35,8 @@ source "$VENV/bin/activate"
 # EXTRA_PYTHONPATH appends side dependency dirs (e.g. the cuDNN DSA frontend
 # in /mnt/dgxc/pydeps-cudnn) without touching the shared venv.
 export PYTHONPATH="$WORKTREE:/mnt/dgxc/pydeps${EXTRA_PYTHONPATH:+:$EXTRA_PYTHONPATH}"
+# Optional fp32 matmul precision override (bfx9 default / tf32 / ieee).
+export TORCHTITAN_FP32_MATMUL_PRECISION=${TORCHTITAN_FP32_MATMUL_PRECISION:-bfx9}
 
 BRANCH=$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD)
 COMMIT=$(git -C "$WORKTREE" rev-parse --short HEAD)
