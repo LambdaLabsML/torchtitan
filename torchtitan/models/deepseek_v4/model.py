@@ -168,9 +168,22 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
                 ffn_in, scores, eids, counts
             )
 
+        experts_mod = moe.routed_experts.inner_experts
+        # Under dense-never the experts are their own FSDP unit. Two forward and
+        # two backward passes through it per block would all-gather and
+        # reduce-scatter the expert weights twice (job 792: 374 vs 401 TFLOP/s).
+        # Keep them unsharded between the halves and let only the second
+        # backward (half A, which autograd reaches last) reduce-scatter; FSDP2
+        # accumulates the first half's grads in the reduce dtype meanwhile.
+        fsdp = experts_mod if hasattr(experts_mod, "set_requires_gradient_sync") else None
+        if fsdp is not None:
+            fsdp.set_reshard_after_forward(False, recurse=False)
+            fsdp.set_requires_gradient_sync(False, recurse=False)
+            fsdp.set_reshard_after_backward(False, recurse=False)
+
         def experts(routed_in, n_e):
             with maybe_set_sparse_mesh():
-                return moe.routed_experts.inner_experts(routed_in, n_e)
+                return experts_mod(routed_in, n_e)
 
         def combine(routed_out, meta, ffn_in):
             return moe.routed_experts.token_dispatcher.combine(routed_out, meta, ffn_in)
@@ -203,15 +216,39 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         d_b, ev_db = on_comm(dispatch, f_b[0], 1)
         join(ev_da, d_a[0], d_a[1])
         e_a = experts(d_a[0], d_a[1])
+        if fsdp is not None:
+            # Backward reaches this before half A's expert backward: turn the
+            # gradient sync and the post-backward reshard back on for it.
+            e_a = _FsdpSyncOnBackward.apply(e_a, fsdp)
         c_a, ev_ca = on_comm(combine, e_a, d_a[2], f_a[0])
         join(ev_db, d_b[0], d_b[1])
         e_b = experts(d_b[0], d_b[1])
+        if fsdp is not None:
+            fsdp.reshard()  # free the unsharded experts after the second forward
         c_b, ev_cb = on_comm(combine, e_b, d_b[2], f_b[0])
         join(ev_ca, c_a)
         out_a = finish(c_a, *f_a)
         join(ev_cb, c_b)
         out_b = finish(c_b, *f_b)
         return torch.cat([out_a, out_b], dim=0)
+
+
+class _FsdpSyncOnBackward(torch.autograd.Function):
+    """Identity in forward; in backward re-enables gradient sync and the
+    post-backward reshard on the experts' FSDP unit (see _forward_dual_microbatch).
+    It sits on half A's expert output, so it runs after half B's post-backward
+    (which only accumulates) and before half A's (which reduce-scatters)."""
+
+    @staticmethod
+    def forward(ctx, x, fsdp_module):
+        ctx.fsdp_module = fsdp_module
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        ctx.fsdp_module.set_requires_gradient_sync(True, recurse=False)
+        ctx.fsdp_module.set_reshard_after_backward(True, recurse=False)
+        return grad, None
 
 
 _DUAL_MB_COMM_STREAM = None
