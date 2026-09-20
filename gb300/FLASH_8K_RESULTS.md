@@ -2317,3 +2317,9 @@ Weight cast 0.2 ms per step per layer; output rel error vs bf16 3.7e-2
 per linear, ~0.43 s/step (~4% ceiling). Implemented as
 ``torchtitan/quantization/custom_fp8.py`` (``CustomFloat8Linear``, enabled
 with ``FP8_DENSE_IMPL=custom``); 8-node run follows the debug smoke.
+
+**torchao tensorwise + per-linear compile, 8 nodes (job 820, r03): 398.6
+TFLOP/s vs 401 -- flat**, as the same-node microbenchmark predicted (20.02
+vs 19.97 ms per layer). Memory 234.55 GiB, loss 3.11 @20. That is the best
+torchao's Float8Linear can do on this model here; the torchao-free
+``CustomFloat8Linear`` (job 823, same rack) is the remaining question.
