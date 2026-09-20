@@ -2225,3 +2225,25 @@ rejects every one of these shapes (K=1024 for wq_b), and ran at exactly the
 baseline; do not use that filter on this model. A 1-GPU microbenchmark of
 the converted shapes (bf16 vs rowwise fp8, eager and compiled, and raw
 ``_scaled_mm`` vs ``mm``) follows to pin the mechanism.
+
+**Mechanism (probe job 816, 1 GPU, T=49152 rows, fwd+bwd per linear):**
+
+| linear | bf16 | fp8 rowwise, compiled | fp8 rowwise_with_gw_hp, compiled |
+| --- | --- | --- | --- |
+| wq_b 1024->32768 | 8.7 ms (1132 TFLOP/s) | 13.1 ms | 8.6 ms |
+| wo_a 4096->8192 | 5.9 ms (1682) | 16.9 ms | 9.8 ms |
+| wo_b 8192->4096 | 5.5 ms (1808) | 25.8 ms | 14.4 ms |
+| w13 4096->4096 | 3.1 ms (1604) | 13.6 ms | 6.7 ms |
+| w2 2048->4096 | 1.8 ms (1368) | 7.5 ms | 4.5 ms |
+| per layer, x86 per step | **2.15 s** | 6.61 s | 3.77 s |
+| raw GEMM 49152x4096x8192 | 1.69 ms (1957) | rowwise-scaled 1.22 ms (2702) | tensorwise-scaled 0.95 ms (3476) |
+
+The fp8 GEMM itself IS faster on GB300 (1.4x rowwise, 1.8x tensorwise), but
+torchao's Float8Linear spends 2-3.5x the bf16 time per linear on the dynamic
+amax/scale/cast of input, weight and grad-output plus the transposed
+re-casts the three backward GEMMs need; compile does not recover it (in
+several shapes it is slower compiled). bf16 dense GEMMs already run at
+1600-1800 TFLOP/s here, so the ceiling was small and the recipe overhead is
+far larger. The 8-node -18% is exactly the predicted +4.5 s/step. A leaner
+fp8 linear (tensorwise or delayed scaling, casts fused once per tensor) is
+the only version worth revisiting; the tensorwise recipe is probed next.
