@@ -119,3 +119,36 @@ def convert_linear_config(linear_config: Linear.Config) -> CustomFloat8Linear.Co
         if f.init
     }
     return CustomFloat8Linear.Config(**kwargs)
+
+
+def warmup_custom_fp8(model, *, num_tokens: int, device=None) -> int:
+    """Compile every cast kernel the model will need BEFORE training starts.
+
+    ``_cast_both`` / ``_cast_one`` are ``torch.compile``d with fixed shapes,
+    so their first call compiles. Inside the first forward that compile sits
+    between FSDP collectives on every rank, and a slow rank trips the NCCL
+    watchdog (job 823: all ranks aborted at the 300 s init timeout with no
+    other error). Warming up at build time moves the compiles out of any
+    collective's window. Returns the number of distinct graphs warmed.
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+    device = device or torch.device("cuda", torch.cuda.current_device())
+    shapes = set()
+    for m in model.modules():
+        if isinstance(m, CustomFloat8Linear):
+            n, k = m.weight.shape
+            shapes.add((num_tokens, k))  # x
+            shapes.add((num_tokens, n))  # dy
+            shapes.add(("w", n, k))
+    done = 0
+    for sh in sorted(shapes, key=str):
+        if sh[0] == "w":
+            _cast_one(torch.randn(sh[1], sh[2], device=device, dtype=torch.bfloat16))
+        else:
+            _cast_both(torch.randn(sh[0], sh[1], device=device, dtype=torch.bfloat16))
+        done += 1
+    torch.cuda.synchronize(device)
+    logger.info("custom fp8: warmed %d cast graphs for %d tokens", done, num_tokens)
+    return done
