@@ -84,6 +84,9 @@ def cudnn_indexer_select(
         sm_scale=1.0,  # idx_w already carries softmax_scale * H^-0.5
         return_softmax=False,
         deterministic=True,  # ties at the k-th boundary -> lowest key id
+        # Per-sequence ids; the default 'global' ids are offset by b * S_k
+        # across the batch (probe 804), which the consumer does not expect.
+        topk_indices_global=False,
     )
     indices = out["indices"].to(torch.int64)  # (B, S_q, k)
     return indices if batched else indices.squeeze(0)
