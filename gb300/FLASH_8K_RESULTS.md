@@ -2427,3 +2427,33 @@ epilogues are cuBLASLt's). Delayed scaling is the fastest fp8 recipe here
 (no per-call amax reduction on the critical path); NVFP4 is another 15% but is
 the aggressive recipe. Expected on the step over 829's 450.8: ~+0.8%
 (delayed/MXFP8) to ~+1.6% (NVFP4). Queued as branch ``dsv4_te_dense``.
+
+## New best: Transformer Engine delayed-scaling fp8 dense linears = 457.6 TFLOP/s (job 840)
+
+Branch ``dsv4_te_experts`` (worktree /mnt/dgxc/worktrees/teexp), config
+``deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense``,
+``TE_DENSE_RECIPE`` env, ``EXTRA_PYTHONPATH=/mnt/dgxc/pydeps-te:/mnt/dgxc/pydeps-cudnn``.
+``torchtitan/quantization/te_linear.py``: the torchtitan ``Linear`` keeps the
+parameter (FSDP2/optimizer/state dict untouched); an unregistered ``te.Linear``
+is created lazily on the first CUDA forward and its ``weight`` re-pointed at
+whatever Parameter object FSDP2 exposes at that moment; per-module
+``te.autocast``. Same 215 linears as the custom fp8 config. All on r02, nodes
+1-8, 20 steps, vs job 829 (custom fp8, 450.8):
+
+| recipe | TFLOP/s step 20 (steps 12-20 range) | peak memory | loss @20 |
+| --- | --- | --- | --- |
+| custom fp8 tensorwise (829) | 450.8 | 225 GiB | 3.32 |
+| TE MXFP8 (839) | 449.2 (449-450) | 225.1 GiB | 3.13 |
+| **TE fp8 delayed scaling (840)** | **457.6 (457-458)** | **221.2 GiB** | 2.99 |
+| TE NVFP4 (841) | 449.2 (448-449) | 221.7 GiB | 2.98 |
+
++1.5% for delayed scaling, matching the 1-GPU probe's ordering for fp8
+(delayed < MXFP8 ~ current < custom) but not for NVFP4, whose probe advantage
+(10.9 vs 12.8 ms per set) did not survive in situ -- its Hadamard-transform
+casts and fp4 weight handling land on the critical path where the probe's
+back-to-back GEMMs hid them. Delayed scaling also frees 4 GiB (no per-call
+amax reductions, fp8 weight cache). Losses are all inside the run-to-run
+band (see 600/602). **Adopt: 457.6 is the new number.** This closes the
+"torchao vs TE" review: the dense linears were the one place TE pays; the
+grouped experts (above) do not, and nothing else torchao-backed remains in
+the recipe.
