@@ -764,6 +764,30 @@ def _apply_fp8_dense(config: Trainer.Config) -> Trainer.Config:
     already-built recipe."""
     from torchtitan.config.transform.quantization import Float8LinearConverter
 
+    if os.environ.get("FP8_DENSE_IMPL", "torchao") == "custom":
+        # torchao-free tensorwise fp8 linear with cached weight casts
+        # (torchtitan/quantization/custom_fp8.py; probe 821).
+        from torchtitan.models.common.linear import Linear
+        from torchtitan.quantization.custom_fp8 import convert_linear_config
+        from torchtitan.quantization.utils import module_filter_fn
+
+        fqns = [f for f in FP8_DENSE_FILTER_FQNS if f != "auto_filter_small_kn"]
+        n = 0
+        for fqn, lc, parent, attr in list(config.model_spec.model.traverse(Linear.Config)):
+            if type(lc) is not Linear.Config or not module_filter_fn(lc, fqn, fqns):
+                continue
+            new_cfg = convert_linear_config(lc)
+            if isinstance(parent, list):
+                parent[attr] = new_cfg
+            else:
+                setattr(parent, attr, new_cfg)
+            n += 1
+        assert n > 0, "custom fp8: no linear converted"
+        return config
+
+    # FP8_DENSE_RECIPE: tensorwise (default; the only recipe whose compiled
+    # fwd+bwd beat bf16 on GB300 in probe 817), rowwise, rowwise_with_gw_hp.
+    recipe = os.environ.get("FP8_DENSE_RECIPE", "tensorwise")
     conv = Float8LinearConverter(
         Float8LinearConverter.Config(
             recipe_name="rowwise", filter_fqns=list(FP8_DENSE_FILTER_FQNS)
