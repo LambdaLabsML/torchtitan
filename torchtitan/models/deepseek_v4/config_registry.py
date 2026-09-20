@@ -809,6 +809,10 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_fp8dense(
     fuse (eager fp8 casts can eat the gain).
     """
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(microbatch, seq_len)
+    # First-step compiles of the fp8 cast graphs can exceed the 300 s default
+    # while FSDP collectives are pending (job 823); warm-up handles the known
+    # shapes, this covers anything it misses.
+    config.comm.init_timeout_seconds = 1800
     return _apply_fp8_dense(config)
 
 
