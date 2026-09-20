@@ -1333,3 +1333,628 @@ found on the old stack and re-applied here: the out-of-place relu in
 MinimalAsyncEP's ``isinstance(..., FullAC.Config)`` gate to accept eager SAC
 policies (they recompute the dispatcher's ops, so the symmetric-buffer
 aliasing the gate protects against cannot happen).
+
+## cuDNN fused DSA backward (branch `dsv4_cudnn_dsa_backward`)
+
+**253.2 TFLOP/s, a new best -- +48.5% over the 170.5 baseline.** Same recipe,
+same 8 nodes, 4x microbatch; the only change is that the DSA backward runs on
+cuDNN's `sparse_attention_backward` instead of flex's generated backward. The
+forward still runs flex under `no_grad`, so it is bitwise unchanged.
+
+| arm | job | TFLOP/s |
+| --- | --- | --- |
+| flex backward (baseline) | 582 | 169.7 / 170.7 / 170.5 |
+| cuDNN backward | 583 | 255.1 / 255.5 / 254.9 |
+| cuDNN backward (confirm, later commit) | 594 | 254.0 / 253.1 / 252.5 |
+
+Microbenchmark at the production shape (T=8192, H=64, D=512, topk=512):
+**3.62x** on fwd+bwd, 79.4 -> 22.0 ms.
+
+### Two conventions the kernel cares about, both silent when wrong
+
+1. **`lse` excludes the sink.** The argument is the KV-only logsumexp; the
+   kernel folds `attn_sink` in itself (`_interface_sm100.py:200`). Passing
+   `logaddexp(lse, sink)` double-counts it. The damage is proportional to the
+   sink's share of the softmax mass, so it is invisible on long rows and
+   ruinous on short ones: dq went 2.4e-3 -> 5.6e-2 and d_sink -> 2.7e-1, with
+   the error concentrated entirely in rows with few valid keys.
+2. **Indices want compacting**, valid entries packed to the front with a `-1`
+   tail and a per-row `topk_length`, ascending. cuDNN ships `_compactify` for
+   exactly this.
+
+Accuracy against an fp64 reference, at microbatch 1/2/4: cuDNN is **better**
+than the backward it replaces -- dq 2.7e-3 vs flex 3.4e-3, dkv 2.6e-3 vs
+4.1e-3.
+
+### Do not read grad_norm as a correctness signal here
+
+The cuDNN arm showed grad_norm 26.8 at step 18 against flex's 8.2, which looks
+alarming and is not. Two *identical* flex runs (591, 593) give step-1 loss
+12.2244 vs 12.2135 and grad_norm 53.51 vs 50.79, then diverge to 12.61 vs 6.54
+by step 2 and 56.6 vs 314.3 by step 3. Early training here is chaotic and the
+run is nondeterministic. The cuDNN arm's step-1 numbers (12.354, 53.27) sit
+inside the flex-vs-flex spread; step-1 is the only point where the two arms
+are comparable at all.
+
+### Gotchas
+
+- `head_dim` must be 512 or 576, and the head count must divide 128 on SM100+.
+- The frontend is not in the shared venv; it lives in `/mnt/dgxc/pydeps-cudnn`
+  and the launcher now takes `EXTRA_PYTHONPATH` to add it.
+- A reference mask built with `scatter_(1, idx.clamp(min=0), valid)` is wrong:
+  every `-1` pad maps to column 0 and can overwrite the genuine key there.
+  Route invalid slots to a throwaway column instead. This produced a fake
+  1/length error curve that cost a full debugging cycle.
+
+## Full cuDNN attention + num_stages=2 (branches `dsv4_cudnn_dsa_full`, `dsv4_cudnn_stack`)
+
+**367.7 TFLOP/s**, the best measured. All 8 nodes, 20 steps, same recipe
+otherwise.
+
+| arm | job | TFLOP/s | peak mem |
+| --- | --- | --- | --- |
+| flex bwd, 4x (baseline) | 582 | 170.5 | 181 GiB |
+| flex bwd + num_stages=2, 6x/EP=2 | 595 | 206.0 | 244 GiB |
+| cuDNN bwd, 4x | 583/594 | 253.2 | 181 GiB |
+| cuDNN bwd, 6x/EP=2 | 596 | 289.4 | 242 GiB |
+| cuDNN bwd + num_stages=2, 6x/EP=2 | 597 | 298.0 | 242 GiB |
+| cuDNN full (fwd+bwd), 4x | 599 | 307.3 | 181 GiB |
+| **cuDNN full, 6x/EP=2** | **600** | **367.7** | 243 GiB |
+
+### What stacks with what
+
+- **num_stages=2** (from a coworker's profile: the pinned `num_stages=1` left
+  the Triton loop with no software pipelining) is worth +24% against a flex
+  backward but only **+3.0%** once cuDNN owns the backward (289.4 -> 298.0) --
+  same absolute saving, smaller slice. It is a **no-op** on the full-cuDNN
+  path: all 43 attention layers (CSA, HC and SWA alike) delegate to
+  `DSV4FlexInnerAttention._forward_impl`, so with `fused_dsa_forward` on there
+  is no flex kernel anywhere for `kernel_options` to reach.
+- **6x/EP=2 over 4x/EP=1** is worth +14.3% on the backward-only path and
+  +19.6% on the full path. The old 4x operating point was inherited from the
+  flex era and was too small once the attention got cheap.
+- **Fusing the forward** is worth +21.4% at 4x and +19.6% at 6x/EP=2. It also
+  retires the block mask, a dense [B, n_q_blocks, n_kv_blocks] scatter built
+  per layer per step purely to drive flex.
+
+Job 600 also had the best loss and lowest grad_norm of any arm (3.298 / 5.27 at
+step 20 vs 3.34-4.00 and 8.4-16.5), consistent with both cuDNN kernels landing
+closer to an fp64 reference than the flex ones -- but it is one seed, and these
+runs diverge chaotically, so it is not evidence on its own.
+
+### Not worth doing: the cuDNN indexer
+
+cuDNN also ships `indexer_forward` / `indexer_top_k`, but the whole PyTorch
+indexer (einsum scoring + causal mask + stable sort + slice) costs **0.89
+ms/call** at the production shape against 22.0 ms for the cuDNN attention --
+~4%, of which the sort is 0.28 ms. It is also inapplicable: the bf16 indexer
+requires 32 or 64 query heads per KV head and this model has 8.
+
+## Both halves of DSA on cuDNN (branch `dsv4_cudnn_dsa_full`)
+
+**367.7 TFLOP/s -- +116% over the 170.5 baseline.** 8 nodes, 20 steps.
+
+| config | job | TFLOP/s | memory |
+| --- | --- | --- | --- |
+| flex backward, 4x (baseline) | 582 | 170.5 | 181 GiB |
+| flex backward + `num_stages=2`, 6x/EP=2 | 595 | 206.0 | 244 GiB |
+| cuDNN backward, 6x/EP=2 | 596 | 289.4 | 242 GiB |
+| cuDNN backward + `num_stages=2`, 6x/EP=2 | 597 | 298.0 | 242 GiB |
+| cuDNN full (fwd+bwd), 4x | 599 | 307.3 | 181 GiB |
+| **cuDNN full, 6x/EP=2** | **600** | **367.7** | 243 GiB |
+| cuDNN full + `num_stages=2` (control) | 602 | 366.9 | 243 GiB |
+
+### `num_stages=2` stacks, but only where flex survives
+
++24% on a flex backward (172.45 -> 214.11, measured elsewhere at 6x/EP=2),
++3.0% on top of the cuDNN backward (289.4 -> 298.0), and **nothing at all** on
+the full path (367.7 vs 366.9, job 602 run as a deliberate control). All 43
+attention layers delegate to `DSV4FlexInnerAttention._forward_impl`, so once
+`fused_dsa_forward` is on there is no Triton template anywhere in the attention
+for `kernel_options` to reach.
+
+### The forward is worth more than the tile tuning
+
+Moving the forward to cuDNN on top of the backward: 289.4 -> 367.7 at the same
+operating point, **+27%**, and 23% clear of backward+`num_stages=2`. It deletes
+the flex forward and the block mask together -- the mask was a dense
+`[B, n_q_blocks, n_kv_blocks]` scatter built per layer per step for a kernel
+that no longer runs.
+
+### Coverage
+
+All three attention classes are affected, not just CSA: 21
+CompressedSparseAttention, 20 HeavilyCompressedAttention, 2
+SlidingWindowAttention, all sharing `_forward_impl`. HCA and SWA skip the
+indexer entirely (the selection branches on `compress_ratio`), so they produce
+index shapes the CSA tests never generate. 10 tests cover all three at
+microbatch 1 and 4; cuDNN's forward is closer to fp64 than flex's
+(out 2.11e-3 vs 2.69e-3).
+
+### Not worth doing: the cuDNN indexer
+
+cuDNN also ships `indexer_forward` / `indexer_top_k`. Our PyTorch indexer
+(einsum + stable sort) costs **0.89 ms/call** at production shape, of which the
+sort is 0.28 ms, against 22.0 ms for the cuDNN attention -- about 4%. It is
+also inapplicable: the bf16 indexer requires `qhead_per_kv_head` of 32 or 64
+and this model has 8. FlashMLA (what Megatron uses for the forward) is not
+installed and needs a source build for aarch64/sm_103; cuDNN's own
+`sparse_attention_forward` made that unnecessary.
+
+## Shared-expert overlap and bf16 mHC projections
+
+| config | job | TFLOP/s | memory |
+| --- | --- | --- | --- |
+| cuDNN full, 4x | 599 | 307.3 | 181 GiB |
+| cuDNN full + overlap, 4x | 615 | **347.6** | 221 GiB |
+| cuDNN full, 5x | 617 | 355.7 | 219 GiB |
+| cuDNN full + overlap, 5x | 616 | 354.8 | 253 GiB |
+| cuDNN full, 6x | 600 | 367.7 | 243 GiB |
+| cuDNN full + bf16 mHC + overlap, 5x | 618 | 375.4 | 249 GiB |
+| **cuDNN full + bf16 mHC, 6x** | 619 | **387.7** | 237 GiB |
+
+### The overlap's win does not survive a larger batch
+
+Shared-expert overlap is worth **+13.1% at 4x** (347.6 vs 307.3) and **nothing
+at 5x** (354.8 vs 355.7, i.e. zero within noise). The 5x control is what makes
+that visible; without job 617 the 5x overlap number reads as a win against the
+4x baseline.
+
+The mechanism explains it. The exposed cost is a peer copy plus a fixed EP
+barrier, and a larger microbatch amortises the fixed part over more tokens, so
+there is less exposure left to recover. The batch curve is also steeper than
+linear -- 307.3 -> 355.7 -> 367.7 for 4x/5x/6x -- so plain 5x already reaches
+what the overlap bought at 4x, and does it **without the overlap's ~40 GiB**.
+
+It also cannot reach 6x: the overlap costs ~40-47 GiB (221 vs 181 at 4x; 261 vs
+214 in jobs 614/613 at 6x), and 243+47 exceeds the 277 GiB card. Job 611 hit
+exactly that and degraded into an `expandable_segments` retry loop rather than
+failing cleanly.
+
+**Conclusion: keep the code, do not enable it at the 6x operating point.** It
+is the right fix for the exposed dispatch, but the exposure it targets is
+already small where we actually run.
+
+### bf16 mHC projections: +5.4%, but it is a precision change
+
+Job 619 is the new best at **387.7 TFLOP/s**, +5.4% over 367.7, at 6 GiB less
+memory. It removes the `cublasLt_bf16x9_inf_patching` kernels -- fp32 GEMMs
+emulated as nine bf16 products, 770 ms / 2.7% of GPU kernel time in the
+job-610 profile.
+
+Measured against an fp64 reference at the production shape, however:
+
+| projection | rel-err vs fp64 | after the sigmoid (max abs) |
+| --- | --- | --- |
+| fp32 (main) | 6.1e-07 | 1.5e-06 |
+| bf16 (this change) | **1.7e-03** | 8.2e-04 |
+
+2718x worse. The cause is the output dtype, not the accumulation: both paths
+feed the GEMM the same bf16-valued inputs, but ``F.linear`` on bf16 inputs
+returns bf16, so the result is rounded to ~3 digits before the sigmoid and the
+Sinkhorn. The error lands directly on the hyper-connection mixing gates.
+
+Whether 1.7e-3 on those gates is acceptable is a modelling call, not a
+throughput one, and **loss cannot answer it** -- see the run-to-run spread
+documented above. Job 619's step-19 grad_norm of 15.75 against 8.65 for the
+others is inside the spread we have measured and should not be read either way.
+
+## TF32 for the fp32 matmuls: 394.7 TFLOP/s, and no precision question
+
+`fp32_precision="bfx9"` is torchtitan's sm_100+ default -- the most accurate
+tensor-core option for fp32 matmuls, at nine bf16 products per fp32 product.
+The dsv4 mHC projections are the main consumer, and their inputs are
+*bf16-valued*, so they are exactly representable in TF32's 11-bit mantissa.
+That makes TF32 nearly free accuracy-wise here and much cheaper.
+
+Measured on the projection `[49152,4096] x [4096,24]`:
+
+| mode | rel-err vs fp64 | time |
+| --- | --- | --- |
+| bfx9 (default) | 2.7e-07 | 0.463 ms |
+| **tf32** | **7.3e-06** | **0.132 ms** |
+| ieee fp32 | 6.1e-07 | 0.317 ms |
+| bf16 output | 1.7e-03 | 0.241 ms |
+
+End to end at 6x/EP=2: **394.7 TFLOP/s (job 622)**, against 387.7 for the bf16
+variant and 367.7 for the bfx9 baseline. TF32 is both faster than the bf16
+change *and* 227x more accurate, so it supersedes it -- take
+`TORCHTITAN_FP32_MATMUL_PRECISION=tf32`, drop `dsv4_mhc_bf16_proj`.
+
+The emulation was also bigger than first counted: matching only
+`bf16x9|inf_patching` missed `cutlass3x_sm100_..._9xbf16gemm` (730 ms), so the
+real total was ~5.3% of GPU kernel time, not 2.7%.
+
+### On reading loss
+
+Job 619's loss looked alarming until job 602 -- a `num_stages=2` run on the
+full-cuDNN path, which is a **proven functional no-op** (366.9 vs 367.7) --
+came in at loss 3.871 / grad_norm 17.54 against job 600's 3.298 / 5.27 on the
+identical config. 619 (3.631 / 13.82) sits inside that spread. Two runs that
+compute the same thing differ more than the precision change did. The fp64
+check is what caught the real 1.7e-3 regression; the loss never would have.
+
+### Refuted while profiling
+
+The MoE experts **do** use true grouped GEMMs -- the top kernels are 258-516
+calls at ~3.3 ms each, about 6 per layer, not 256 per-expert launches. An
+earlier bucket showing "grouped GEMM 0.01%" was a kernel-name matching failure,
+not a real finding.
+
+## Activation offload to Grace memory (branch `dsv4_activation_offload`)
+
+**Built, proven exact, and measured as not able to pay on this hardware at
+8k.** The mechanism works; the arithmetic does not.
+
+`OffloadAC` streams a chosen set of blocks' saved activations to pinned host
+memory over NVLink-C2C instead of recomputing them (FullAC on the rest), and
+prefetches them one offloaded block ahead of the backward. It coexists with
+MinimalAsyncEP by snapshotting the two saved tensors that alias its two-slot
+symmetric pool (the dispatch output the expert GEMM saves, and
+`routed_output_ND` from combine) before the next block can overwrite them.
+
+### Exactness
+
+On the standard backend, no-AC, FullAC and OffloadAC are **bitwise identical**
+at steps 1 and 2 (loss 8.20784 / grad 3.3010 -> 6.94347 / 3.5081). On
+MinimalAsyncEP, all-blocks offload reproduces the saved-activation truth
+(3.3010) to the digit. Two identical deterministic controls match bitwise, so
+these comparisons have a zero noise floor.
+
+### Why it cannot pay here (job 654 sizing)
+
+A block saves **13.56 GiB per 8192 tokens** -- 1.7 MB per token per block,
+dominated by the MoE's `top_k=8` expansion and the 64x512 attention tensors --
+so **~81 GiB per block at 6x**.
+
+| constraint | number | consequence |
+| --- | --- | --- |
+| C2C bandwidth | 133 GB/s per direction | one block = 0.6 s each way vs **~70 ms to recompute it**: offload is **~9x costlier than recompute per token**, at any batch size |
+| all 43 blocks' D2H | 26 s | vs a 12 s step; at most ~5 blocks can hide inside the forward (~3%) |
+| device, `prefetch_depth=1` | 243 + 81 GiB at 6x | exceeds the 277 GiB card; 5x too; only <=4x fits (base 307, not 368) |
+| host, ~250 GB/rank | ~3 blocks at 6x | ~1.7% |
+
+Job 651 (six blocks at 6x) died by **SIGKILL from the host OOM killer** before
+its first step: 6 x 81 GiB pinned per rank x 4 ranks on a 1.2 TB node. That is
+arithmetic, not misfortune. Megatron's variant is *fine-grained* -- selected
+small tensors, FP8 activations -- precisely because the whole-block volume is
+this large; and the tensors cheap enough to move are also cheap to recompute.
+
+### Three bugs found on the way, two mine and one torchtitan's
+
+- Address-keyed dedupe served stale data once the device tensor was freed
+  (24% gradient error at step 1). Removed.
+- Restored views lost their strides; compiled backwards assert them. Offload
+  the covering storage span and rebuild with `as_strided`.
+- **`Module.init_states` reordered initialization whenever wrapped and
+  unwrapped layers were mixed**: its queue appended a `CheckpointWrapper`'s
+  children to the end, so uniform trees initialized 0,1,2,3 but a mixed tree
+  initialized e.g. 3,0,1,2 -- different RNG draws behind the hash routing
+  table and parameter init, hence a differently initialized model from the
+  same seed (block-0 output norm 4128.6 vs 4134.4 vs 4128.1). Any per-layer
+  AC policy would trigger it. Fixed: children go to the front (depth-first);
+  uniform orders unchanged, mixed now match.
+
+### A finding about the existing recipe
+
+On MinimalAsyncEP, **FullAC's recompute through the symmetric pool carries a
+small, deterministic gradient deviation** from the saved-activation truth:
+grad_norm 3.2968 vs 3.3010 at step 1 (0.13%), compile-independent. Nobody had
+a reference to see it before. Small, but it is the control that is off, not
+the offload.
+
+### Also measured
+
+Grace-side pinned allocation costs ~300 ms/GiB (pool it, never per step); a
+node has ~1.2 TB shared by four ranks; `saved_tensors_hooks` fire inside
+`fullgraph=True` regions and custom `autograd.Function`s; FSDP2's unsharded
+parameters are leaf `nn.Parameter`s, so `is_leaf` cleanly skips weights.
+
+### The two configurations that fit, measured
+
+**Job 655 -- 4x, four blocks (1, 12, 23, 34), `prefetch_depth=1`.** Ran
+correctly (host pool 200 GiB peak per rank, 149 GiB steady) but the one
+resident prefetched block (~54 GiB at 4x) plus tensors lingering until their
+D2H retires put the device at **94-95%** on a config whose FullAC baseline is
+181 GiB. It thrashed the allocator -- 52 `expandable_segments` warnings -- and
+throughput collapsed step over step:
+
+| step | TFLOP/s | memory |
+| --- | --- | --- |
+| 2 | 45.2 | 262.7 GiB |
+| 3 | 42.5 | 261.7 GiB |
+| 4 | 31.0 | 258.9 GiB |
+| 5 | 26.6 | 260.9 GiB |
+
+against **307.3** for plain 4x. Cancelled at step 5: a step-20 number would
+have measured thrash, not the offload.
+
+**Job 656 -- the same with `prefetch_depth=0`** removes the resident block, so
+the run pays the C2C cost as visible on-demand H2D stalls (~0.4 s per block
+at 4x) and nothing else. That is the fair measurement of what whole-block
+offload costs here; result below when it lands.
+
+**Job 656 result -- 4x, four blocks, `prefetch_depth=0`.** Steady state before
+the allocator degraded (steps 10-15): **219-229 TFLOP/s vs 307.3 plain, i.e.
+-25%**, almost exactly the bandwidth arithmetic (4 blocks x ~0.4 s x 2
+directions on a ~14 s step). Then the same collapse as 655 -- 229 -> 163 -> 73
+-> 33 -> 18.6 over steps 15-19, 50 `expandable_segments` warnings -- and it
+ended at step 19 (killed after a rank failed).
+
+Device memory sat at 244-264 GiB (88-95%) even without prefetch. Diagnosis:
+restore buffers are allocated inside the H2D stream context, so the caching
+allocator files them under that stream's pool; after `record_stream(cur)`
+they return to *that* pool, which the main stream cannot draw from, so a
+second ~54 GiB pool grows beside the main one on top of D2H sources lingering
+until their copies retire. Fixable (allocate restores on the current stream,
+copy on the H2D stream) but irrelevant to the verdict: the -25% in the clean
+steps is the copy cost alone.
+
+**Verdict: whole-block activation offload is ruled out three independent ways
+on GB300 at 8k for this model** -- host capacity (651), device headroom (655),
+raw C2C bandwidth (656). 394.7 TFLOP/s with TF32 stands as the best.
+
+## Megatron-LM #4468 follow-ups: fused mHC and fused output RoPE
+
+Picked from the issue by measured weight in the job-610 profile: the mHC path
+(~4.5% of GPU time, ~15 kernels per block) and the output inverse RoPE
+(2.33% + 0.90% bwd, because Inductor copies the whole [T, H, 512] output to
+rotate a 64-wide tail). Both are Triton ports from the Megatron clone:
+fused_mhc_kernels.py (#3828/#4624) and fused_mla_yarn_rope_apply.py with the
+in-Function inverse-RoPE design of #7036 / #5526.
+
+### Finding: torchtitan's DeepSeek-V4 mHC does not mix the residual streams
+
+Porting Megatron's ``h_post_bda`` exposed it. torchtitan's ``HcPost`` computes
+
+    torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+
+which broadcasts comb's FIRST index against the residual's stream index and
+sums comb's SECOND, i.e. ``(sum_j comb[t, i, j]) * residual[t, i]``. Sinkhorn
+makes ``comb`` doubly stochastic, so that row sum is ~1 and the term equals the
+residual to 1e-16 (checked numerically). The genuine mix ``sum_j comb[t, i, j]
+* residual[t, j]`` -- what the paper defines and Megatron's
+``native_h_post_bda`` (``h_res.T @ residual``) computes -- differs from the
+residual by 84%. Net: the 20 Sinkhorn iterations per block produce a matrix
+whose only forward effect is a scale of ~1; mHC degenerates to per-stream
+``residual + post * x``.
+
+This is upstream torchtitan's semantics from the original model commit
+(``0ff246463``), preserved exactly by the leaf-compile rewrite -- not something
+our branches introduced. Worth an upstream issue. A fix is one broadcast
+(``residual.unsqueeze(1)``), but it changes the model: loss curves before and
+after are not comparable.
+
+### Fused mHC (branch `dsv4_fused_mhc`): correct kernels, ~0.4% to gain
+
+Kernels match: ``hc_pre`` y 1.7e-5 / post 4e-8 / comb 1e-7 against the
+compiled math, grads to bf16 rounding. ``hc_post`` implements the GENUINE mix,
+so it disagrees with production by design (out 0.64, g_res 1.0, g_comb 1.2;
+the shared ``post * x`` term and its grads match to 1e-5).
+
+Timing at 6x (T = 49152), fwd+bwd, per call: hc_pre compiled 11.26 ms vs fused
+10.95; hc_post 7.85 vs 7.58. Per step (86 + 86 calls): **1644 -> 1593 ms,
+~0.4% of a 12 s step.** The compiled path is already at the bandwidth floor
+on [T, 4, 4096] bf16; the Sinkhorn fusion is real but small (0.8%). Not worth
+a run on throughput grounds -- the branch's value is the finding above, and a
+correct fused implementation if the mixing is fixed.
+
+### Fused output inverse RoPE (branch `dsv4_fused_output_rope`)
+
+Kernel exact vs ``_rotate_tail`` (3e-6, head bitwise untouched, round trip
+4.4e-4). **Compiled ``_o_rope_inverse`` 3.404 ms vs fused in-place 0.219 ms
+(15x)**, out-of-place (for gradients) 1.02 ms -- per step ~439 -> ~63 ms,
+about 3% of the step. Also caches the window-index build (eager ``clamp_min +
+arange``, identical every step, 1.2% of GPU time).
+
+End to end inside ``_CudnnDsaBackward`` the fused output's tail is wrong
+(rel-err ~0.5 with the head bitwise equal) while the kernel is exact in
+isolation -- under investigation; result below.
+
+**Root cause of the end-to-end mismatch: Triton autotuning an in-place
+kernel.** ``@triton.autotune`` benchmarks every config on the REAL arguments,
+so an in-place rotation runs once per trial on the first call for a given
+``(RD, H)`` and leaves the tail rotated eight-plus times. That is why the branch
+that happened to run first (cuDNN forward) came out uncorrelated with every
+reference (rel 1.41) while the second (flex forward) was exact to 1e-5, and
+why the first e2e case had wrong gradients too (the multiply-rotated ``out``
+was saved and un-rotated once in backward). The out-of-place unit test never
+saw it: benchmarking an idempotent kernel is harmless. Megatron's in-place
+kernel carries ``restore_value=["DO"]`` for exactly this; the port dropped it.
+Fixed with ``restore_value=["out_ptr"]``. A second, benign effect: the fused
+Function un-rotates ``o`` in place during backward by design, so any test must
+snapshot ``o`` before ``backward()``.
+
+Lesson for the ledger: never autotune an in-place Triton kernel without
+``restore_value``, and never read a fused Function's output after its backward.
+
+**Fused output RoPE, validated end to end after the fix:** output bitwise
+identical to ``_o_rope_inverse`` at T=512 (microbatch 1 and 4) and T=1024;
+gradients q/swa_k/cmp_k/sink within 1.0e-3 / 1.2e-3 / 1.1e-3 / 1.8e-3 -- the
+cost of un-rotating a bf16-rounded ``out`` in backward, the same trade
+Megatron's "recompute RoPE during bwd" makes. Committed on
+``dsv4_fused_output_rope``; 8-node run queued against the 394.7 baseline
+(job 622, same recipe and operating point). Expected: ~3% from the rotation
+plus ~1.2% from the cached window indices.
+
+**Job 664 -- fused output RoPE + cached window indices, 6x/EP=2, TF32:
+397.1 TFLOP/s vs 394.7 (job 622), +0.6%; memory 237.0 vs 242.7 GiB
+(-5.7 GiB); loss 3.288 / grad_norm 5.86 at step 20, squarely normal; no
+errors.** Real but well under the ~4% the microbenchmarks projected (3.40 ->
+0.22 ms per rotation, 439 -> 63 ms per step; plus the 1.2% clamp_min). A
+profiled run diffed against job 610's trace follows, to separate "the fusion
+does not engage in situ" from "profile kernel-time percentages are summed
+across overlapping streams and do not convert to wall time" -- the latter
+being the recurring lesson of this campaign (mHC fusion 0.4%, this 0.6%):
+Inductor's memory-bound kernels are not where the wall time is.
+
+**Why +0.6% and not ~4% (job 665 profile vs job 610):** the fusion engages
+fully -- the compiled rope kernels (664 + 257 ms per 2 steps) are gone,
+replaced by 141 ms of fused kernel, a net -780 ms, exactly the microbenchmark.
+The saving just does not reach the step time. Between the two traces
+compute-busy fell 87.1% -> 84.5% of wall while **exposed communication rose
+11.4% -> 14.1%** (+390 ms per 2 steps): NCCL waits grew 750 ms and the EP
+barrier 300 ms. At 6x the step is paced by FSDP collectives and EP barriers,
+and main-stream compute removed above that floor is partly refunded as
+waiting. TF32's ~1.4 s/step of removed compute converted to wall at ~65%
+(367.7 -> 394.7); the rope fusion's ~0.39 s/step at ~18% -- attention is where
+FSDP hides the expert all-gather, so shortening it exposes that all-gather.
+(The trace pair conflates the two: job 610 predates TF32; its 2826 ms of
+bfx9 emulation kernels are absent in 665. The unprofiled numbers separate
+them: TF32 +7.3%, rope fusion +0.6%.)
+
+**Campaign-level lesson:** every elementwise fusion since the cuDNN attention
+(mHC 0.4%, output RoPE 0.6%) has underdelivered its kernel-time share by
+~5x. The remaining lever is the communication floor itself, not compute:
+FSDP all-gather + reduce-scatter are 17.8% of kernel time (10.3 + 7.1) and
+increasingly exposed. Candidates: ``fsdp_reshard_after_forward="never"`` for
+the dense (non-expert) parameters so backward does not re-gather them --
+memory we now have 5.7 GiB more of -- fewer, larger FSDP buckets, or a
+lower-precision parameter all-gather. The EP barrier's growth (+300 ms) also
+points at rank load imbalance worth measuring.
+
+## `fsdp_reshard_after_forward`: "never" cannot run here; "dense-never" is a free +1.1%
+
+A plain ``"never"`` is infeasible on dsv4_flash under EP: the EP>1 path in
+``apply_fsdp_to_decoder`` shards experts and dense parameters in ONE
+``fully_shard`` call (per-parameter mesh), so the flag would keep the experts
+resident -- **258 GiB per rank unsharded** at EP=2 (277B expert params). The
+dense set is 7.31B params, 13.6 GiB. Added ``"dense-never"``: experts get their
+own FSDP unit on the sparse mesh (still resharding), the block keeps only the
+dense parameters and never reshards them, so backward does not re-gather them.
+
+| | default (job 664) | dense-never (job 667) |
+| --- | --- | --- |
+| TFLOP/s | 397.1 | **401.4 (+1.1%)** |
+| peak memory | 237.0 GiB | 236.2 GiB |
+| loss / grad_norm @20 | 3.288 / 5.86 | 3.367 / 8.86 (normal band) |
+
+**New best: 401.4 TFLOP/s** (cuDNN full + TF32 + fused output RoPE + window
+cache + dense-never, 6x/EP=2).
+
+Verified, not assumed: a same-branch fixed-seed one-node pair gives bitwise
+identical loss (6.98167) with 4/4 blocks logging engagement -- the policy
+touches communication only. At 8 nodes (job 670, profiled): 43/43 blocks
+engaged; **AllGather launches 356 -> 268 (-24.7%)**, exactly the predicted
+one-in-four per block per step; AllGather time only -5% (bytes are
+expert-dominated, as computed); ReduceScatter launches unchanged. Profiled
+wall vs the same-baseline trace (job 665): 22.2 -> 21.6 s (-2.6%).
+
+Why the peak memory did not move: FSDP2 frees a block's unsharded dense
+parameters after ITS backward, so the resident set shrinks as backward
+proceeds; the peak lands late in backward where only a few blocks (~1 GiB)
+remain. The gain comes from removing 43 dense all-gathers from the backward
+critical path (each sits right before a block's recompute), not from bytes.
+
+**Where the remaining communication lever is:** all-gather bytes are ~95%
+experts (two gathers per block per step under FullAC: forward and the
+backward recompute). Gather COUNT is now minimal; the next step is gather
+BYTES -- a lower-precision (fp8/mxfp8) parameter all-gather for the experts
+(Megatron's "FP8 primary weight gather", #5470) would halve ~1 s/step of
+expert gathers.
+
+## FP8 all-gather of the expert weights (Megatron-LM #5470's idea)
+
+Gather COUNT is minimal after dense-never; the remaining cost is gather BYTES,
+~95% experts, two gathers per block per step under FullAC (forward + backward
+recompute). Implemented with FSDP2's tensor-subclass extension
+(``torchtitan/distributed/fp8_allgather.py``): each rank quantizes its shard to
+row-wise e4m3 with fp32 scales before the gather, fp8 data and scales are
+gathered, the weight is dequantized to bf16 after. The bf16 grouped GEMM,
+MinimalAsyncEP and the optimizer are untouched; master weights stay bf16
+(safer than #5470's FP8 primaries, same wire effect). Knob:
+``parallelism.fp8_expert_all_gather``; installed on the meta model before
+``model.parallelize``.
+
+**Measured before the run (probe, real shapes):**
+
+| | |
+| --- | --- |
+| weight rounding, row-wise e4m3 vs bf16 | rel 2.65e-2 (RMS 5.3e-4 on std-0.02 weights; max 3.9e-3) -- ~3.4x bf16's own rounding |
+| quantize, shard [8,2048,4096] | 0.057 ms |
+| dequantize, gathered [128,2048,4096] -> bf16 | 0.564 ms |
+| per-step overhead (43 x 3 x 2) | ~160 ms |
+| bytes removed | 1.0 of 2.0 GiB per gather, ~258 GiB/step per rank (~0.5 s at NVLink rates) |
+
+This IS a numerics change -- the GEMMs see fp8-rounded weights -- and the
+smoke pair (same seed, bf16 vs fp8 gather) plus the 8-node loss are what
+decide whether it is tolerable. Result below.
+
+**Why the first smoke pair (684/685) was bitwise identical:** the hooks were
+never called. torchtitan shards expert weights in
+``Module._spmd_distribute_state`` through ``spmd_types::replicate_to_varying``,
+a ``torch.library.custom_op``, not ``aten.split``. The wrapper subclass only
+re-wrapped outputs of a fixed aten set, so the sharded parameter FSDP received
+was a plain tensor with no extension (``fp8 debug: ... sharded_local=Tensor
+has_hook=False``). A 2-GPU micro-test with plain ``fully_shard`` (no SPMD
+step) engaged the hooks fine, which isolated it. Fix: also preserve outputs of
+the ``spmd_types`` namespace (commit b415d0786).
+
+**Smoke pair after the fix** (debugmodel, 1 node, EP=2, seed 0, deterministic,
+FSDP dense-never, job 694 vs 689):
+
+| step | bf16 gather | fp8 gather | rel |
+| --- | --- | --- | --- |
+| 1 | 8.20785 | 8.20799 | 1.7e-5 |
+| 2 | 6.98167 | 6.98187 | 2.9e-5 |
+
+``pre hook engaged (shard fp32 -> e4m3 + fp32 scales)`` / ``post hook engaged``
+logged; the shard FSDP hands to the pre-hook is the fp32 master shard, so the
+wire format is 1 byte + scales vs the 2-byte bf16 FSDP would otherwise cast
+to. 8-node run: job 695 (``fp8ag_6x_v2``, TF32, 20 steps, nodes 00001-00008
+via the CPATH header workaround).
+
+**8-node result (job 697, ``fp8ag_6x_v3``, nodes 00001-00008, 20 steps):**
+hooks engaged (``wrapped 129``, pre hook shard (8,2048,4096) bf16 -> e4m3,
+post hook gathered (128,2048,4096)). Steady state (steps 8-20):
+
+| | baseline 667 (nodes 55-67) | fp8 gather 697 (nodes 1-8) |
+| --- | --- | --- |
+| TFLOP/s, steps 8-20 | 401-404 | 396-402 |
+| step 20 | 400.6 | 398.9 |
+| peak memory | 236.25 GiB | 230.13 GiB |
+| loss step 20 | 3.367 | 3.625 |
+
+No throughput gain: -0.5%, inside run-to-run noise and on a different node
+set (same-node baseline queued as job 701). The loss gap is inside the
+same-config spread (jobs 600/602 ended at 3.30 vs 3.87), so it does not
+indict the fp8 rounding, but this is a 20-step run and cannot clear it
+either. Halving ~258 GiB/step of gather bytes bought nothing measurable,
+which says the expert all-gathers were already hidden behind compute (they
+issue ahead of the block under FSDP2's prefetch) and the ~0.6 ms dequantize
+per gathered weight (x3 x2 per block) lands on the critical path instead.
+Profiled fp8 run queued (job 702) to confirm where the time went.
+
+**Same-node baseline and profile (jobs 701, 702) -- verdict: -0.9%, not adopted.**
+
+| steps 8-20 | dense-never 701 (nodes 1-8) | fp8 gather 697 (nodes 1-8) |
+| --- | --- | --- |
+| TFLOP/s | 401.6-403.7, step 20 **402.4** | 395.5-401.6, step 20 **398.9** |
+| peak memory | 236.25 GiB | 230.13 GiB |
+| loss @15 / @20 | 4.12 / 3.34 | 4.54 / 3.62 (702: 4.03 @15) |
+
+Nodes 1-8 are not slow (701 matched 667), so the gap is the feature. The
+profiled fp8 run (702, trace ``outputs/profiling/traces/iteration_10_j702``,
+diffed against the dense-never profile ``iteration_10_j680``) shows exactly
+the mechanism predicted above:
+
+| per 2 profiled steps, rank 0 | j680 bf16 gather | j702 fp8 gather |
+| --- | --- | --- |
+| ``ncclDevKernel_AllGather`` | 2963 ms / 268 | **1598 ms** / 268 (-46%, bytes halved as designed) |
+| NCCL exposed (serialised) | 232 ms, 1.0% of window | 280 ms, 1.3% |
+| quantize kernel (``triton_red_fused__to_copy_abs_amax_clamp_min_div``) | -- | 120 ms / 516 |
+| dequantize kernel (``triton_poi_fused__to_copy_mul``) | -- | 283 ms / 516 |
+
+The all-gather was already 95.6% overlapped with compute, so removing 1.4 s
+of it per two steps recovered ~nothing, while the ~200 ms/step of
+quantize+dequantize runs inline: FSDP2 calls ``fsdp_post_all_gather`` from
+``init_unsharded_param`` on the compute stream at unshard time, i.e. right
+before the block that needs the weights. The dequantize is already at HBM
+bandwidth (1.07 G elements, ~3.2 GB moved in 0.55 ms), and its memory traffic
+(read fp8 + write bf16) exceeds what the halved copy-out saves, so it cannot
+be made cheaper -- only removed, which means an fp8-consuming grouped GEMM
+(the MXFP8 path measured at -7.5% earlier). Numerics: two fp8 runs sat on the
+high side of the loss band mid-run but inside the same-config spread; not
+conclusive at 20 steps and moot given the throughput. Code stays behind
+``parallelism.fp8_expert_all_gather`` (default off) on ``dsv4_fused_output_rope``.
+Best config remains dense-never at **401.4-402.4 TFLOP/s**.
