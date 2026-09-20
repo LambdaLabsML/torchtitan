@@ -653,6 +653,12 @@ def deepseek_v4_debugmodel_asyncep_policy(
     config.training.num_tokens_per_microbatch_per_dp_rank = 4 * (seq_len or DEFAULT_DEBUG_MODEL_SEQ_LEN)
     if os.environ.get("DUAL_MB", "0") == "1":
         assert _enable_dual_microbatch(config) > 0
+    mp = os.environ.get("MP_PARAM")
+    if mp:  # e.g. float32: removes the bf16 rounding of grads so two-half sums match one GEMM
+        config.training.mixed_precision_param = mp
+        config.training.mixed_precision_reduce = mp
+    if os.environ.get("BALANCED_ROUTING", "0") == "1":
+        assert _force_balanced_routing(config) > 0
     config.training.disable_cuda_graphs = True
     config.debug.seed = 0
     config.debug.deterministic = True
@@ -1183,4 +1189,12 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_dualmb(
     assert microbatch % 2 == 0, "dual microbatch needs an even sequence count"
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(microbatch, seq_len)
     assert _enable_dual_microbatch(config) > 0, "no MoE block found"
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_dualmb_balanced(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """Dual-microbatch EP overlap with forced round-robin routing."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_dualmb(microbatch, seq_len)
+    assert _force_balanced_routing(config) > 0
     return config
