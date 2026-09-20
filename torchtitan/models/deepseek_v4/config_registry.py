@@ -668,6 +668,8 @@ def deepseek_v4_debugmodel_asyncep_policy(
     config.parallelism.fp8_expert_all_gather = os.environ.get("FP8_EXPERT_AG", "0") == "1"
     if os.environ.get("CUDNN_INDEXER", "0") == "1":
         assert _enable_cudnn_indexer(config) > 0
+    if os.environ.get("FP8_DENSE", "0") == "1":
+        _apply_fp8_dense(config)
     config.training.disable_cuda_graphs = True
     config.debug.seed = 0
     config.debug.deterministic = True
@@ -736,3 +738,46 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx(
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(microbatch, seq_len)
     assert _enable_cudnn_indexer(config) > 0, "no CSA layer found"
     return config
+FP8_DENSE_FILTER_FQNS = [
+    # Kept in bf16/fp32 on purpose (Megatron's DSv4 correctness list keeps the
+    # CSA compressor and indexer in high precision under FP8; the router gate
+    # scores in fp32; the LM head is left bf16 as in every fp8 recipe here).
+    "lm_head",
+    "router.gate",
+    "indexer",
+    "compressor",
+    # torchao: skip linears whose K/N are too small to gain from fp8.
+    "auto_filter_small_kn",
+]
+
+
+def _apply_fp8_dense(config: Trainer.Config) -> Trainer.Config:
+    """Swap the dense ``Linear`` configs (attention projections, shared
+    experts) to torchao rowwise Float8Linear. Expert grouped GEMMs are not
+    touched: fp8 ``_scaled_grouped_mm`` aborts on sm_103 and the MXFP8 path
+    measured -7.5% here. Runs on the model config tree, so it composes with any
+    already-built recipe."""
+    from torchtitan.config.transform.quantization import Float8LinearConverter
+
+    conv = Float8LinearConverter(
+        Float8LinearConverter.Config(
+            recipe_name="rowwise", filter_fqns=list(FP8_DENSE_FILTER_FQNS)
+        )
+    )
+    config.model_spec.model = conv.convert(config.model_spec.model)
+    return config
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_fp8dense(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The 401 best (dense-never, 4 receive slots) plus fp8 dense linears.
+
+    Dense bf16 GEMMs (attention projections, shared expert, indexer scores)
+    are 11.3% of kernel time in the job-702 profile; rowwise fp8 halves the
+    tensor-core work of the ones converted here. FP8_DENSE_COMPILE=1 compiles
+    each Float8Linear module on its own so torchao's amax/scale/cast kernels
+    fuse (eager fp8 casts can eat the gain).
+    """
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(microbatch, seq_len)
+    return _apply_fp8_dense(config)

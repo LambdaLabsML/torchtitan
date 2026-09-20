@@ -1,3 +1,4 @@
+import os
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
@@ -16,6 +17,11 @@ from torchtitan.distributed.compile import apply_compile
 from torchtitan.distributed.fsdp import resolve_fsdp_mesh, resolve_sparse_fsdp_mesh
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.deepseek_v3.mtp import apply_fsdp_to_mtp_decoder
+
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def parallelize_deepseekv3(
@@ -45,6 +51,19 @@ def parallelize_deepseekv3(
 
     if ac_config is not None:
         ac_config.build(dump_folder=dump_folder).apply(model)
+
+    if os.environ.get("FP8_DENSE_COMPILE", "0") == "1":
+        # Compile each Float8Linear on its own (the block itself stays eager:
+        # whole-block compile graph-breaks in the SPMD typecheck context) so
+        # torchao's per-call amax/scale/cast kernels fuse around the fp8 GEMM.
+        from torchtitan.quantization.float8 import Float8Linear
+
+        n = 0
+        for _name, module in model.named_modules():
+            if Float8Linear is not None and isinstance(module, Float8Linear):
+                module.compile(dynamic=False)
+                n += 1
+        logger.info("fp8 dense: compiled %d Float8Linear modules", n)
 
     if model_compile_enabled:
         apply_compile(
