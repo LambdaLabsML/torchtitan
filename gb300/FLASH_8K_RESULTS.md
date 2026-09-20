@@ -2323,3 +2323,15 @@ TFLOP/s vs 401 -- flat**, as the same-node microbenchmark predicted (20.02
 vs 19.97 ms per layer). Memory 234.55 GiB, loss 3.11 @20. That is the best
 torchao's Float8Linear can do on this model here; the torchao-free
 ``CustomFloat8Linear`` (job 823, same rack) is the remaining question.
+
+**Custom (torchao-free) fp8 dense linears, 8 nodes (job 824, r03, vs 777 on
+r03): 416.3 TFLOP/s vs 401 -- +3.8%, as the microbenchmark predicted.**
+Memory 243.65 GiB (+7.4 GiB: cached e4m3 weights in both layouts and the
+fp8 transposed activations saved for wgrad), loss 3.02 @20 (777: 3.00).
+Job 823, the first attempt, aborted at the 300 s init timeout on all ranks
+before step 1 with no other error; 824 (identical code) ran, so that was a
+stall, most likely first-step compiles of the cast graphs racing FSDP
+collectives. The branch now warms the cast graphs at build time and sets
+``comm.init_timeout_seconds=1800`` for this config (job 825 checks it).
+Stack with the cuDNN indexer queued on r02 against 807's 441.4
+(``stack_idx_fp8_v2_6x``).
