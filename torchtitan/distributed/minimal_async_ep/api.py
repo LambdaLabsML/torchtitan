@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import logging
+import os
 
 import torch
 import torch.distributed as dist
@@ -44,7 +45,12 @@ from torchtitan.distributed.minimal_async_ep.kernels import (
 
 logger = logging.getLogger(__name__)
 
-_HIDDEN_RECV_BUFFER_COUNT = 2
+# Receive-slot count. Under FullAC the experts' saved input aliases the slot a
+# dispatch returned and the wgrad GEMM reads it in backward; every comm op
+# (fwd dispatch, fwd combine, bwd combine, bwd dispatch) rotates the pool, so
+# with 2 slots the backward ops rewrite it first (a 0.12% gradient error,
+# jobs 754 vs 768). 4 slots keep the alias intact through a block's backward.
+_HIDDEN_RECV_BUFFER_COUNT = int(os.environ.get("MINIMAL_ASYNC_EP_SLOTS", "4"))
 
 _HIDDEN_READY_CHANNEL = 0
 _COUNTS_READY_CHANNEL = 0
