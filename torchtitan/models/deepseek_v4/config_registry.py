@@ -556,3 +556,15 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2(
     config = deepseek_v4_flash_8k_gb300_cudnn_full(microbatch, seq_len)
     config.parallelism.expert_parallel_degree = 2
     return config
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_5x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """Plain 5x control, so the overlap's gain at 5x can be separated from batch.
+
+    The batch curve on this recipe is 4x 307.3 -> 6x 367.7, and the overlap is
+    worth +13.1% at 4x (347.6 vs 307.3). Without a 5x point, a 5x+overlap
+    number cannot be attributed between the two.
+    """
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2(5, seq_len)
