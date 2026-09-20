@@ -2346,3 +2346,26 @@ compiled; any extra shape (MTP, a different microbatch) would have tipped it
 too. Fix: ``recompile_limit = 64`` in ``custom_fp8.py``. Reruns: fp8 alone
 (``fp8custom_v4_6x``, r03, vs 401) and the cuDNN-indexer stack
 (``stack_idx_fp8_v3_6x``, r02, vs 441.4).
+
+## New best: cuDNN indexer + torchao-free fp8 dense linears = 450.8 TFLOP/s (job 829)
+
+Branch ``dsv4_stack_idx_fp8`` (worktree ``/mnt/dgxc/worktrees/stack``), config
+``deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_fp8dense`` with
+``FP8_DENSE_IMPL=custom``. Contents: dense-never FSDP, 4 MinimalAsyncEP
+receive slots (correct gradients), cuDNN fused indexer top-k, custom
+tensorwise fp8 for wq_b/wo_a/wo_b/shared w13/w2, fused output RoPE, TF32
+fp32 matmuls, cuDNN DSA forward+backward.
+
+| 20 steps, 6x, EP=2, single rack | TFLOP/s @20 | steady range | peak mem | loss @20 |
+| --- | --- | --- | --- | --- |
+| 4-slot baseline, job 777 (r03) | 401 | 399.7-402.1 | 236.3 GiB | 3.00 |
+| + custom fp8 dense, 824 / 828 (r03) | 416.3 / 409.1 | 409-417 | 243.7 GiB | 3.02 / 3.83 |
+| + cuDNN indexer, 807 (r02) | 441.4 | 430.9-443.6 | 224.8 GiB | 3.32 |
+| **+ both, 829 (r02)** | **450.8** | 450.8-452.2 | 236.6 GiB | 3.04 |
+
+fp8 dense adds +2.1% on top of the indexer (+2 to +4% alone across two runs,
+inside this cluster's run-to-run spread), the two are independent and stack
+additively. No recompile-limit hits in 828/829. Ideas from the DSv4 tracker
+review, final: idea 2 (cuDNN indexer) +10%, idea 1 (fp8 dense) +2-4% but
+only without torchao; dual-microbatch (other session, jobs 808/812) -5.6%,
+not adopted.
