@@ -29,6 +29,14 @@ def parallelize_deepseekv3(
     dump_folder: str,
     skip_dp: bool = False,
 ):
+    if parallelism.fp8_expert_all_gather:
+        # Before model.parallelize / FSDP, on the meta model: FSDP then shards
+        # the wrapped parameter and finds the all-gather extension hooks.
+        from torchtitan.distributed.fp8_allgather import (
+            wrap_expert_weights_for_fp8_all_gather,
+        )
+
+        wrap_expert_weights_for_fp8_all_gather(model)
     model.parallelize(parallel_dims)
 
     model_compile_enabled = (
