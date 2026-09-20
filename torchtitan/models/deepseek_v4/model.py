@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from dataclasses import dataclass
 from typing import cast, TYPE_CHECKING
 
@@ -217,7 +218,11 @@ _DUAL_MB_COMM_STREAM = None
 
 
 def _dual_mb_comm_stream():
+    """The comm stream; DUAL_MB_SAME_STREAM=1 runs the same schedule on the
+    compute stream (no overlap) to separate split-math from stream effects."""
     global _DUAL_MB_COMM_STREAM
+    if os.environ.get("DUAL_MB_SAME_STREAM", "0") == "1":
+        return torch.cuda.current_stream()
     if _DUAL_MB_COMM_STREAM is None:
         _DUAL_MB_COMM_STREAM = torch.cuda.Stream()
     return _DUAL_MB_COMM_STREAM
