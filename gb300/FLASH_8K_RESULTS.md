@@ -2088,3 +2088,9 @@ slots, collapsed routing), 778 (dual, 8 slots, balanced routing). A
 memory-neutral alternative is to clone the expert input out of the slot
 (one 4.8 GB copy per layer per forward/recompute, ~50 ms/step) -- not
 implemented; the extra slots are free in time and fit in memory.
+
+**Rack caveat on job 757:** it ran on ``mgx-[00009-00012,00014-00015,00053-00054]``,
+i.e. across rack_r02 and rack_r03, and the inter-rack IB is not optimized.
+The 1.7% balanced-routing deficit therefore includes an unknown cross-rack
+penalty; 701 (r02) and 667 (r01) were single-rack. From here on all 8-node
+runs go through ``/mnt/dgxc/sbatch_rack.sh`` (or ``--partition=rack_rNN``).
