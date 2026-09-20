@@ -25,9 +25,13 @@ invalid (the eager path never produced negatives).
 
 from __future__ import annotations
 
+import logging
+
 import torch
 
+logger = logging.getLogger(__name__)
 _wrapper = None
+_warned = False
 
 
 def _get_wrapper():
@@ -52,6 +56,20 @@ def cudnn_indexer_select(
     topk: int,
 ) -> torch.Tensor:
     batched = idx_q.ndim == 4
+    n_heads = idx_q.shape[-2]
+    if n_heads not in (32, 64):
+        # The bf16 cuDNN indexer kernel is built for 32 or 64 index heads
+        # (DSv4 flash has 64); smaller debug models fall back to the eager path.
+        global _warned
+        if not _warned:
+            logger.warning(
+                "cudnn_indexer: %d index heads unsupported (needs 32/64); using eager select",
+                n_heads,
+            )
+            _warned = True
+        from .compressor import Indexer
+
+        return Indexer.select(idx_q, idx_k, idx_w, seqlen=seqlen, ratio=ratio, topk=topk)
     if batched:
         q, k, w = idx_q, idx_k, idx_w
     else:
