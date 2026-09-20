@@ -2442,7 +2442,7 @@ whatever Parameter object FSDP2 exposes at that moment; per-module
 
 | recipe | TFLOP/s step 20 (steps 12-20 range) | peak memory | loss @20 |
 | --- | --- | --- | --- |
-| custom fp8 tensorwise (829) | 450.8 | 225 GiB | 3.32 |
+| custom fp8 tensorwise (829) | 450.8 | 236.6 GiB | 3.04 |
 | TE MXFP8 (839) | 449.2 (449-450) | 225.1 GiB | 3.13 |
 | **TE fp8 delayed scaling (840)** | **457.6 (457-458)** | **221.2 GiB** | 2.99 |
 | TE NVFP4 (841) | 449.2 (448-449) | 221.7 GiB | 2.98 |
@@ -2452,7 +2452,7 @@ whatever Parameter object FSDP2 exposes at that moment; per-module
 (10.9 vs 12.8 ms per set) did not survive in situ -- its Hadamard-transform
 casts and fp4 weight handling land on the critical path where the probe's
 back-to-back GEMMs hid them. Delayed scaling also frees 4 GiB (no per-call
-amax reductions, fp8 weight cache). Losses are all inside the run-to-run
+amax reductions, fp8 weight cache); all three TE variants sit ~15 GiB below 829. Losses are all inside the run-to-run
 band (see 600/602). **Adopt: 457.6 is the new number.** This closes the
 "torchao vs TE" review: the dense linears were the one place TE pays; the
 grouped experts (above) do not, and nothing else torchao-backed remains in
