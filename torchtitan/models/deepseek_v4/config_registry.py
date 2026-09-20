@@ -645,3 +645,15 @@ def deepseek_v4_debugmodel_asyncep_policy(
     config.debug.deterministic = True
     config.training.steps = 2
     return config
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_profile(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """dense-never with the profiler on (warmup 3, active 2, at step 10)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(microbatch, seq_len)
+    config.profiler.enable_profiling = True
+    config.profiler.profile_freq = 10
+    config.profiler.profiler_warmup = 3
+    config.profiler.profiler_active = 2
+    return config
