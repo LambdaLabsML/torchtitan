@@ -2335,3 +2335,14 @@ collectives. The branch now warms the cast graphs at build time and sets
 ``comm.init_timeout_seconds=1800`` for this config (job 825 checks it).
 Stack with the cuDNN indexer queued on r02 against 807's 441.4
 (``stack_idx_fp8_v2_6x``).
+
+**Warm-up gotcha (job 825, r03): 380.2 TFLOP/s, i.e. slower than bf16.**
+Same code as 824 plus the build-time warm-up; the log shows ``torch._dynamo
+hit config.recompile_limit (8)`` 32 times. The compiled cast functions get
+one variant per (shape, stride) -- 7 for the activations/grads, 5 for the
+weights -- and the warm-up's variants pushed ``_cast_both`` past Dynamo's
+default limit of 8, after which it silently runs eager. 824 sat at 7 and
+compiled; any extra shape (MTP, a different microbatch) would have tipped it
+too. Fix: ``recompile_limit = 64`` in ``custom_fp8.py``. Reruns: fp8 alone
+(``fp8custom_v4_6x``, r03, vs 401) and the cuDNN-indexer stack
+(``stack_idx_fp8_v3_6x``, r02, vs 441.4).
