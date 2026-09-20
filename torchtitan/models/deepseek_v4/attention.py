@@ -141,7 +141,18 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
         self.fused_dsa_forward = config.fused_dsa_forward
         self.block_size = config.block_size
 
-    def get_window_topk_idxs(
+    def get_window_topk_idxs(self, *, bsz, seqlen, device):
+        """Cached: the index build depends only on (seqlen, window), yet ran
+        86 times a step (eager clamp_min + arange, 1.2% of GPU time)."""
+        cache = self.__dict__.setdefault("_window_idx_cache", {})
+        key = (seqlen, str(device))
+        if key not in cache:
+            cache[key] = self._get_window_topk_idxs_uncached(
+                bsz=1, seqlen=seqlen, device=device
+            )[0]
+        return cache[key].unsqueeze(0).expand(bsz, -1, -1)
+
+    def _get_window_topk_idxs_uncached(
         self,
         *,
         bsz: int,
@@ -316,6 +327,7 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
         idx_k=None,
         idx_w=None,
         attention_masks=None,
+        out_rope=None,
     ) -> torch.Tensor:
         """Run DSV4 sparse attention over a folded token stream."""
         if attention_masks is not None:
@@ -379,8 +391,10 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
 
             if self.fused_dsa_backward:
                 return self._fused_dsa(
-                    q_in, kv, attn_sink, selected_indices, block_mask, bsz, kv_len
+                    q_in, kv, attn_sink, selected_indices, block_mask, bsz, kv_len,
+                    out_rope=out_rope,
                 )
+            assert out_rope is None, "output RoPE fusion needs fused_dsa_backward"
 
             return super().forward(
                 q_in,
@@ -391,7 +405,9 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
                 out_transform=apply_sink,
             )
 
-    def _fused_dsa(self, q_in, kv, attn_sink, selected_indices, block_mask, bsz, kv_len):
+    def _fused_dsa(
+        self, q_in, kv, attn_sink, selected_indices, block_mask, bsz, kv_len, *, out_rope=None
+    ):
         """cuDNN backward (and optionally forward) over the flat layout.
 
         The kernel takes one KV stream and global indices, so a batched
@@ -443,6 +459,7 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
             idx_flat,
             softmax_scale=self.softmax_scale,
             flex_fwd=None if self.fused_dsa_forward else flex_fwd,
+            out_rope=out_rope,
         )
 
     def _batch_shape(self, num_tokens: int) -> tuple[int, int]:
@@ -473,12 +490,14 @@ class SlidingWindowAttention(DSV4FlexInnerAttention):
         attn_sink,
         *,
         attention_masks=None,
+        out_rope=None,
     ) -> torch.Tensor:
         return self._forward_impl(
             q,
             swa_k,
             attn_sink,
             attention_masks=attention_masks,
+            out_rope=out_rope,
         )
 
 
@@ -495,6 +514,7 @@ class HeavilyCompressedAttention(DSV4FlexInnerAttention):
         attn_sink,
         *,
         attention_masks=None,
+        out_rope=None,
     ) -> torch.Tensor:
         return self._forward_impl(
             q,
@@ -502,6 +522,7 @@ class HeavilyCompressedAttention(DSV4FlexInnerAttention):
             attn_sink,
             cmp_k=cmp_k,
             attention_masks=attention_masks,
+            out_rope=out_rope,
         )
 
 
@@ -521,6 +542,7 @@ class CompressedSparseAttention(DSV4FlexInnerAttention):
         attn_sink,
         *,
         attention_masks=None,
+        out_rope=None,
     ) -> torch.Tensor:
         return self._forward_impl(
             q,
@@ -531,6 +553,7 @@ class CompressedSparseAttention(DSV4FlexInnerAttention):
             idx_k=idx_k,
             idx_w=idx_w,
             attention_masks=attention_masks,
+            out_rope=out_rope,
         )
 
 
@@ -645,6 +668,10 @@ class Attention(BaseAttention):
             cmp_k = self.compressor_128(x, positions=positions)
 
         attn_sink_param = self.attn_sink.weight.squeeze(-1)
+        # With the DSA backward on cuDNN the sparse-attention Function applies
+        # the output inverse RoPE itself, in place on the output it owns.
+        fuse_out_rope = bool(getattr(self.inner_attention, "fused_dsa_backward", False))
+        out_rope = (rope_cache_ri.contiguous(), rd) if fuse_out_rope else None
         if self.compress_ratio == 4:
             o = self.inner_attention(
                 q,
@@ -655,6 +682,7 @@ class Attention(BaseAttention):
                 idx_w,
                 attn_sink_param,
                 attention_masks=attention_masks,
+                out_rope=out_rope,
             )
         elif self.compress_ratio > 1:
             o = self.inner_attention(
@@ -663,6 +691,7 @@ class Attention(BaseAttention):
                 cmp_k,
                 attn_sink_param,
                 attention_masks=attention_masks,
+                out_rope=out_rope,
             )
         else:
             o = self.inner_attention(
@@ -670,9 +699,11 @@ class Attention(BaseAttention):
                 kv,
                 attn_sink_param,
                 attention_masks=attention_masks,
+                out_rope=out_rope,
             )
 
-        o = _o_rope_inverse(o, rope_cache_ri, rd=rd)
+        if not fuse_out_rope:
+            o = _o_rope_inverse(o, rope_cache_ri, rd=rd)
 
         with spmd.local():
             n_local_heads = o.shape[1]
