@@ -1958,3 +1958,38 @@ high side of the loss band mid-run but inside the same-config spread; not
 conclusive at 20 steps and moot given the throughput. Code stays behind
 ``parallelism.fp8_expert_all_gather`` (default off) on ``dsv4_fused_output_rope``.
 Best config remains dense-never at **401.4-402.4 TFLOP/s**.
+
+## EP load probe: the 20-step benchmark runs in a collapsed-routing regime
+
+Cheap measurement (branch ``dsv4_ep_load_probe``, ``TORCHTITAN_EP_LOAD_LOG=1``:
+one tiny all-reduce per MoE forward of the per-EP-rank received row counts and
+the per-expert counts inside the EP group; job 749, dense-never 6x, 10 steps,
+probe overhead ~8%: 368.6 vs 402 TFLOP/s, so never benchmark with it on).
+
+| | value |
+| --- | --- |
+| EP-rank received rows, max/mean (1.0 = balanced) | mean **1.28**, p50 1.30, p90 1.67, max 2.00 |
+| samples where ALL tokens route to the same 6 experts | step 1: 0%; step 2: 65%; steps 4-10: **93%** of layers |
+| per-expert max/mean inside the group at step 1 | 31.8 (256/6 = 42.7 is total collapse) |
+
+From random init the router concentrates on a handful of experts at step 1 and
+by step 2-4 nearly every layer sends every token to the same 6 experts (the
+3 hash layers are the balanced exceptions). The aux-loss-free bias correction
+(``load_balance_coeff`` 1e-3 per step, sign update) is far too slow to matter
+within 20 steps. Consequences for the numbers in this ledger:
+
+1. **The EP barrier is mostly imbalance, not sync cost.** With one rank of
+   each pair receiving ~65% of the rows (max/mean 1.3) the other rank waits
+   ~30% of the expert time at the barrier; expert GEMMs are ~25% of the step,
+   so ~7% of the step -- matching the 5-6% ``multimem_barrier`` kernel share.
+   That component would largely vanish in balanced training.
+2. **The expert GEMMs are running in the most favourable shape:** 6 huge
+   groups instead of 256 small ones, so grouped-GEMM efficiency in these runs
+   is optimistic relative to balanced training.
+
+The two effects pull in opposite directions; job 757 (forced round-robin
+routing via the router's ``_debug_force_load_balance`` switch, config
+``..._densenever_balanced``) measures the balanced end of the range directly.
+Any comparison between configs in this ledger is still valid (same regime on
+both sides), but the absolute TFLOP/s should be quoted with this caveat until
+757 is in.
