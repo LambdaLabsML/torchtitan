@@ -2247,3 +2247,12 @@ several shapes it is slower compiled). bf16 dense GEMMs already run at
 far larger. The 8-node -18% is exactly the predicted +4.5 s/step. A leaner
 fp8 linear (tensorwise or delayed scaling, casts fused once per tensor) is
 the only version worth revisiting; the tensorwise recipe is probed next.
+
+**Tensorwise recipe (probe 817, same shapes, compiled per linear):** wq_b
+8.2 ms (bf16 8.7), wo_a 4.8 (6.0), wo_b 4.9 (5.5), w13 2.9 (3.1), w2 1.9
+(1.8) -- **22.6 vs 25.1 ms per layer, ~0.22 s/step, ~+2% ceiling**; eager
+tensorwise is 3x slower than bf16, so compile is mandatory. Raw tensorwise
+``_scaled_mm`` runs at 3646 TFLOP/s vs 1977 bf16. One 8-node run
+(``fp8dense_tw_comp_6x``, r03, ``FP8_DENSE_RECIPE=tensorwise
+FP8_DENSE_COMPILE=1``) closes the question; the numerics caveat is that
+per-tensor dynamic scaling is the coarsest fp8 recipe.
