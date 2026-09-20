@@ -1993,3 +1993,43 @@ routing via the router's ``_debug_force_load_balance`` switch, config
 Any comparison between configs in this ledger is still valid (same regime on
 both sides), but the absolute TFLOP/s should be quoted with this caveat until
 757 is in.
+
+**Balanced end measured (job 757, forced round-robin routing, dense-never 6x,
+20 steps): 395-397 TFLOP/s steady state (step 20: 394.9) vs 402.4 collapsed
+(job 701), memory identical.** The two regime effects nearly cancel: balanced
+routing removes the EP barrier's imbalance wait but replaces 6 huge expert
+groups with 256 small ones, and the grouped GEMM loses more than the barrier
+gains. So the ledger's absolute numbers are ~1.5% optimistic for steady-state
+training, and config-vs-config deltas stand. (Loss still falls under
+round-robin routing -- the scores are still gathered -- but it is not a model.)
+
+## Two-microbatch EP overlap (Megatron combined-1F1B idea), branch `dsv4_dual_microbatch`
+
+Each MoE block splits its tokens into two halves of whole sequences and
+issues dispatch(A), dispatch(B), combine(A), combine(B) on a comm stream while
+attention(B), experts(A), experts(B), post(A/B) run on the compute stream
+(``DeepSeekV4TransformerBlock._forward_dual_microbatch``). MinimalAsyncEP's
+receive pool becomes 2*split half-size slots (same bytes) so no slot is
+rewritten before its consumer runs; a capacity assert guards non-split
+dispatches. Autograd replays each op on its forward stream, so backward and
+FullAC's recompute overlap the same way.
+
+Correctness (debugmodel, 1 node, EP=2, seed 0, deterministic, batch 4):
+
+| run | step-1 loss / grad_norm | step-2 loss |
+| --- | --- | --- |
+| single, bf16 (754 = 766, bitwise) | 8.20169 / 3.3059 | 6.97696 |
+| dual, bf16 (755, 760) | 8.20169 / 3.3060, 3.3061 | 6.94076, 6.94014 |
+| dual one-stream (759, 767) | 8.20169 / 3.3067, 3.3066 | 6.93827, 6.93838 |
+| single, fp32 params (761) | 8.20159 / 3.3109 | 6.93667 |
+| **dual, fp32 params (762)** | **8.20159 / 3.3109** | **6.93667** |
+
+Forward is exact (identical step-1 loss everywhere). With fp32 parameters the
+dual schedule matches the single one to every printed digit, so there is no
+stream, slot or allocator race. The bf16 difference (3e-5 in grad_norm) is the
+two per-half gradient contributions being summed in bf16 instead of one
+fp32-accumulated GEMM -- the same rounding as 2-step gradient accumulation --
+and it is not bitwise reproducible even on one stream (accumulation order of
+3-4 contributions per shared weight). Acceptable for evaluation; production
+would want fp32 gradient accumulation. 8-node runs: job 763 (collapsed
+routing, vs 402.4) and the balanced variant (vs 395-397).
