@@ -52,18 +52,31 @@ def parallelize_deepseekv3(
     if ac_config is not None:
         ac_config.build(dump_folder=dump_folder).apply(model)
 
+    fp8_linears = [
+        name
+        for name, m in model.named_modules()
+        if "Float8" in type(m).__name__ and isinstance(m, nn.Linear)
+    ]
+    if fp8_linears:
+        logger.info(
+            "fp8 dense: %d Float8Linear modules, e.g. %s",
+            len(fp8_linears),
+            ", ".join(fp8_linears[:4]),
+        )
     if os.environ.get("FP8_DENSE_COMPILE", "0") == "1":
         # Compile each Float8Linear on its own (the block itself stays eager:
         # whole-block compile graph-breaks in the SPMD typecheck context) so
         # torchao's per-call amax/scale/cast kernels fuse around the fp8 GEMM.
-        from torchtitan.quantization.float8 import Float8Linear
-
         n = 0
-        for _name, module in model.named_modules():
-            if Float8Linear is not None and isinstance(module, Float8Linear):
+        names = []
+        for name, module in model.named_modules():
+            if "Float8" in type(module).__name__ and isinstance(module, nn.Linear):
                 module.compile(dynamic=False)
                 n += 1
-        logger.info("fp8 dense: compiled %d Float8Linear modules", n)
+                names.append(name)
+        logger.info(
+            "fp8 dense: compiled %d Float8Linear modules (%s)", n, ", ".join(names[:6])
+        )
 
     if model_compile_enabled:
         apply_compile(
