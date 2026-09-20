@@ -2263,3 +2263,31 @@ per-tensor dynamic scaling is the coarsest fp8 recipe.
 dual schedule would otherwise hide, so the smaller gap says the schedule does
 recover some of the exposed comm; its own overhead is simply larger than the
 recovery at 6x. Profile (815) pending to name that overhead.
+
+**Why the dual-microbatch schedule loses (profile job 815, r01, vs the
+dense-never profile 680; per 2 steps, rank 0):**
+
+| | baseline 680 | dual 815 |
+| --- | --- | --- |
+| profiled window | 23.6 s | 25.2 s (+6.4%) |
+| ``ncclDevKernel_AllGather`` | 2963 ms / 268 calls (11 ms) | **13302 ms / 354 (37.6 ms)** |
+| NCCL exposed | 232 ms (1.0%) | 1493 ms (5.9%) |
+| EP barrier + row copy: busy / exposed | 2987 / 2987 ms | 3839 / **1963** ms |
+| ``multimem_barrier`` | 1600 ms / 688 | 2442 ms / 1376 |
+| cutlass GEMMs + attention + nvjet | | +1.3 s (half-size shapes) |
+| FSDP single AG/RS per pass | | engaged (log line), RS count unchanged |
+
+Three effects, all structural: (1) the schedule does hide exposed EP comm --
+1.0 s of the 3.0 s -- but not more, because the barrier spin and the row copy
+are SM-resident kernels sharing the GPU with the compute they overlap;
+(2) the expert all-gathers, which the baseline overlapped cleanly with
+attention, now run concurrently with the EP row copies over the same
+NVLink/IB and stretch 3.4x per call, turning a 1% exposed collective into
+5.9%; (3) attention and grouped GEMMs on half the tokens are ~6% less
+efficient. Net -6% (808: 377.6 vs 401.3), -3.5% under balanced routing (809).
+Megatron's version of this idea rests on DeepEP's RDMA all-to-all (no spin
+kernel, no SM footprint) and TE grouped GEMMs; on MinimalAsyncEP's
+copy-kernel + barrier transport the overlap costs more than it recovers.
+**Not adopted.** Kept on ``dsv4_dual_microbatch`` (correct, validated, with
+the slot-alias and lazy-load fixes that are useful on their own). Stacked on
+the 441 cuDNN-indexer baseline as job 812 for completeness.
