@@ -1,0 +1,11 @@
+###### env: CUBLAS_WORKSPACE_CONFIG=unset ######
+###### final_128_12x_ws_swiglu  branch=dsv4_te_mhc  commit=20e31cd3  steps=20  job=970  13:51:06 ######
+###### torchtitan resolved to /mnt/dgxc/chelsea/torchtitan/torchtitan/__init__.py
+###### nodes=32 (yqb01-qa01-mgx-[00001-00005,00007-00009,00037-00052,00055-00056,00060,00063-00065,00069-00070]) ######
+###### parallelism env: TORCHTITAN_LEAF_COMPILE=unset NCCL_PROTO=auto NCCL_ALGO=auto ######
+###### sourced /mnt/dgxc/caia/torchtitan/.env (WANDB_API_KEY set: yes) ######
+###### wandb: caia-costello-lambd/dsv4-gb300-torchtitan run=final_128_12x_ws_swiglu-128gpu-j970 group=deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_12x job_type=final_128_12x_ws_swiglu ######
+###### END final_128_12x_ws_swiglu exit=0 14:03:40 ######
+step: 18  loss:  3.07286  grad_norm:  7.3977  memory: 222.83GiB(80.59%)  tps: 5,835  tflops: 517.20  mfu: 20.69%
+step: 19  loss:  2.98416  grad_norm:  5.3227  memory: 222.83GiB(80.59%)  tps: 5,833  tflops: 516.98  mfu: 20.68%
+step: 20  loss:  2.94270  grad_norm:  4.1520  memory: 222.83GiB(80.59%)  tps: 5,819  tflops: 515.70  mfu: 20.63%
