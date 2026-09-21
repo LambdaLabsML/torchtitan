@@ -1,13 +1,34 @@
-# DeepSeek-V4-flash, 8k seq, 32x GB300: 517.6 TFLOP/s (job 996)
+# DeepSeek-V4-flash, 8k seq, 32x GB300: 578.5 TFLOP/s balanced routing (job 1008) / 519.1 collapsed (job 1006)
 
 Branch `dsv4_te_mhc` = the full stack. Everything below default-off is a knob.
 
-## The run
+## Two regimes, two numbers
+20-step runs from random init collapse the router onto ~6 experts by step 2;
+the EP-rank token skew then costs 8% of the step in barrier waits. With forced
+load-balanced routing (`config.debug.moe_force_load_balance`, the `_balanced`
+config variants; Megatron's `--moe-router-force-load-balancing`) the barrier
+vanishes and the same kernels run +14% faster. Balanced is the proxy for
+trained routing; collapsed is what step 20 from scratch really does. Name the
+regime with every number.
+
+## The balanced run (578.5, job 1008)
 ```
 RACK=r02 WORKTREE=<this checkout> \
 EXTRA_PYTHONPATH=/mnt/dgxc/pydeps-te:/mnt/dgxc/pydeps-cudnn \
 TORCHTITAN_FP32_MATMUL_PRECISION=tf32 TE_DENSE_RECIPE=delayed TE_REDUCE_AMAX=0 TORCHTITAN_TE_MHC=1 \
-TORCHTITAN_BLOCK_INPUT_OFFLOAD=1 TORCHTITAN_DSA_PERSISTENT_WORKSPACE=0 \
+TORCHTITAN_DSA_PERSISTENT_WORKSPACE=0 FSDP_PREFETCH_DEPTH=2 \
+CONFIG=deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_balanced STEPS=20 TAG=best_balanced \
+/mnt/dgxc/sbatch_rack.sh --parsable --nodes=8 --time=00:50:00 gb300/dsv4_64xgb300.slurm
+```
+No offload: in the balanced regime 7x (578.5) beats 10x+offload (572.3) and
+13x+offload (549.7).
+
+## The collapsed run (519.1, job 1006)
+```
+RACK=r02 WORKTREE=<this checkout> \
+EXTRA_PYTHONPATH=/mnt/dgxc/pydeps-te:/mnt/dgxc/pydeps-cudnn \
+TORCHTITAN_FP32_MATMUL_PRECISION=tf32 TE_DENSE_RECIPE=delayed TE_REDUCE_AMAX=0 TORCHTITAN_TE_MHC=1 \
+TORCHTITAN_BLOCK_INPUT_OFFLOAD=1 TORCHTITAN_DSA_PERSISTENT_WORKSPACE=0 FSDP_PREFETCH_DEPTH=2 \
 CONFIG=deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_13x STEPS=20 TAG=best \
 /mnt/dgxc/sbatch_rack.sh --parsable --nodes=8 --time=00:50:00 gb300/dsv4_64xgb300.slurm
 ```
@@ -30,7 +51,9 @@ copy at block entry, one-layer-deep restore in backward; -68 GiB at 7x) which
 makes 12x fit -> 12x microbatch (513.9, job 942) -> 13x on the merged branch
 (bounded SwiGLU on by default; `TORCHTITAN_DSA_PERSISTENT_WORKSPACE=0`, the
 persistent workspace costs 16 GiB and -1.5% at 32 GPUs and is for 128) = 517.6
-(job 996). 14x needs `OPT_STATE_OFFLOAD=1 OPT_STATE_OFFLOAD_LAYERWISE=1` too.
+(job 996). 14x needs `OPT_STATE_OFFLOAD=1 OPT_STATE_OFFLOAD_LAYERWISE=1` too (503.8, loses).
+`FSDP_PREFETCH_DEPTH=2` (explicit two-block-ahead all-gather prefetch) is
+neutral-to-+0.3% and on in both runs.
 
 ## External pieces not in this repo (paths on the yqb01 cluster)
 * venv: `/mnt/dgxc/venvs/dsv4n` (torch 2.15 nightly cu130, aarch64).
