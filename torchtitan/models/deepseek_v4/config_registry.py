@@ -1095,3 +1095,14 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_12x_c4(
 ) -> Trainer.Config:
     """The bf16-dense numerics reference on real C4 (pair with the hero run)."""
     return _on_c4_local(deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_12x(seq_len))
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_12x_hybridep(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 12x recipe with the HybridEP dispatcher in place of MinimalAsyncEP
+    (launch with HYBRIDEP=1). Retest: the dispatcher barrier is 12% of the
+    12x step (job 946 profile); HybridEP measured -2.9% on the 1k recipe."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_12x(seq_len)
+    assert _swap_ep_backend(config, "hybridep") > 0
+    return config
