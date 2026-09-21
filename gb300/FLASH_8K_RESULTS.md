@@ -3073,3 +3073,23 @@ are real for their regime; the balanced one is the closer proxy for trained
 routing. Queued: 1006 (13x, `FSDP_PREFETCH_DEPTH=2`, collapsed), 1007 (13x,
 balanced, prefetch 2). Traces: `/mnt/dgxc/profiles/bal_7x_iter10_traces/`,
 analysis `exposed_comm.py` next to `memcpy_stalls.py`.
+
+## Two-deep FSDP prefetch (1006) and the 13x stack under balanced routing (1007)
+
+**1006: 13x + `FSDP_PREFETCH_DEPTH=2`** (new knob in `torchtitan/distributed/fsdp.py`,
+explicit forward/backward prefetch N blocks ahead; bitwise on the debugmodel
+against the merged-code reference): **519.1 at step 20** (steps 17-20: 519.6 /
+498.1 / 493.7 / 519.1), 225.4 GiB, vs 517.6 at depth 1 -- neutral within the
+spread, +0.8 GiB. Kept on. (Aside: the merged branch changed the debugmodel's
+5-step losses at the 1e-5 level -- bounded SwiGLU -- so the bitwise reference
+is now 8.20762 / 6.94503 / 5.13873 / 4.63070 / 4.42346; jobs 998-1004.)
+
+**1007: the same 13x stack with forced load-balanced routing: 549.7 at step
+20, steps 16-20 = 577.3 / 575.6 / 541.1 / 532.5 / 549.7 (mean 555), 218.8 GiB**
+-- +7% over the collapsed pair (1006) and 6 GiB less (balanced experts pad
+less). Step-to-step spread is wider than in the collapsed regime. The profiled
+7x balanced run (1001) had done 579.5 *with* the profiler on, so the
+microbatch optimum likely shifts down in the balanced regime (128 small
+expert groups instead of ~6 huge ones; the offload's cost no longer buys a
+barrier-free step). Queued unprofiled: 7x balanced (no offload) and 10x
+balanced (offload), both with prefetch 2 and no amax all-reduce.
