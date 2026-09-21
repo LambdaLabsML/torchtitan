@@ -196,3 +196,181 @@ def offload_step(optim: Optimizer) -> None:
             )
         return
     off.step(optim)
+
+
+# --- Layer-wise deferred step, interleaved with the next forward ---------------
+# ``OPT_STATE_OFFLOAD_LAYERWISE=1`` (implies OPT_STATE_OFFLOAD=1). The plain
+# chunked step above exposes the whole moment transfer (~0.4 s/step at ~89 GB/s)
+# because nothing runs inside the optimizer step to hide it. Here ``step()``
+# only captures the work (grad references, lr, betas) per decoder layer and
+# updates the non-layer parameters (embedding, final norm, head) at once; every
+# layer's update -- H2D moments, fused AdamW, D2H write-back -- then runs on
+# side streams during the NEXT forward, two layers ahead of use. Each block's
+# forward pre-hook (registered with prepend=True, so it runs before FSDP2's own
+# pre-forward hook) makes the main stream wait on the update events of its own
+# layer and of the next one, because FSDP2's implicit prefetch all-gathers layer
+# i+1 during layer i; FSDP2's all-gather stream waits on main, so the gathered
+# shards are the updated ones. Grad references are held until the layer's
+# update event has been waited on, so ``zero_grad(set_to_none=True)`` at the
+# start of the next step cannot free them early.
+LAYERWISE = os.environ.get("OPT_STATE_OFFLOAD_LAYERWISE", "0") == "1"
+_AHEAD = int(os.environ.get("OPT_STATE_OFFLOAD_AHEAD", "2"))
+
+
+class _LayerwiseScheduler:
+    def __init__(self, container, optim: Optimizer):
+        self.optim = optim
+        self.off = _offloaders.setdefault(id(optim), _Offloader())
+        self.opt_stream = torch.cuda.Stream()
+        self.layer_of: dict[int, int] = {}  # id(param) -> layer (-1 = non-layer)
+        self.blocks: dict[int, torch.nn.Module] = {}
+        import re
+
+        pat = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+        for model in container.model_parts:
+            for name, p in model.named_parameters():
+                m = pat.search(name)
+                self.layer_of[id(p)] = int(m.group(1)) if m else -1
+            layers = getattr(model, "layers", None)
+            if layers is not None:
+                for key, block in layers.named_children():
+                    i = int(key)
+                    self.blocks[i] = block
+                    block.register_forward_pre_hook(self._make_hook(i), prepend=True)
+        self.n_layers = max(self.blocks) + 1 if self.blocks else 0
+        self.pending: dict[int, list] = {}
+        self.hyper = None
+        self.done: dict[int, torch.cuda.Event] = {}
+        self.launched: set[int] = set()
+
+    # --- capture at step() ---
+    def capture(self):
+        optim = self.optim
+        for hook in optim._optimizer_step_pre_hooks.values():
+            hook(optim, (), {})
+        self.pending = {}
+        self.hyper = []
+        for gi, group in enumerate(optim.param_groups):
+            lr = group["lr"]
+            lr = float(lr.item()) if torch.is_tensor(lr) else float(lr)
+            self.hyper.append((lr, *group["betas"], float(group["weight_decay"]), float(group["eps"])))
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = _local(p.grad)
+                g.record_stream(self.opt_stream)
+                self.pending.setdefault(self.layer_of.get(id(p), -1), []).append((gi, p, g))
+        for hook in optim._optimizer_step_post_hooks.values():
+            hook(optim, (), {})
+        self.done = {}
+        self.launched = set()
+        main = torch.cuda.current_stream()
+        # non-layer params (embedding, norm, head): update now; the root FSDP unit
+        # gathers them at the very start of the forward.
+        if -1 in self.pending:
+            self._launch(-1)
+            main.wait_event(self.done[-1])
+        for i in range(min(_AHEAD, self.n_layers)):
+            self._launch(i)
+
+    def _make_hook(self, i):
+        def hook(module, args, kwargs):
+            main = torch.cuda.current_stream()
+            for j in (i, i + 1):  # own layer, and the one FSDP prefetches during this layer
+                if j in self.pending and j not in self.launched:
+                    self._launch(j)
+                if j in self.done:
+                    main.wait_event(self.done[j])
+                    self.pending.pop(j, None)  # release grad references
+            nxt = i + _AHEAD
+            if nxt in self.pending and nxt not in self.launched:
+                self._launch(nxt)
+        return hook
+
+    # --- the update of one layer on the side streams ---
+    def _launch(self, layer):
+        items = self.pending.get(layer)
+        self.launched.add(layer)
+        if not items:
+            return
+        off, optim = self.off, self.optim
+        h2d, d2h, opt = off.h2d, off.d2h, self.opt_stream
+        main = torch.cuda.current_stream()
+        h2d.wait_stream(main)  # grads and the previous step's kernels are issued on main
+        by_class: dict[tuple, list] = {}
+        for gi, p, g in items:
+            by_class.setdefault((gi, _local(p).dtype, g.dtype), []).append((p, g))
+        for (gi, pdtype, gdtype), plist in by_class.items():
+            lr, beta1, beta2, wd, eps = self.hyper[gi]
+            device = _local(plist[0][0]).device
+            sdtype = optim.state[plist[0][0]]["exp_avg"].dtype
+            off._ensure_staging(device, sdtype)
+            chunks, cur, cur_n = [], [], 0
+            for p, g in plist:
+                n = _local(p).numel()
+                if cur and cur_n + n > _CHUNK_ELEMS:
+                    chunks.append(cur); cur, cur_n = [], 0
+                cur.append((p, g)); cur_n += n
+            if cur:
+                chunks.append(cur)
+            for k, chunk in enumerate(chunks):
+                buf_m, buf_v = off.staging[k % 2]
+                total = sum(_local(p).numel() for p, _ in chunk)
+                if total > _CHUNK_ELEMS:
+                    with torch.cuda.stream(h2d):
+                        buf_m = torch.empty(total, device=device, dtype=sdtype)
+                        buf_v = torch.empty(total, device=device, dtype=sdtype)
+                    buf_m.record_stream(opt); buf_v.record_stream(opt)
+                    buf_m.record_stream(d2h); buf_v.record_stream(d2h)
+                ev = off.last_d2h_events[k % 2]
+                if ev is not None:
+                    h2d.wait_event(ev)
+                with torch.cuda.stream(h2d):
+                    o, views = 0, []
+                    for p, _ in chunk:
+                        st = optim.state[p]; n = _local(p).numel(); shp = _local(p).shape
+                        m = buf_m[o:o + n].view(shp); v = buf_v[o:o + n].view(shp)
+                        m.copy_(_local(st["exp_avg"]), non_blocking=True); v.copy_(_local(st["exp_avg_sq"]), non_blocking=True)
+                        views.append((m, v)); o += n
+                    h2d_done = torch.cuda.Event(); h2d_done.record(h2d)
+                opt.wait_event(h2d_done)
+                with torch.cuda.stream(opt):
+                    steps = [optim.state[p]["step"] for p, _ in chunk]
+                    torch._foreach_add_(steps, 1.0)
+                    torch._fused_adamw_(
+                        [_local(p) for p, _ in chunk], [g for _, g in chunk],
+                        [m for m, _ in views], [v for _, v in views], [], steps,
+                        lr=lr, beta1=beta1, beta2=beta2, weight_decay=wd, eps=eps,
+                        amsgrad=False, maximize=False,
+                    )
+                    upd = torch.cuda.Event(); upd.record(opt)
+                d2h.wait_event(upd)
+                with torch.cuda.stream(d2h):
+                    for (p, _), (m, v) in zip(chunk, views):
+                        st = optim.state[p]
+                        _local(st["exp_avg"]).copy_(m, non_blocking=True); _local(st["exp_avg_sq"]).copy_(v, non_blocking=True)
+                    ev2 = torch.cuda.Event(); ev2.record(d2h)
+                off.last_d2h_events[k % 2] = ev2
+        done = torch.cuda.Event(); done.record(opt)
+        self.done[layer] = done
+
+
+_layerwise: dict[int, _LayerwiseScheduler] = {}
+
+
+def layerwise_step(container, optim: Optimizer) -> None:
+    """``offload_step`` variant whose per-layer updates run during the next forward."""
+    off = _offloaders.setdefault(id(optim), _Offloader())
+    if not off.migrated:
+        offload_step(optim)  # first step native + migration
+        return
+    sched = _layerwise.get(id(optim))
+    if sched is None:
+        sched = _layerwise[id(optim)] = _LayerwiseScheduler(container, optim)
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            import logging
+
+            logging.getLogger(__name__).info(
+                "optimizer state offload: layer-wise deferred step over %d layers, %d ahead", sched.n_layers, _AHEAD
+            )
+    sched.capture()
