@@ -304,7 +304,9 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         from torchtitan.components.optimizer import state_offload
 
         for optimizer in self.optimizers:
-            if state_offload.ENABLED:
+            if state_offload.ENABLED and state_offload.LAYERWISE:
+                state_offload.layerwise_step(self, optimizer)
+            elif state_offload.ENABLED:
                 state_offload.offload_step(optimizer)
             else:
                 optimizer.step()
