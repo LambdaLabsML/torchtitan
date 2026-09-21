@@ -3156,3 +3156,10 @@ and it changes numerics: ~0.3% of the step at best. Not built. The lever
 that remains for the copy is moving it off the SMs onto copy engines
 (gather to a contiguous staging buffer, batched peer memcpy), which would
 also unblock the dual-microbatch overlap that lost 6% to SM contention.
+
+**Collapsed 13x A/B (1020): 516.6 at step 20, steps 16-20 in 487-517, vs
+1006's 519.1 on 494-520** -- no measurable change; in the collapsed regime the
+8% barrier skew swamps a 1-2% copy saving. The geometry's +1.6% is
+established on the balanced plateau (1015 vs 1008) and the knobs stay on in
+both headline commands. Headline pair now: **587.5 balanced (7x, 1015) /
+519.1 collapsed (13x + offload, 1006)**.
