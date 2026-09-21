@@ -2974,3 +2974,12 @@ imbalance of the collapsed-routing regime these 20-step runs sit in. 941
 (10x + block-input offload) and 942 (12x) with the knob are queued; if the
 offload's 5% was the same skew through the all-reduce, it will not vanish
 either.
+
+## Block-input offload + `TE_REDUCE_AMAX=0` at 10x = 498.8 (job 941)
+
+10x with the offload and the knob: **498.8 TFLOP/s at step 20 (503 on steps
+18-19), 197.5 GiB** -- +2.5% over the same run with the all-reduce (935:
+486.6), so the offload's penalty fell from 5% to ~1.5%, as predicted for a
+jitter-through-a-barrier cost. Still under the 7x best without the offload
+(506.1): the 41 GiB the offload frees buys a microbatch that returns less
+than the offload costs. 12x (942) queued for the record.
