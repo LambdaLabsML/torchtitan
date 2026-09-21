@@ -14,7 +14,15 @@ write-back overlaps chunk k+1. The write-back of the last chunks drains into
 the next forward. Registered step pre-/post-hooks (bf16 state init, MoE
 expert-bias update) still run. State dict readers see CPU tensors.
 
-Knob: ``OPT_STATE_OFFLOAD=1`` (env); ``OPT_STATE_OFFLOAD_CHUNK_GIB`` (default 1).
+Knob: ``OPT_STATE_OFFLOAD=1`` (env); ``OPT_STATE_OFFLOAD_CHUNK_GIB`` (default 1);
+``OPT_STATE_OFFLOAD_DEBUG=1`` adds finiteness/contiguity checks (synchronizing).
+
+Stream ordering matters here: the H2D stream must wait for main before its
+first copy. Without that, its copies could run before the trainer's
+asynchronous finiteness assert had executed and, through the caching
+allocator, overwrite a just-freed main-stream tensor (jobs 882-890: NaN at
+"step 2", clean under CUDA_LAUNCH_BLOCKING=1). Debugmodel with the bookends
+matches the native optimizer bitwise over 4 steps (jobs 893/894).
 """
 
 from __future__ import annotations
@@ -166,13 +174,9 @@ def offload_step(optim: Optimizer) -> None:
         off = _offloaders[id(optim)] = _Offloader()
     if not off.migrated:
         optim.step()  # first step: fused AdamW creates the (bf16) moments on the GPU
-        if os.environ.get("OPT_STATE_OFFLOAD_NO_MIGRATE", "0") == "1":
-            n = 0  # bisect aid: keep moments on the GPU, still use the chunked step (D2D copies)
-        else:
-            n = off.migrate(optim)
+        n = off.migrate(optim)
         off.migrated = True
-        if os.environ.get("OPT_STATE_OFFLOAD_NO_EMPTY_CACHE", "0") != "1":
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
         if _DEBUG:
             torch.cuda.synchronize()
             badp = [tuple(p.shape) for g in optim.param_groups for p in g["params"] if not torch.isfinite(_local(p)).all()]
@@ -184,18 +188,5 @@ def offload_step(optim: Optimizer) -> None:
             logging.getLogger(__name__).info(
                 "optimizer state offload: moved %d params' Adam moments to pinned host memory", n
             )
-        return
-    mode = os.environ.get("OPT_STATE_OFFLOAD_BISECT", "")
-    if mode == "native":  # wrapper only: native step every step
-        optim.step()
-        return
-    if mode == "roundtrip":  # bring moments back to the GPU, native step, re-offload
-        for g in optim.param_groups:
-            for p in g["params"]:
-                st = optim.state.get(p)
-                if st and "exp_avg" in st and not st["exp_avg"].is_cuda:
-                    st["exp_avg"] = st["exp_avg"].to(_local(p).device); st["exp_avg_sq"] = st["exp_avg_sq"].to(_local(p).device)
-        optim.step()
-        off.migrate(optim)
         return
     off.step(optim)
