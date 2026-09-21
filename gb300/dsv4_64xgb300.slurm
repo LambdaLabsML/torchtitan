@@ -101,7 +101,7 @@ if [ "${HYBRIDEP:-0}" = "1" ]; then
   export PATH="$CUDA_HOME/bin:/mnt/dgxc/deepep-deps/tools/bin:$PATH"
   SP="$VENV/lib/python3.12/site-packages"
   export LD_LIBRARY_PATH="$SP/nvidia/cu13/lib:$SP/nvidia/nvshmem/lib:$SP/nvidia/nccl/lib:$CUDA_HOME/lib:${LD_LIBRARY_PATH:-}"
-  export PYTHONPATH="$WORKTREE:/mnt/dgxc/DeepEP-hybrid"
+  export PYTHONPATH="$WORKTREE:/mnt/dgxc/DeepEP-hybrid:/mnt/dgxc/pydeps${EXTRA_PYTHONPATH:+:$EXTRA_PYTHONPATH}"
   export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-4}
   export USE_MNNVL=${USE_MNNVL:-0}
   echo "###### HybridEP env on: ranks_per_nvlink_domain=$NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN USE_MNNVL=$USE_MNNVL HYBRIDEP_NUM_SMS_DISPATCH=${HYBRIDEP_NUM_SMS_DISPATCH:-default} HYBRIDEP_NUM_SMS_COMBINE=${HYBRIDEP_NUM_SMS_COMBINE:-default} ######"
