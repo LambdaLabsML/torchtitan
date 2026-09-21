@@ -34,7 +34,9 @@ login node, 00006/12/14/61/62/66/68/71/72 drained). Session window ends
 | 963 | 32 | X7a: bounded SwiGLU, skip mode (commit 54cca37c) | crash step 4 | | "loss or grad norm not finite"; local test: NaN rows past the last offset do NOT leak through `_grouped_mm` fwd/bwd |
 | 965 | 32 | K1: 7x with block-input offload, fix on, r02 | 483.9 | 175.4 GiB | offload still costs ~2.2% of its own at 7x |
 | 966 | 32 | K2: 7x without offload, fix on, r01 | 494.9 | 242.8 GiB | 12x+offload (~503) nets only +1.6% over 7x without |
-| 967 | 32 | X7c: bounded SwiGLU, zero mode (commit d23fb9a5), r03 | running | | outputs allocated zeroed; isolates whether a consumer reads the tail |
+| 967 | 32 | X7c: bounded SwiGLU, zero mode | crash step 2 | | root cause of 963/967: int32 element-offset overflow above row 1,048,576 in the kernels (fixed, commit f7f66b26) |
+| 968 | 64 | X8: HSDP replicate=2 + `NCCL_PROTO=Simple`, same nodes as 960 | 504.1 | 223.9 GiB | vs 960 503.3: no effect |
+| 969 | 32 | X7d: bounded SwiGLU with the offset fix, r03 | running | | vs 964 control on the same rack |
 | 964 | 32 | X7b: SwiGLU control (`TORCHTITAN_SWIGLU_BOUNDED=0`), r03 | queued behind 962 | | same-rack control for 967 |
 | 955 | 32 | X1: control + `NCCL_PROTO=Simple`, r03 | 496.4 (494.3 @ step 20) | 225.4 GiB | vs control 954: see below |
 | 956 | 32 | X2: control + HybridEP | crash at init | | NVLink-domain size 4 vs EP=2 |
@@ -116,9 +118,9 @@ to the edge. Analysis scripts: `scratchpad/prof_summary.py`, `straggler.py`,
       509.0 vs 499.2 (+2.0%), memory +16.6 GiB (the buffer no longer shares
       its region with per-layer activations). Less than the 4.6% the stall
       cost, so some allocator churn may remain; a re-profile would show.
-- [ ] A2. `NCCL_PROTO=Simple`: every collective runs LL today; the ledger
-      measured +0.85% on an old recipe and the dedicated protocol test (job
-      783) never ran. Env-only, in the 7b batch.
+- [x] A2. (closed, no effect) `NCCL_PROTO=Simple`: 32 GPUs 496.4 vs 493.1
+      control across racks (955/954); 64 GPUs HSDP on identical nodes 504.1
+      vs 503.3 (968/960). Both inside noise. Default protocol kept.
 - [x] B0. (done, job 960: 503.3) **64 GPUs as HSDP shard=32 replicate=2** (one 16-node rack): plain
       FSDP over 64 gave 485; HSDP at 96/128 gave 502-509, so the 64 number is
       likely recoverable the same way. Trades the 30 GiB memory saving back.
