@@ -145,6 +145,11 @@ class _TEExpertsChain(torch.autograd.Function):
         # so data_ptr/_version change within a step. Key on the values instead: a
         # strided sample checksum (one tiny host sync) is stable across the
         # forward, recompute and backward of a step and changes at optimizer.step.
+        if cache is None:
+            # No cross-pass cache: a per-layer cache of fp8 expert weights is
+            # 6.4 GB x 43 layers = 277 GB (job 877 OOM) -- it would undo FSDP's
+            # sharding. The fp8 weights live only inside this Function's ctx.
+            return tex.group_quantize(w.reshape(E * O, I), _quantizer(), E, None)
         flat = w.reshape(-1)
         stride = max(1, flat.numel() // 4096)
         sig = flat[::stride].float().sum().item()
@@ -176,9 +181,10 @@ class _TEExpertsChain(torch.autograd.Function):
             n = e1 - e0
             ss, (_, in_off, hid_off) = _offsets(sp, D, Fh)
             gx = tex.group_quantize(xp[r0:r1], _quantizer(), n, ss, tensor_offsets=in_off)
-            gw1 = _TEExpertsChain._weight(w1[e0:e1], caches[0].setdefault(i, {}), i)
-            gw3 = _TEExpertsChain._weight(w3[e0:e1], caches[1].setdefault(i, {}), i)
-            gw2 = _TEExpertsChain._weight(w2[e0:e1], caches[2].setdefault(i, {}), i)
+            cs = [None, None, None] if caches is None else [c.setdefault(i, {}) for c in caches]
+            gw1 = _TEExpertsChain._weight(w1[e0:e1], cs[0], i)
+            gw3 = _TEExpertsChain._weight(w3[e0:e1], cs[1], i)
+            gw2 = _TEExpertsChain._weight(w2[e0:e1], cs[2], i)
             _TEExpertsChain._gemm(gw1, gx, _grouped(gate[r0:r1], n, ss, hid_off, Fh), "TN")
             _TEExpertsChain._gemm(gw3, gx, _grouped(up[r0:r1], n, ss, hid_off, Fh), "TN")
             saved.append((e0, e1, r0, r1, ss, in_off, hid_off, gx, gw1, gw3, gw2))
@@ -253,7 +259,12 @@ class TEGroupedExperts(GroupedExperts):
 
     def __init__(self, config: Config):
         super().__init__(config)
-        object.__setattr__(self, "_te_caches", [{}, {}, {}])
+        import os
+
+        # Cross-pass fp8 weight cache only for tiny models (TE_EXPERTS_WCACHE=1);
+        # on dsv4_flash it costs 277 GB across layers (job 877).
+        caches = [{}, {}, {}] if os.environ.get("TE_EXPERTS_WCACHE", "0") == "1" else None
+        object.__setattr__(self, "_te_caches", caches)
 
     def forward(self, x_RD, num_tokens_per_expert_E):
         if not x_RD.is_cuda or x_RD.dtype != torch.bfloat16:
