@@ -3189,3 +3189,31 @@ half-size GEMMs and NVLink contention with FSDP gathers, not only SM
 contention. Closed. The SM copy at 16 rows/CTA is within ~20% of what this
 link delivers to any engine; the remaining exposed communication (~6% copy,
 ~5% FSDP tails) needs overlap, not a faster copy.
+
+## Dual-microbatch EP overlap re-tested under balanced routing: -20%, closed (jobs 1030-1033)
+
+The two-microbatch schedule (`dsv4_dual_microbatch`) was ported onto the
+merged branch (commit c3bc027a2: `DUAL_MB`, 4 slots per in-flight half via
+`set_microbatch_split`, `DEBUG_MB4` reference, 6x balanced variants; default
+off). Debugmodel at 4 sequences: losses agree to ~1e-6 relative from step 2
+(half-size GEMMs pick different split-K), no drift, no errors (1030/1031).
+
+**8-node A/B, 6x balanced (even sequence count is required: halves must be
+whole sequences), rack r02, EAGER module loading, 8 slots:**
+
+| job | schedule | TFLOP/s step 20 | steps 16-20 | peak |
+|---|---|---:|---|---:|
+| 1032 | single microbatch (control) | **575.0** | 575.0-576.4 | 217.2 GiB |
+| 1033 | dual microbatch | 457.0 | 457-511, swinging | 236.8 GiB |
+
+-13% to -20%, worse than the -6% measured in the collapsed regime, and
+unsteady where the control is flat. With the EP barrier already at ~0 under
+balanced routing, none of this is barrier contention: it is the price of the
+split itself (half-size expert GEMMs and attention, two dispatch/combine
+pairs per layer, the comm-stream joins, the expert FSDP unit held unsharded
+across both halves) plus stream jitter, against a copy that is only ~6% of
+the step. Megatron's version pays less because DeepEP runs on a few SMs,
+recompute is selective rather than FullAC, and CUDA graphs remove the launch
+cost of the finer schedule; none of those three transfer to this stack.
+Closed. The overlap route to the remaining ~6% copy / ~5% FSDP tails is not
+available with MinimalAsyncEP + FullAC; the balanced best stays at 587.5.
