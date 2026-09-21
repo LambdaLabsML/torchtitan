@@ -2635,3 +2635,20 @@ in MXFP8 (one quantize per optimizer step, half the gather bytes, no
 per-pass quantize) feeding this grouped GEMM directly, plus dispatcher-level
 128-row padding to drop the copies -- a day or two of FSDP2-extension work,
 not attempted here.
+
+**Job 878 (TE experts, 6x, no weight cache): OOM too** -- 251.5 GiB allocated
+vs 224.6 for the same recipe with bf16 experts (852), i.e. the chain holds
+~27 GiB more at the backward peak of one block: the fp8 weights for the chunk
+with both usages (6.4 GB, needed by fwd rowwise and dgrad columnwise), the
+quantized input and hidden with both usages (4.8 GB), the saved gate/up for the
+SwiGLU backward (2.4 GB), the padded input/output copies (4.8 GB), plus the
+backward's own dh/dgate/dup/dx (~8 GB), where the bf16 path saves little more
+than the slot alias and h. About 10 GB of that is recoverable (requantize the
+weights in backward, drop the rowwise input after forward) at ~4 ms more per
+layer-pass -- which by the 873 timings leaves no gain even in the collapsed
+regime (torch 38.6 ms vs TE ~39.5 per layer fwd+bwd). **Track closed: TE MXFP8
+grouped experts do not pay on dsv4_flash under FSDP-sharded bf16 experts.**
+The reusable pieces (TE build, cuBLAS 13.8 preload switch, the 128-row
+grouped layout facts, the single-Function chain) are on the branch; the
+design that could pay is fp8 primary expert weights all-gathered in MXFP8.
+**Best stays 482.8 TFLOP/s at 7x (job 853).**
