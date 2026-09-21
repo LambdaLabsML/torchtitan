@@ -1,4 +1,4 @@
-# DeepSeek-V4-flash, 8k seq, 32x GB300: 506.1 TFLOP/s (job 940)
+# DeepSeek-V4-flash, 8k seq, 32x GB300: 513.9 TFLOP/s (job 942)
 
 Branch `dsv4_te_mhc` = the full stack. Everything below default-off is a knob.
 
@@ -7,11 +7,12 @@ Branch `dsv4_te_mhc` = the full stack. Everything below default-off is a knob.
 RACK=r02 WORKTREE=<this checkout> \
 EXTRA_PYTHONPATH=/mnt/dgxc/pydeps-te:/mnt/dgxc/pydeps-cudnn \
 TORCHTITAN_FP32_MATMUL_PRECISION=tf32 TE_DENSE_RECIPE=delayed TE_REDUCE_AMAX=0 TORCHTITAN_TE_MHC=1 \
-CONFIG=deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x STEPS=20 TAG=best \
+TORCHTITAN_BLOCK_INPUT_OFFLOAD=1 \
+CONFIG=deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_12x STEPS=20 TAG=best \
 /mnt/dgxc/sbatch_rack.sh --parsable --nodes=8 --time=00:50:00 gb300/dsv4_64xgb300.slurm
 ```
-8 nodes x 4 GB300 in ONE rack (inter-rack IB is slow); the config is 7 sequences
-of 8192 per rank, EP=2, FSDP over the rest, FullAC, MinimalAsyncEP dispatcher
+8 nodes x 4 GB300 in ONE rack (inter-rack IB is slow); the config is 12 sequences
+of 8192 per rank (215 GiB peak; 7x without the offload = 506.1 at 238.5 GiB), EP=2, FSDP over the rest, FullAC, MinimalAsyncEP dispatcher
 with 4 receive slots (2 slots corrupt expert weight grads: see ledger).
 
 ## What is in the recipe (in stacking order, each measured in the ledger)
@@ -22,9 +23,11 @@ top-k (`cudnn_indexer`) -> Transformer Engine 2.19 fp8 dense linears
 (`torchtitan/quantization/te_linear.py`, `TE_DENSE_RECIPE=delayed`) -> copy-free
 grouped output projection + in-place indexer RoPE (`attention.py`,
 `compressor.py`) -> TE fused mHC kernels (`TORCHTITAN_TE_MHC=1`, residual
-stream kept as [T, D, n]) -> 7x microbatch -> `TE_REDUCE_AMAX=0` (skips TE's
-per-module synchronous amax all-reduce, 520 per step; 500.3 -> 506.1). Without
-the last knob the run reproduces job 880's 500.3.
+stream kept as [T, D, n]) -> 7x microbatch (500.3, job 880) -> `TE_REDUCE_AMAX=0`
+(skips TE's per-module synchronous amax all-reduce, 520 per step; 506.1, job
+940) -> `TORCHTITAN_BLOCK_INPUT_OFFLOAD=1` (FullAC block inputs to pinned host,
+copy at block entry, one-layer-deep restore in backward; -68 GiB at 7x) which
+makes 12x fit -> 12x microbatch (513.9, job 942).
 
 ## External pieces not in this repo (paths on the yqb01 cluster)
 * venv: `/mnt/dgxc/venvs/dsv4n` (torch 2.15 nightly cu130, aarch64).
@@ -39,8 +42,6 @@ the last knob the run reproduces job 880's 500.3.
 * Optional: cuBLAS 13.8 preload (`CUBLAS_NEW=1`) only for TE grouped experts.
 
 ## Knobs that are OFF in the best run (measured negative or neutral)
-`OPT_STATE_OFFLOAD`(+`_LAYERWISE`), `TORCHTITAN_BLOCK_INPUT_OFFLOAD` (works,
-bitwise, -68 GiB at 7x, but -5% and larger microbatches return <3%),
-`TE_EXPERTS`, `DUAL_MB` (other branch), DeepEP (`DEEPEP=1`), selective AC
+`OPT_STATE_OFFLOAD`(+`_LAYERWISE`), `TE_EXPERTS`, `DUAL_MB` (other branch), DeepEP (`DEEPEP=1`), selective AC
 configs, EP=1 configs, `parallelism.fp8_expert_all_gather`. The ledger
 `gb300/FLASH_8K_RESULTS.md` (branch `dsv4_flash_64xgb300`) has every number.
