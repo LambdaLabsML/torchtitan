@@ -2736,3 +2736,27 @@ is worth +2.5%, i.e. ~1 s/step in the optimizer. The step copies each
 parameter's two moments separately (1116 params x 2 x 2 directions of pinned
 copies per step, many of them tiny) -- microbenchmark 899 and a flat
 per-chunk-buffer variant follow.
+
+**Microbenchmark 899 (1 GPU, per-rank scale: 989 params, 8.95B elements,
+33.3 GiB of bf16 moments):** the copies are not launch-bound (2000 x 128 KiB
+copies: 10 ms) -- the volume is the cost. A 1 GiB pinned copy takes 12 ms
+each way (~89 GB/s effective, below the 133 GB/s the activation-offload
+work measured), so 33 GiB per direction is ~0.4 s per step even perfectly
+pipelined; the chunked step measures 686 ms at 1 GiB chunks and 1322 ms at
+4 GiB (less overlap). The optimizer's own compute is tens of milliseconds,
+so inside the optimizer step there is nothing to hide the transfers behind:
+at 8x (~12 s steps) that is 5-6% of the step against the eighth sequence's
++2.5%, exactly the 897 result. 9x (898) died at step 1 with a non-finite
+loss/grad before any optimizer step -- a 9x-specific issue (73,728 tokens per
+rank) unrelated to the offload, not chased since 9x cannot pay either.
+
+**Verdict: the chunked offload works and buys the memory (8x fits with
+10 GiB spare) but is net -5.6%; it can only pay if the moment traffic is
+hidden under the NEXT step's forward, i.e. a layer-wise optimizer step
+interleaved with the forward's per-layer FSDP unshard (Megatron's LayerWise
+optimizer, #4509/#5388). That is the remaining design: order chunks by
+layer, run each layer's update + write-back on a side stream during the
+forward, and make each block's pre-forward wait on its own update event.
+Expected recovery ~+2.5% per extra sequence up to the 276 GiB ceiling (8x, 9x
+if its NaN is fixed), against HBM contention with the forward. Not built.
+**Best stays 500.3 TFLOP/s at 7x (job 880).**
