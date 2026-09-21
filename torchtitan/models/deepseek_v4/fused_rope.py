@@ -56,7 +56,9 @@ def _rotate_tail_kernel(
     """Grid (T, cdiv(H, BLOCK_H)). Rotates x[t, h, D-RD:] pairs into out; with
     COPY_HEAD also copies x[t, h, :D-RD] so out is a complete out-of-place
     result (the in-place caller passes out == x and skips the copy)."""
-    t = tl.program_id(0)
+    # int64 row index: t * stride passes 2^31 once [T, 64, 512] exceeds 65536 rows
+    # (9x microbatch) -- int32 offsets then read out of bounds (job 917/918, probe 923).
+    t = tl.program_id(0).to(tl.int64)
     hb = tl.program_id(1)
     offs_h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
     mask_h = offs_h < H
