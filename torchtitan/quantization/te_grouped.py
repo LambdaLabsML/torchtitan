@@ -31,6 +31,7 @@ from torchtitan.models.common.moe import GroupedExperts
 
 
 def _tex():
+    import transformer_engine.pytorch  # noqa: F401  (loads the torch extension from wheel_lib)
     import transformer_engine_torch as tex
 
     return tex
