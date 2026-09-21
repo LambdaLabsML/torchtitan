@@ -214,7 +214,13 @@ def offload_step(optim: Optimizer) -> None:
 # update event has been waited on, so ``zero_grad(set_to_none=True)`` at the
 # start of the next step cannot free them early.
 LAYERWISE = os.environ.get("OPT_STATE_OFFLOAD_LAYERWISE", "0") == "1"
-_AHEAD = int(os.environ.get("OPT_STATE_OFFLOAD_AHEAD", "2"))
+# FSDP issues the all-gathers of the next FSDP_PREFETCH_DEPTH blocks during
+# block i, so block i's hook must have waited on the updates of layers
+# i .. i+depth, and a layer's update must be launched at least one block
+# before that wait to stay hidden: launch depth+1 ahead. (Job 1036: depth 2
+# with the old fixed i..i+1 wait let layer i+2's gather race its update.)
+_PREFETCH = max(1, int(os.environ.get("FSDP_PREFETCH_DEPTH", "1")))
+_AHEAD = max(int(os.environ.get("OPT_STATE_OFFLOAD_AHEAD", "2")), _PREFETCH + 1)
 
 
 class _LayerwiseScheduler:
@@ -276,7 +282,7 @@ class _LayerwiseScheduler:
     def _make_hook(self, i):
         def hook(module, args):
             main = torch.cuda.current_stream()
-            for j in (i, i + 1):  # own layer, and the one FSDP prefetches during this layer
+            for j in range(i, i + _PREFETCH + 1):  # own layer + the ones FSDP prefetches during it
                 if j in self.pending and j not in self.launched:
                     self._launch(j)
                 if j in self.done:
