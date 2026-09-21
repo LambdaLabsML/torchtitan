@@ -37,7 +37,8 @@ login node, 00006/12/14/61/62/66/68/71/72 drained). Session window ends
 | 967 | 32 | X7c: bounded SwiGLU, zero mode | crash step 2 | | root cause of 963/967: int32 element-offset overflow above row 1,048,576 in the kernels (fixed, commit f7f66b26) |
 | 968 | 64 | X8: HSDP replicate=2 + `NCCL_PROTO=Simple`, same nodes as 960 | 504.1 | 223.9 GiB | vs 960 503.3: no effect |
 | 969 | 32 | X7d: bounded SwiGLU with the offset fix, r03 | running | | vs 964 control on the same rack |
-| 964 | 32 | X7b: SwiGLU control (`TORCHTITAN_SWIGLU_BOUNDED=0`), r03 | queued behind 962 | | same-rack control for 967 |
+| 964 | 32 | X7b: SwiGLU control (`TORCHTITAN_SWIGLU_BOUNDED=0`), r03 | 499.4 (505.0 @ step 20) | 225.3 GiB | same-rack control for 969 |
+| 970 | 128 | FINAL: fix + bounded SwiGLU, HSDP replicate=4 | queued behind 969 | | TAG `final_128_12x_ws_swiglu`; cancel/resubmit without SwiGLU if 969 disappoints |
 | 955 | 32 | X1: control + `NCCL_PROTO=Simple`, r03 | 496.4 (494.3 @ step 20) | 225.4 GiB | vs control 954: see below |
 | 956 | 32 | X2: control + HybridEP | crash at init | | NVLink-domain size 4 vs EP=2 |
 | 958 | 32 | X2b: HybridEP, domain size 2 | crash at step 1 | | CheckpointError: routed row count differs on recompute (see D2) |
