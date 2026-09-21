@@ -2816,7 +2816,7 @@ cuDNN indexer):**
 | 907: EP=4, 3x | 312.7 | 136 GiB |
 | 906: EP=4, 4x | 335-353 | 158 GiB |
 | 905: EP=2, 4x | 384.9 | 170 GiB |
-| FullAC EP=2, 4x (909) | see below | |
+| FullAC EP=2, 4x (909) | 409.5 | 147 GiB |
 | FullAC EP=2, 7x (880, best) | 500.3 | 238.5 GiB |
 
 SAC fits far higher than the 181.69-era sweep found (~31 GiB per sequence
@@ -2834,3 +2834,8 @@ input, which is a symmetric-buffer alias that must not be saved, and a copy is
 ~2.4 GB per layer per 6 sequences. The recoverable recompute is therefore the
 non-MoE part (~10% of the step) against tens of GiB per sequence of saved
 attention/dense outputs. Not pursued.
+
+FullAC at the same 4x (909) runs 409.5 TFLOP/s at 147 GiB against SAC's 384.9
+at 170 GiB: with the default policy SAC is -6% at equal batch while using 23
+GiB more, i.e. it stores more and recomputes more than FullAC on this model.
+Confirms the analysis above; SAC closed again.
