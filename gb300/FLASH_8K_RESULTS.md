@@ -3270,3 +3270,32 @@ the optimum for this recipe; every way of fitting more (block-input offload,
 plain or layer-wise moment offload) costs at least what the extra sequence
 returns under balanced routing. The headroom you see at 6x is one sequence
 short of full, not spare capacity.** Balanced best stays 587.5 (job 1015).
+
+## EP degree sweep under balanced routing: EP=8 and EP=32 lose to EP=2 (jobs 1048-1055, 1061)
+
+Question: with 32 GPUs in one NVL72 rack, EP=32 puts exactly 8 experts on
+each GPU, removes the expert FSDP all-gather/reduce-scatter entirely and
+turns 128 small expert groups into 8 big ones -- does that plus a larger
+microbatch beat the EP=2 recipe? Prerequisites built: `_with_ep()` variants
+(EP=8/32 at 1x/7x/8x/9x), and `MINIMAL_ASYNC_EP_POOL_FACTOR` (api.py +
+token_dispatcher.py): MinimalAsyncEP sizes its receive pool and the routed
+activation at ep_size x tokens x top_k (90 GB per slot at EP=32/7x); the
+factor bounds them at factor x the expected receive (exact under forced
+balance; imbalanced routing beyond it would overflow -- balanced only).
+Cross-node symmetric memory works on this rack (2-node EP=8 smoke 1050 ran a
+step; its OOM was the 8-way sharding of a 1-node-scale test, not EP).
+
+| job | EP | microbatch | TFLOP/s (step 20) | steps 16-20 | peak |
+|---|---|---|---:|---|---:|
+| 1015 | 2 | 7x | **587.5** | 586-588 | 238.5 GiB |
+| 1052 | 8 | 7x | 537.7 | 538-541 | 215.9 GiB |
+| 1051 | 32 | 7x | ~521 (seen live; cancelled by hand, log did not flush) | | ~211 GB |
+| 1055 | 32 | 8x | 523.6 | 523.3-523.8 | 231.6 GiB |
+
+EP=32 saves ~27 GiB at 7x (no gathered expert weights in flight, pool at
+factor 2 = 22 GB) but runs ~11% slower, and the extra sequence at 8x buys
+nothing (523.6 vs ~521). The removed collectives were mostly overlapped
+already (5.6% exposed at EP=2), while the dispatch/combine copy -- SM stores
+over NVLink at ~620 GB/s, 1/2 remote at EP=2 -- becomes 31/32 remote at
+EP=32, roughly doubling a 7% item, on top of a 32-rank barrier per leg.
+9x EP=32 (1061) pending as the last point; it cannot change the ranking.
