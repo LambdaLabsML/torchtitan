@@ -38,7 +38,7 @@ login node, 00006/12/14/61/62/66/68/71/72 drained). Session window ends
 | 968 | 64 | X8: HSDP replicate=2 + `NCCL_PROTO=Simple`, same nodes as 960 | 504.1 | 223.9 GiB | vs 960 503.3: no effect |
 | 969 | 32 | X7d: bounded SwiGLU with the offset fix, r03 | **512.5** (513.4 @ step 20), min 510.3 | 223.1 GiB | **+2.6% vs 964 (499.4)** on the same rack; loss 3.02 vs 3.11 @ 20 (noise) |
 | 964 | 32 | X7b: SwiGLU control (`TORCHTITAN_SWIGLU_BOUNDED=0`), r03 | 499.4 (505.0 @ step 20) | 225.3 GiB | same-rack control for 969 |
-| 970 | 128 | FINAL: fix + bounded SwiGLU, HSDP replicate=4 | running (started 13:51) | | TAG `final_128_12x_ws_swiglu`; baselines 950 499.2 / 951 509.0 |
+| 970 | 128 | **FINAL: fix + bounded SwiGLU, HSDP replicate=4** | **515.0** (515.7 @ step 20), min 510.2 max 517.2 | 225.8 GiB | +3.2% vs 950 (499.2), +1.2% vs 951 (509.0); above yesterday's 32-GPU 507.9 |
 | 955 | 32 | X1: control + `NCCL_PROTO=Simple`, r03 | 496.4 (494.3 @ step 20) | 225.4 GiB | vs control 954: see below |
 | 956 | 32 | X2: control + HybridEP | crash at init | | NVLink-domain size 4 vs EP=2 |
 | 958 | 32 | X2b: HybridEP, domain size 2 | crash at step 1 | | CheckpointError: routed row count differs on recompute (see D2) |
