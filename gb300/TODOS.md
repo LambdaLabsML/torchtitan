@@ -26,7 +26,11 @@ login node, 00006/12/14/61/62/66/68/71/72 drained). Session window ends
 | 951 | 128 | same + persistent DSA workspace (commit 7fc610c5) | 509.0 (502.6 @ step 20) | 223.8 GiB | +2.0%, step spread 499-514 (950: 444-513) |
 | 952 | 128 | **hero**: 951 recipe, 100 steps, real C4 (`c4_local`) | **504.2 mean steps 11-100** (min 495.6, max 506.3) | 226.5 GiB | exit 0, 36 min wall; loss 11.99 -> 2.745, grad_norm 12.9 -> 0.13; curve `gb300/hero_128_12x_c4.png` |
 | 953 | 128 | reference: bf16 dense, bfx9 matmuls, eager mHC | cancelled (user: optimize first) | | config `..._cudnnidx_12x_c4` exists if wanted later |
-| 954 | 32 | X0 control: 12x + workspace fix, r02 | queued after 952 | | |
+| 954 | 32 | X0 control: 12x + workspace fix, r02 | 493.1 (492.7 @ step 20) | 225.6 GiB | lower than 945 (503.3) on the same nodes 2 h earlier; A/B 961 isolates the fix |
+| 959 | 32 | X4: EP=1, 7x (`..._ep1_7x`) | 441 (436.2 @ step 20) | 198.1 GiB | -12% vs EP=2 at 7x: full-expert all-gather per layer costs more than the dispatcher. EP=1+CUDA graphs dropped. |
+| 960 | 64 | B0: HSDP shard=32 replicate=2 (r01 8 + r02 8) | running | | |
+| 961 | 32 | X5: control with `TORCHTITAN_DSA_PERSISTENT_WORKSPACE=0`, r03 | running | | same-hour A/B for the fix at 32 GPUs |
+| 962 | 32 | X6: EP=4 at 12x (`--parallelism.expert_parallel_degree 4`), r03 | queued | | user request; prior: EP=2 beat EP=4 by ~8% on this attention recipe |
 | 955 | 32 | X1: control + `NCCL_PROTO=Simple`, r03 | 496.4 (494.3 @ step 20) | 225.4 GiB | vs control 954: see below |
 | 956 | 32 | X2: control + HybridEP | crash at init | | NVLink-domain size 4 vs EP=2 |
 | 958 | 32 | X2b: HybridEP, domain size 2 | crash at step 1 | | CheckpointError: routed row count differs on recompute (see D2) |
@@ -85,6 +89,8 @@ Side streams (fully overlapped, ~50 ms exposed total): FSDP reduce-scatter
 3144 ms, all-gather 2287 ms, offload DtoH 1882 ms, restore HtoD 1805 ms.
 Every NCCL kernel in the trace is `RING_LL`.
 
+Post-fix profile (job 957, step 9): longest barrier on any rank 94 ms (was 853), longest main-stream gap 28 ms (was 875), mean barrier per rank 1.46 s (was 1.9 s); 3 ranks still show 150-250 ms slow `empty_strided` allocations in step 8, so a little allocator churn remains.
+
 Root cause of the 850 ms per-step stall (item A): each layer's cuDNN DSA
 backward called `torch.empty` for a 26-32 GB scratch workspace and freed it
 after the layer (42x per step). Near the memory cap the caching allocator had
@@ -121,7 +127,7 @@ to the edge. Analysis scripts: `scratchpad/prof_summary.py`, `straggler.py`,
       (mHC residual stream `.contiguous()`). Fusing w1/w3 into one grouped GEMM
       means a `w13_E(2F)D` parameter layout: checkpoint mapping, FSDP
       sharding, init. Not a same-day change; sized for a follow-up.
-- [ ] D. EP=1 + CUDA graphs (user request). EP=1 removes the symmetric-memory
+- [x] D. (measured, dropped) EP=1 at 7x (job 959): 441 vs ~500 for EP=2, -12%, even with the barrier and peer copies gone. CUDA graphs would have to recover 12%. Original note: EP=1 + CUDA graphs (user request). EP=1 removes the symmetric-memory
       dispatcher (barrier + copies = 19% of the step) and makes shapes static
       so `training.disable_cuda_graphs=False` becomes possible, but every rank
       then all-gathers all 256 experts per layer (12.9 GB/layer; ledger EP=1
