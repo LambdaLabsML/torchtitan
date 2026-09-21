@@ -24,7 +24,7 @@ login node, 00006/12/14/61/62/66/68/71/72 drained). Session window ends
 | 949 | 96 | 8+8+8, HSDP shard=32 replicate=3 | 502.5 (501.9 @ step 20) | 207.6 GiB | HSDP holds the 32-GPU number across 3 racks |
 | 950 | 128 | 16 (r03) + 8 + 8, HSDP shard=32 replicate=4 | 499.2 (505.8 @ step 20) | 207.2 GiB | |
 | 951 | 128 | same + persistent DSA workspace (commit 7fc610c5) | 509.0 (502.6 @ step 20) | 223.8 GiB | +2.0%, step spread 499-514 (950: 444-513) |
-| 952 | 128 | hero: 951 recipe, 100 steps, real C4 (`c4_local`) | running (started 12:10) | | TAG `hero_128_12x_c4` |
+| 952 | 128 | hero: 951 recipe, 100 steps, real C4 (`c4_local`) | 505 @ step 20, running | 225.7 GiB | TAG `hero_128_12x_c4`; loss 3.54 @ 20 on C4 |
 | 953 | 128 | reference: bf16 dense, bfx9 matmuls, eager mHC, 100 steps, C4 | queued after 952 | | TAG `ref_128_12x_c4_bf16` |
 
 Noise floor: two runs with bitwise-identical numerics (950 vs 951, c4_test)
@@ -103,9 +103,8 @@ to the edge. Analysis scripts: `scratchpad/prof_summary.py`, `straggler.py`,
       FSDP over 64 gave 485; HSDP at 96/128 gave 502-509, so the 64 number is
       likely recoverable the same way. Trades the 30 GiB memory saving back.
 - [ ] B. **14x microbatch** (`..._tedense_14x`, 114688 tokens/rank). Never
-      measured (943 was cancelled, not OOM). 12x is now 224 GiB with the
-      persistent workspace; 14x adds ~16 GiB of block inputs (offloaded) plus
-      recompute peak, so it may or may not fit. In the 7b batch.
+      measured (943 was cancelled, not OOM). Probably OOM now: the device sits
+      at 278 of 284 GB at 12x with the persistent workspace. Low priority.
 - [ ] C. **Unfused expert-path elementwise** (~0.6 s, 3%): the two dgrad
       grouped GEMMs (w1 and w3 are separate `_grouped_mm` calls in
       `torchtitan/models/common/moe.py`) leave 688 adds of [1179648, 4096] per
@@ -123,9 +122,33 @@ to the edge. Analysis scripts: `scratchpad/prof_summary.py`, `straggler.py`,
       (build at `/mnt/dgxc/DeepEP-hybrid`; it forces CUDA graphs). Earlier
       sweep (jobs 784-795, 1k recipe): 2.9% below MinimalAsyncEP. Retest now
       that the dispatcher barrier is 12% of the step. In the 7b batch.
-- [ ] E. Remaining EP barrier waits (1.6 s/rank, 100 barriers of 1-90 ms) are
-      routing imbalance between the two EP peers (even ranks wait 0.6 s more
-      than odd). No cheap fix.
+- [x] E. (explained) The even/odd barrier asymmetry was item A: odd ranks'
+      main streams show 840 ms less kernel time in an identical step, i.e.
+      the straggler stall was absorbed as barrier spinning on even ranks and
+      as a stream gap on odd ranks. Residual barrier (1.6 s/rank) is genuine
+      peer sync; even ranks carry ~220 ms more expert GEMM (experts 0-127
+      receive more tokens than 128-255).
+- [ ] I. **Elementwise over padded EP capacity** (~3-4%, half a day). The
+      expert-path elementwise kernels (SiLU, gate*up, dgrad add) run over the
+      dispatcher's full receive capacity (1,179,648 rows) while the grouped
+      GEMMs respect the real offsets; expected fill is ~50% with top-k 6 over
+      2 EP ranks, so about half of the 2.5 s of Triton + plain elementwise is
+      wasted. Slicing needs the row count on the host (which MinimalAsyncEP
+      avoids); the fix is a masked / offset-aware fused kernel.
+- [ ] J. **Re-profile at 128 GPUs after the fix** (15 min): residual allocator
+      churn (the fix recovered 2.0 of the 4.6% and the card sits at 278 of
+      284 GB) and whether the cross-rack replica all-reduce is exposed.
+- [ ] K. **Re-measure the offload's own cost at 7x**: this morning's pair
+      (937/938, profiler on) put it at 4.8%. If that was mostly the allocator
+      stall it is now free; otherwise there is a second offload issue.
+- [x] L. (dead end) cuDNN DSA backward launch granularity: 33k launches/step
+      at ~77 us. The wrapper's `block_tile` is overridden by the SM100 backend
+      selector (tested 32/64/128 locally: identical time, bitwise equal).
+      Needs a cuDNN-side change.
+- [x] M. (keep) the per-layer index sort (0.4 s, 2%) is intentional: sorted
+      key sets measurably improve the kernel's numerics (cudnn_dsa.py:135).
+- [ ] N. FSDP2 flat-buffer copy-in/out for expert params: 0.33 s (1.8%) on
+      the main stream, inherent to FSDP2's all-gather layout. Low priority.
 - [x] F. (closed) TE MXFP8 grouped experts: ledger jobs 871-878. MXFP8 grouped
       GEMMs are 1.8x faster in isolation but fp8 weights cannot be cached
       across the step under FSDP-sharded bf16 experts (277 GB), so weights are
