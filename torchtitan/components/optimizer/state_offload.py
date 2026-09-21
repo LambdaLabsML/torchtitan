@@ -105,8 +105,9 @@ class _Offloader:
                     views = []
                     for p in chunk:
                         st = optim.state[p]; n = _local(p).numel()
-                        m = buf_m[off:off + n].view_as(st["exp_avg"]); v = buf_v[off:off + n].view_as(st["exp_avg_sq"])
-                        m.copy_(st["exp_avg"], non_blocking=True); v.copy_(st["exp_avg_sq"], non_blocking=True)
+                        shp = _local(p).shape
+                        m = buf_m[off:off + n].view(shp); v = buf_v[off:off + n].view(shp)
+                        m.copy_(_local(st["exp_avg"]), non_blocking=True); v.copy_(_local(st["exp_avg_sq"]), non_blocking=True)
                         views.append((m, v)); off += n
                 h2d_done = torch.cuda.Event(); h2d_done.record(self.h2d)
                 main.wait_event(h2d_done)
@@ -137,7 +138,7 @@ class _Offloader:
                 with torch.cuda.stream(self.d2h):
                     for p, (m, v) in zip(chunk, views):
                         st = optim.state[p]
-                        st["exp_avg"].copy_(m, non_blocking=True); st["exp_avg_sq"].copy_(v, non_blocking=True)
+                        _local(st["exp_avg"]).copy_(m, non_blocking=True); _local(st["exp_avg_sq"]).copy_(v, non_blocking=True)
                 ev = torch.cuda.Event(); ev.record(self.d2h)
                 self.last_d2h_events[k % 2] = ev
         for hook in optim._optimizer_step_post_hooks.values():
@@ -172,5 +173,18 @@ def offload_step(optim: Optimizer) -> None:
             logging.getLogger(__name__).info(
                 "optimizer state offload: moved %d params' Adam moments to pinned host memory", n
             )
+        return
+    mode = os.environ.get("OPT_STATE_OFFLOAD_BISECT", "")
+    if mode == "native":  # wrapper only: native step every step
+        optim.step()
+        return
+    if mode == "roundtrip":  # bring moments back to the GPU, native step, re-offload
+        for g in optim.param_groups:
+            for p in g["params"]:
+                st = optim.state.get(p)
+                if st and "exp_avg" in st and not st["exp_avg"].is_cuda:
+                    st["exp_avg"] = st["exp_avg"].to(_local(p).device); st["exp_avg_sq"] = st["exp_avg_sq"].to(_local(p).device)
+        optim.step()
+        off.migrate(optim)
         return
     off.step(optim)
