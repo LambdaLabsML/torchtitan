@@ -1010,3 +1010,10 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep1_1x(seq_len: int | None = 8192) -> 
 
 def deepseek_v4_flash_8k_gb300_cudnn_full_ep1_7x(seq_len: int | None = 8192) -> Trainer.Config:
     return _ep1_variant(7, seq_len)
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_12x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """12x microbatch (98304 tokens per rank); needs TORCHTITAN_BLOCK_INPUT_OFFLOAD=1."""
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(12, seq_len)
