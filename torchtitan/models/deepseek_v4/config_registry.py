@@ -1050,3 +1050,15 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_16x(
 ) -> Trainer.Config:
     """The 500 recipe at a 16x microbatch (131072 tokens per rank); needs the block-input offload."""
     return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(16, seq_len)
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_12x_profile(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 513.9 recipe (12x, job 942) with the profiler on (warmup 3, active 2, at step 10)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(12, seq_len)
+    config.profiler.enable_profiling = True
+    config.profiler.profile_freq = 10
+    config.profiler.profiler_warmup = 3
+    config.profiler.profiler_active = 2
+    return config
