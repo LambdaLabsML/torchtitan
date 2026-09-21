@@ -89,15 +89,22 @@ class _Offloader:
             device = _local(plist[0]).device
             dtype = optim.state[plist[0]]["exp_avg"].dtype
             self._ensure_staging(device, dtype)
-            # chunk by cumulative numel (a single huge param gets its own chunk)
-            chunks, cur, cur_n = [], [], 0
+            # chunk by cumulative numel within a (param dtype, grad dtype) class: the
+            # fused kernel needs uniform dtypes per call (fp32 hc weights live next to
+            # bf16 ones here; fp32 params + bf16 moments is its mixed-precision path).
+            chunks = []
+            by_dtype: dict[tuple, list] = {}
             for p in plist:
-                n = _local(p).numel()
-                if cur and cur_n + n > _CHUNK_ELEMS:
-                    chunks.append(cur); cur, cur_n = [], 0
-                cur.append(p); cur_n += n
-            if cur:
-                chunks.append(cur)
+                by_dtype.setdefault((_local(p).dtype, _local(p.grad).dtype), []).append(p)
+            for group_params in by_dtype.values():
+                cur, cur_n = [], 0
+                for p in group_params:
+                    n = _local(p).numel()
+                    if cur and cur_n + n > _CHUNK_ELEMS:
+                        chunks.append(cur); cur, cur_n = [], 0
+                    cur.append(p); cur_n += n
+                if cur:
+                    chunks.append(cur)
             main = torch.cuda.current_stream()
             # Order the side streams after everything main has issued so far (grads,
             # the trainer's async finiteness assert, the previous step's kernels) and
@@ -133,7 +140,6 @@ class _Offloader:
                 if _DEBUG:
                     for p_, g_ in zip(params, grads):
                         assert p_.is_contiguous() and g_.is_contiguous(), (p_.shape, p_.stride(), g_.stride())
-                        assert p_.dtype == g_.dtype == dtype, (p_.dtype, g_.dtype, dtype)
                 # torch.optim's fused path increments the step counters BEFORE the kernel
                 torch._foreach_add_(steps, 1.0)
                 torch._fused_adamw_(
