@@ -52,8 +52,10 @@ class BlockInputOffload(nn.Module):
         super().__init__()
         self.inner = inner
         self.index = index
-        self.prev: BlockInputOffload | None = None
-        self.next: BlockInputOffload | None = None
+        # neighbour links must NOT be registered as submodules (nn.Module would
+        # make the module graph cyclic and to_empty()/_apply recurse forever)
+        object.__setattr__(self, "prev", None)
+        object.__setattr__(self, "next", None)
         self.host = None          # pinned mirror of the current input
         self.x = None             # the GPU input tensor object (storage freed between fwd and bwd)
         self.nbytes = 0
@@ -137,5 +139,6 @@ def apply_block_input_offload(model: nn.Module) -> int:
         wrapped.append(w)
     wrapped.sort(key=lambda w: w.index)
     for a, b in zip(wrapped, wrapped[1:]):
-        a.next, b.prev = b, a
+        object.__setattr__(a, "next", b)
+        object.__setattr__(b, "prev", a)
     return len(wrapped)
