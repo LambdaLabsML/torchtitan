@@ -3306,3 +3306,33 @@ the balanced best stays **EP=2, 7x, 587.5 (job 1015)**. EP=32 is not a
 throughput lever on this recipe: what it removes (expert weight gather and
 reduce-scatter) was already ~95% hidden, what it adds (a near-all-remote
 dispatch copy and a 32-rank barrier per leg) is on the critical path.
+
+## NeMo Automodel #2039/#2076 assessed; shared-expert overlap re-tried with the dispatch on the side stream: no gain (jobs 1065-1068)
+
+#2039 is a model/PP/checkpoint port with no kernels or perf claims (8xA100).
+#2076: TileLang sparse-attention/indexer/Sinkhorn kernels (1.14-1.51x over
+*eager* at 160-4096 tokens) -- we already run cuDNN DSA, the cuDNN indexer
+and TE's fused mHC in their place; block-local AC that skips the MoE
+dispatch replay -- needs the dispatched rows resident, 120 GB/rank at 7x,
+does not fit; and a shared-expert overlap toggle -- built here two days ago
+(branch `dsv4_shared_expert_overlap`: shared experts on a side stream,
++13% at 4x, nothing at >=5x, +35-40 GiB from the second allocator pool).
+
+New variant on branch `dsv4_dispatch_overlap` (`TORCHTITAN_DISPATCH_OVERLAP=1`,
+default off): the *dispatch* goes to the comm stream and the shared experts
+run on main beside it, so only the dispatch outputs live in the side pool.
+Debugmodel bitwise (1065). Balanced regime, where the exposed dispatch is a
+token-proportional copy rather than a batch-amortised barrier:
+
+| job | microbatch | overlap | TFLOP/s step 20 | steps 16-20 | peak |
+|---|---|---|---:|---|---:|
+| 1015 | 7x | off | 587.5 | 586-588 | 238.5 GiB |
+| 1067 | 7x | on | OOM retry loop, cancelled | | |
+| 1032 | 6x | off | 575.0 | 575.0-576.4 | 217.2 GiB |
+| 1068 | 6x | on | 573.8 | 561-576 | 231.5 GiB |
+
+Zero gain, +14 GiB, wider spread. The shared-expert GEMM and the SM-resident
+copy kernel contend for the same SMs, so running them concurrently hides
+nothing -- the same reason the dual-microbatch schedule and the copy-engine
+idea failed: this dispatcher's copy is not a passive transfer that compute
+can run under. Closed. Nothing in 4.2 improves FSDP for this stack.
