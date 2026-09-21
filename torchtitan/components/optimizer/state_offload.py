@@ -274,7 +274,7 @@ class _LayerwiseScheduler:
             self._launch(i)
 
     def _make_hook(self, i):
-        def hook(module, args, kwargs):
+        def hook(module, args):
             main = torch.cuda.current_stream()
             for j in (i, i + 1):  # own layer, and the one FSDP prefetches during this layer
                 if j in self.pending and j not in self.launched:
