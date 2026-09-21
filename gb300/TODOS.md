@@ -8,6 +8,10 @@ NOTE: the login node's NFS view of a running job's log lags by minutes; read
 it from a compute node (`srun --jobid=<j> --overlap -N1 -n1 -w <node> ...`)
 or wait for the `###### END` marker in the `.out`.
 
+Cluster: 38 usable nodes (r01 9-10, r02 11-14, r03 18; mgx-00057 is the
+login node, 00006/12/14/61/62/66/68/71/72 drained). Session window ends
+~16:00 UTC.
+
 ## Results so far (mean TFLOP/s per GPU over steps 11-20)
 
 | job | GPUs | layout | TFLOP/s | peak mem | notes |
@@ -20,23 +24,40 @@ or wait for the `###### END` marker in the `.out`.
 | 949 | 96 | 8+8+8, HSDP shard=32 replicate=3 | 502.5 (501.9 @ step 20) | 207.6 GiB | HSDP holds the 32-GPU number across 3 racks |
 | 950 | 128 | 16 (r03) + 8 + 8, HSDP shard=32 replicate=4 | 499.2 (505.8 @ step 20) | 207.2 GiB | |
 | 951 | 128 | same + persistent DSA workspace (commit 7fc610c5) | 509.0 (502.6 @ step 20) | 223.8 GiB | +2.0%, step spread 499-514 (950: 444-513) |
+| 952 | 128 | hero: 951 recipe, 100 steps, real C4 (`c4_local`) | running (started 12:10) | | TAG `hero_128_12x_c4` |
+| 953 | 128 | reference: bf16 dense, bfx9 matmuls, eager mHC, 100 steps, C4 | queued after 952 | | TAG `ref_128_12x_c4_bf16` |
+
+Noise floor: two runs with bitwise-identical numerics (950 vs 951, c4_test)
+differ in per-step loss by 0.2 on average after step 10 (max 1.1 early);
+942 vs 945 differ 0.08 at step 20. Kernel and collective ordering is not
+deterministic, so the hero-vs-reference verdict is "curves overlap within
+this band", not an exact match. TFLOP/s noise is ~1% on the 10-step mean.
 
 ## Scale-out queue
 
-- [x] 1. reproduce 513.9 on 32 GPUs
+- [x] 1. reproduce 513.9 on 32 GPUs (945: 503.3 mean, within noise)
 - [x] 2. profile the 32-GPU recipe (job 946)
 - [x] 3. analyze the profile (findings below)
-- [x] 4. 64 GPUs, one rack (job 947)
+- [x] 4. 64 GPUs, one rack (job 947): 485.2 (plain FSDP; HSDP retest is B0)
 - [x] 5. 96 GPUs, 8 nodes per rack, HSDP (job 949): 502.5
-- [x] 6. 128 GPUs: 16 on r03 + 8 on r01 + 8 on r02, HSDP shard=32 replicate=4 (job 950): 499.2
-      (two shard groups on r03). Slurm orders ranks by hostname and the shard
-      axis is the inner mesh axis, so pick exactly 8 or 16 nodes per rack.
-- [ ] 7. optimize the best of 4/5/6 (profile + PGO, list below)
-- [ ] 8. hero run, >= 100 steps, loss curve captured (W&B is on by default).
-      Budget: ~18 s/step at every scale so far -> 100 steps ~30 min + ~5 min
-      startup; reserve 45 min. A reference run at the same GPU count and
-      microbatch (numerics knobs off) is another ~70 min, can run on another
-      rack in parallel. Decide: what is the curve compared against?
+- [x] 6. 128 GPUs: 16 on r03 + 8 on r01 + 8 on r02, HSDP shard=32 replicate=4
+      (job 950): 499.2. Two shard groups on r03. Slurm orders ranks by
+      hostname and the shard axis is the inner mesh axis, so pick exactly 8
+      or 16 nodes per rack. Launch: `--parallelism.data_parallel_replicate_degree 4`
+      plus `--nodelist`, partition `all`.
+- [x] 7a. first optimization applied and measured at 128 (A below, +2.0%)
+- [ ] 8. hero run on 128 GPUs (job 952), 100 steps, loss curve on real C4.
+      Reference (job 953) chained behind it on the same 32 nodes: same recipe
+      minus TE fp8 dense (bf16 `Linear`), `TORCHTITAN_FP32_MATMUL_PRECISION=bfx9`,
+      `TORCHTITAN_TE_MHC=0`. Both use the c4_local dataset (64 staged C4 shards
+      streamed locally, commit 5320d553) and the same schedule (warmup 2,
+      linear decay over the last 80 steps). ETA: hero ~12:50, reference ~13:40.
+      Compare with `scratchpad/curves.py` (loss, grad_norm, TFLOP/s overlay).
+- [ ] 7b. after the reference: experiment batch, 4 concurrent 8-node jobs
+      (~15 min): control = 12x + workspace fix at 32 GPUs; `NCCL_PROTO=Simple`;
+      HybridEP (`..._tedense_12x_hybridep`, `HYBRIDEP=1`); 14x microbatch
+      (`..._tedense_14x`, memory now 224 GiB at 12x). Then B0 (64 GPUs HSDP)
+      and stack whatever wins into a final 128-GPU run.
 
 ## Profile findings (job 946, rank 0, step 9, 18.4 s step, GPU 99.6% busy)
 
@@ -55,41 +76,56 @@ Side streams (fully overlapped, ~50 ms exposed total): FSDP reduce-scatter
 3144 ms, all-gather 2287 ms, offload DtoH 1882 ms, restore HtoD 1805 ms.
 Every NCCL kernel in the trace is `RING_LL`.
 
+Root cause of the 850 ms per-step stall (item A): each layer's cuDNN DSA
+backward called `torch.empty` for a 26-32 GB scratch workspace and freed it
+after the layer (42x per step). Near the memory cap the caching allocator had
+to release cached blocks (cudaFree + device synchronize) to place it: every
+rank shows ~15 such syncs per profiled window, 0.1-1.2 s each, and the
+slowest rank (rank 27 in step 9: 1.22 s) stalls all 32 through the next
+expert all-gather/reduce-scatter and the EP barrier. The 457.6-recipe
+profile (job 847, 6x) has no such stall; it appeared with 12x pushing memory
+to the edge. Analysis scripts: `scratchpad/prof_summary.py`, `straggler.py`,
+`slow_empty.py` (kept in the session scratchpad, not the repo).
+
 ## Optimization candidates, in order
 
-- [x] A. (fixed, commit 7fc610c5, +2.0% at 128 GPUs, job 951 vs 950) **The 850 ms stall at the forward->backward transition** (4.6% of
-      the step). On every odd rank the compute stream idles ~875 ms waiting
-      for a 1.04 s all-gather that runs alongside a 0.96 s reduce-scatter;
-      steady-state per-layer all-gathers take ~60 ms. The even rank then waits
-      for its odd EP peer in the barrier (even ranks: 2.25 s barrier/step,
-      odd: 1.63 s). Cheapest experiment: `NCCL_PROTO=Simple` (ledger: +0.85%
-      on an old recipe; the dedicated protocol test, job 783, never ran).
-      Second: find which parameter group's collectives these are (output
-      projection / embedding grads, 1 GB each, at backward start) and split or
-      reorder them.
-- [ ] B0. **64 GPUs as HSDP shard=32 replicate=2** (one 16-node rack): plain FSDP
-      over 64 gave 485; HSDP at 96 gave 502, so the 64 number is likely
-      recoverable the same way. Trades the 30 GiB memory saving back.
-- [ ] B. **14x microbatch at 64+ GPUs (plain FSDP only).** Wider FSDP sharding freed 30 GiB
-      (177 GiB at 64 GPUs vs 210 at 32). 14x was never measured (943 was
-      cancelled, not OOM). Config exists: `..._tedense_14x`.
-- [ ] C. **Unfused expert-path elementwise** (~0.6 s, 3%): in-place add of
-      the two dgrad grouped GEMMs (w1 and w3 are separate `_grouped_mm`
-      calls, 688 adds of [1179648, 4096] per step), 950 bf16->fp32 copies,
-      688 copies of a [T, 16384] tensor (mHC residual stream `.contiguous()`).
-      Fusing w1/w3 into one grouped GEMM removes the add and one input pass.
+- [x] A. **Persistent cuDNN backward workspace** (commit 7fc610c5): one
+      grow-only uint8 buffer shared by all layers, passed as the wrapper's
+      `workspace=`; `TORCHTITAN_DSA_PERSISTENT_WORKSPACE=0` restores the old
+      path. Single-GPU check: outputs and all grads bitwise equal. 128 GPUs:
+      509.0 vs 499.2 (+2.0%), memory +16.6 GiB (the buffer no longer shares
+      its region with per-layer activations). Less than the 4.6% the stall
+      cost, so some allocator churn may remain; a re-profile would show.
+- [ ] A2. `NCCL_PROTO=Simple`: every collective runs LL today; the ledger
+      measured +0.85% on an old recipe and the dedicated protocol test (job
+      783) never ran. Env-only, in the 7b batch.
+- [ ] B0. **64 GPUs as HSDP shard=32 replicate=2** (one 16-node rack): plain
+      FSDP over 64 gave 485; HSDP at 96/128 gave 502-509, so the 64 number is
+      likely recoverable the same way. Trades the 30 GiB memory saving back.
+- [ ] B. **14x microbatch** (`..._tedense_14x`, 114688 tokens/rank). Never
+      measured (943 was cancelled, not OOM). 12x is now 224 GiB with the
+      persistent workspace; 14x adds ~16 GiB of block inputs (offloaded) plus
+      recompute peak, so it may or may not fit. In the 7b batch.
+- [ ] C. **Unfused expert-path elementwise** (~0.6 s, 3%): the two dgrad
+      grouped GEMMs (w1 and w3 are separate `_grouped_mm` calls in
+      `torchtitan/models/common/moe.py`) leave 688 adds of [1179648, 4096] per
+      step, plus 950 bf16->fp32 copies and 688 copies of a [T, 16384] tensor
+      (mHC residual stream `.contiguous()`). Fusing w1/w3 into one grouped GEMM
+      means a `w13_E(2F)D` parameter layout: checkpoint mapping, FSDP
+      sharding, init. Not a same-day change; sized for a follow-up.
 - [ ] D. EP=1 + CUDA graphs (user request). EP=1 removes the symmetric-memory
       dispatcher (barrier + copies = 19% of the step) and makes shapes static
       so `training.disable_cuda_graphs=False` becomes possible, but every rank
       then all-gathers all 256 experts per layer (12.9 GB/layer; ledger EP=1
-      results were a collapse on the old recipe). Try after A-C.
-- [ ] D2. HybridEP dispatcher (user request): launcher `HYBRIDEP=1`, configs
-      `..._hep4/6/8` from the earlier sweep (jobs 784-795: HybridEP measured
-      2.9% below MinimalAsyncEP on the 1k recipe, and it forces CUDA graphs).
-      Retest on the 12x recipe with `_swap_ep_backend(config, "hybridep")`
-      since the dispatcher barrier is now 12% of the step.
+      results were a collapse on the old recipe). `_ep1_variant` configs exist.
+- [ ] D2. HybridEP dispatcher (user request): config
+      `..._tedense_12x_hybridep` (commit b066f2c4), launch with `HYBRIDEP=1`
+      (build at `/mnt/dgxc/DeepEP-hybrid`; it forces CUDA graphs). Earlier
+      sweep (jobs 784-795, 1k recipe): 2.9% below MinimalAsyncEP. Retest now
+      that the dispatcher barrier is 12% of the step. In the 7b batch.
 - [ ] E. Remaining EP barrier waits (1.6 s/rank, 100 barriers of 1-90 ms) are
-      routing imbalance between the two EP peers. No cheap fix.
+      routing imbalance between the two EP peers (even ranks wait 0.6 s more
+      than odd). No cheap fix.
 - [x] F. (closed) TE MXFP8 grouped experts: ledger jobs 871-878. MXFP8 grouped
       GEMMs are 1.8x faster in isolation but fp8 weights cannot be cached
       across the step under FSDP-sharded bf16 experts (277 GB), so weights are
@@ -99,15 +135,26 @@ Every NCCL kernel in the trace is `RING_LL`.
       1-2 days of FSDP2 work).
 - [x] G. (closed) deterministic DSA backward (~0.5 s): required, the router
       flips on near-ties and FullAC rejects the forward/recompute mismatch.
-- [ ] H. Not compiled: `compile.enable=False` everywhere; only leaf-compiled
-      helpers (silu, rmsnorm, mHC pieces, 6 small Inductor graphs) run
-      compiled. TE `te.Linear` is not torch.compiled and does not need to be
-      (cast + cuBLASLt fp8 GEMM are fused inside TE). The unfused work in C is
-      outside TE.
+- [x] H. (answered) Not compiled: `compile.enable=False` everywhere; only
+      leaf-compiled helpers (silu, rmsnorm, mHC pieces, 6 small Inductor
+      graphs) run compiled. TE `te.Linear` is not torch.compiled and does not
+      need to be (cast + cuBLASLt fp8 GEMM are fused inside TE). The unfused
+      work in C is outside TE.
 
 ## Bugs found
 
 - [ ] `fused_gate_up_param_init` (`torchtitan/models/common/config_utils.py`)
       unflattens the *sharded* DTensor: fails when dp_shard does not divide
-      2048 (96 ranks). Fix like the fused QKV init: build the replicated
-      tensor and `copy_` into the shard. Not needed with HSDP shard=32.
+      2048 (96 ranks, job 948). Fix like the fused QKV init: build the
+      replicated tensor and `copy_` into the shard. Not hit with HSDP shard=32.
+- [x] Login-node NFS view of a running job's log lags by minutes (looked like
+      a hang at 11:17; py-spy showed all ranks training). Read from a compute
+      node instead.
+
+## Commits this session (branch `dsv4_te_mhc`)
+
+- 98e9f936 config: 12x profile variant
+- 7fc610c5 cudnn_dsa: persistent backward workspace
+- 5320d553 data: c4_local dataset + 12x hero/reference configs
+- 229e1450 TODOS: 128-GPU results
+- b066f2c4 config: 12x HybridEP variant
