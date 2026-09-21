@@ -2862,3 +2862,15 @@ recompute+backward of the layer above. Traffic 0.033 MB/token/block per
 direction (50x less than the whole-block offload ruled out earlier). Debugmodel:
 **bitwise identical to the reference over 5 steps** (916 vs 902). Runs
 queued: 9x (with and without wq_b in TE, to settle the 9x step-1 NaN), 10x, 12x.
+
+**EP=1 at 7x (job 911): 365.7 TFLOP/s at 251.3 GiB, -27% vs EP=2 (500.3).**
+No dispatch/combine communication at all, but every layer all-gathers all
+256 experts (2x the expert bytes of EP=2), the grouped GEMM runs 256 small
+groups per rank, and the receive pool is gone in exchange for the standard
+dispatcher's permutes. EP=2 stays. (EP=1 at 1x: 111.5 at 146.9 GiB, job 910.)
+
+**9x with the block-input offload (917, wq_b out of TE): non-finite at step 1
+again**, so the 9x failure is not TE's wq_b cast. 8x is fine; something breaks
+between 65,536 and 73,728 tokens per rank. Bisect runs: 918 (9x, all of TE
+dense on), 921 (9x without the cuDNN indexer), 922 (9x without TE mHC). 10x/12x
+(919/920) cancelled until the cause is known.
