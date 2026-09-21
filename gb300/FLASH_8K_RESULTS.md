@@ -2783,3 +2783,15 @@ cuDNN attention/indexer and the offloaded moments cut that to 89 GiB, so SAC
 should now fit at 3x-4x. SAC removes most of the FullAC recompute (~a quarter
 of the step) against a smaller microbatch's ~2.5%-per-sequence penalty, so
 this is worth measuring: jobs 905 (EP2 4x), 906 (EP4 4x), 907 (EP4 3x).
+
+**Layer-wise deferred step at 8x (job 904, r02): 496.7-497.4 TFLOP/s at
+229.1 GiB** -- against 472.1 for the plain chunked offload at 8x (+5.3%: the
+moment traffic is now hidden under the next forward) and 500.3 for 7x with the
+moments on the GPU (-0.7%, inside run-to-run noise). So the offload is free
+but not yet profitable: the eighth sequence's +2.5% is spent on the residual
+cost (HBM contention with the forward, the two-layer-ahead stalls at the start
+of each step, the grads held through the forward). Profit needs 9x, which
+died at step 1 with a non-finite loss independent of the offload (898); the
+likely cause is TE's cast kernels on wq_b's [T, 32768] output crossing 2^31
+elements at 73,728 tokens (8x sits just under). Job 908 retries 9x with wq_b
+kept out of TE (``TE_DENSE_EXCLUDE=wq_b``, ~-1% for that projection).
