@@ -3103,3 +3103,24 @@ collapsed 7x (940: 506.1) and above the 13x balanced stack (1007: 549.7,
 noisy). In the balanced regime the expert GEMMs run as 128 similar groups
 and the EP barrier is gone, so the larger microbatch no longer buys anything
 the offload has to pay for. 10x balanced (1009) pending to close the curve.
+
+## Balanced-regime curve closed: 10x = 572.3 (job 1009); 7x without offload is the balanced best
+
+| job | microbatch | offload | regime | TFLOP/s (step 20) | steps 16-20 | peak |
+|---|---|---|---|---:|---|---:|
+| 1006 | 13x | on | collapsed | 519.1 | 494-520 | 225.4 GiB |
+| 1007 | 13x | on | balanced | 549.7 | 532-577 | 218.8 GiB |
+| 1009 | 10x | on | balanced | 572.3 | 541-572 | 199.0 GiB |
+| 1008 | **7x** | off | **balanced** | **578.5** | 575-578 | 238.5 GiB |
+| 940 | 7x | off | collapsed | 506.1 | 504-506 | 238.5 GiB |
+
+Balanced routing is worth +14% at 7x and inverts the microbatch curve: with
+the EP barrier gone and 128 similar expert groups, the extra sequences the
+block-input offload buys no longer cover its ~1.5% cost, and the offload runs
+also show a wider step-to-step spread (the offload streams add jitter that
+balanced EP now exposes at the FSDP gathers). All runs: `TE_REDUCE_AMAX=0`,
+`FSDP_PREFETCH_DEPTH=2`, `TORCHTITAN_DSA_PERSISTENT_WORKSPACE=0`, rack r02.
+
+**Headline pair for this recipe on 32 GB300 at 8k: 578.5 TFLOP/s balanced
+(7x, job 1008) / 519.1 collapsed (13x + offload, job 1006).** Report both
+with the regime named; Megatron's published MoE numbers are the balanced kind.
