@@ -2839,3 +2839,26 @@ FullAC at the same 4x (909) runs 409.5 TFLOP/s at 147 GiB against SAC's 384.9
 at 170 GiB: with the default policy SAC is -6% at equal batch while using 23
 GiB more, i.e. it stores more and recomputes more than FullAC on this model.
 Confirms the analysis above; SAC closed again.
+
+## EP=1 check, and FullAC block-input offload (built)
+
+**EP=1, 1x (job 910): fits and runs -- 111.5 TFLOP/s at 146.9 GiB.** Standard
+local dispatcher (no EP comm at all), default reshard policy (dense-never
+would keep all 43 layers' experts unsharded at EP=1), each layer's full 256
+experts gathered per pass. EP=1 at 7x: job 911.
+
+**FullAC block-input offload, built** (``torchtitan/distributed/block_input_offload.py``,
+``TORCHTITAN_BLOCK_INPUT_OFFLOAD=1``, wraps each FSDP-wrapped block outermost):
+the block input -- the only activation FullAC keeps, [T, 4, 4096] bf16 = 268 MB
+per block per sequence, 11.5 GiB per sequence over 43 layers, ~60% of the
+19.4 GiB each extra sequence costs -- is copied to a persistent pinned buffer
+on a D2H stream after the block's forward and its GPU storage released at the
+next block's forward (``resize_(0)`` on the very tensor the checkpoint
+closure holds); a hook on the block output's gradient restores this layer's
+input (storage-level copy: no tensor version bump, which FSDP2's
+``RegisterPostBackwardFunction`` input views would otherwise reject) and
+prefetches the previous layer's, one layer deep, so the H2D hides under the
+recompute+backward of the layer above. Traffic 0.033 MB/token/block per
+direction (50x less than the whole-block offload ruled out earlier). Debugmodel:
+**bitwise identical to the reference over 5 steps** (916 vs 902). Runs
+queued: 9x (with and without wq_b in TE, to settle the 9x step-1 NaN), 10x, 12x.
