@@ -2535,3 +2535,25 @@ internals), MinimalAsyncEP combine accumulate 173 ms, hc residual-grad
 accumulate 130 ms (autograd), ~150 ms of [T, 4096] casts/copies spread over
 ~10 sites per layer, and ~200 ms of index sorts of which only the static HCA
 compaction (64 ms) is cacheable. Nothing single above 1%.
+
+## Microbatch 7x on the 471 recipe = 482.8 TFLOP/s (job 853); 8x does not fit (854)
+
+| microbatch (r02, nodes 1-8, 20 steps) | TFLOP/s step 20 (steps 12-20) | allocator peak |
+| --- | --- | --- |
+| 6x (852) | 471.0 (471-476) | 224.6 GiB (81%) |
+| **7x (853)** | **482.8 (see range above)** | 244.0 GiB (88%) |
+| 8x (854) | never completed a step | expandable_segments OOM retry loop (free 16 MB of 296 GB), cancelled at 14 min |
+
++2.5% for the seventh sequence: the per-step FSDP traffic, optimizer and
+launch overheads amortise over 14% more tokens, and the loss trajectory is
+normal (3.00 @20). The allocator slope is ~19.4 GiB per extra sequence, on
+top of ~26 GiB of MinimalAsyncEP receive slots (4 x 2*T*6*4096 bf16, outside
+the allocator) plus cuDNN/TE/NCCL workspaces, so 8x needs ~290 GiB on a
+276 GiB card. Getting 8x in would need ~15-20 GiB back: the only levers on
+the table are dropping dense-never (13.6 GiB of unsharded dense params, costs
+~1.1%), or a memory-neutral fix for the receive-slot alias so the pool can go
+back to 2 slots (~13 GiB at 8x) -- the clone-based fix noted in the
+MinimalAsyncEP section, not implemented. Neither is clearly net positive over
+7x. **Best is now 482.8 at 7x** (config
+``deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x``,
+branch ``dsv4_eager_fusions``).
