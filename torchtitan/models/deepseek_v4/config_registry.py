@@ -644,6 +644,8 @@ def deepseek_v4_debugmodel_asyncep_policy(
     config.parallelism.fp8_expert_all_gather = os.environ.get("FP8_EXPERT_AG", "0") == "1"
     if os.environ.get("TE_DENSE", "0") == "1":
         _apply_te_dense(config)
+    if os.environ.get("TE_EXPERTS", "0") == "1":
+        assert _apply_te_experts(config) > 0
     if os.environ.get("CUDNN_INDEXER", "0") == "1":
         assert _enable_cudnn_indexer(config) > 0
     if os.environ.get("FP8_DENSE", "0") == "1":
@@ -893,4 +895,28 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_dee
     and the EP dispatch copy + barrier are the largest exposed item, so retest."""
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x(seq_len)
     assert _swap_ep_backend(config, "deepep") > 0
+    return config
+
+
+def _apply_te_experts(config: Trainer.Config) -> int:
+    """Swap every MoE's GroupedExperts config to TEGroupedExperts (MXFP8 grouped
+    GEMMs via Transformer Engine, torchtitan/quantization/te_grouped.py)."""
+    from torchtitan.models.common.moe import GroupedExperts, MoE
+    from torchtitan.quantization.te_grouped import convert_experts_config
+
+    n = 0
+    for _, moe_cfg, _, _ in config.model_spec.model.traverse(MoE.Config):
+        ie = moe_cfg.routed_experts.inner_experts
+        if type(ie) is GroupedExperts.Config:
+            moe_cfg.routed_experts.inner_experts = convert_experts_config(ie)
+            n += 1
+    return n
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_teexperts(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 482.8 recipe (7x) with the expert grouped GEMMs in MXFP8 through TE."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x(seq_len)
+    assert _apply_te_experts(config) > 0
     return config
