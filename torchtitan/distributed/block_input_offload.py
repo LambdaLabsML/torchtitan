@@ -75,11 +75,12 @@ class BlockInputOffload(nn.Module):
     # --- forward side ---
     def _offload(self, x: torch.Tensor) -> None:
         d2h, _ = _Streams.get()
+        assert x.is_contiguous() and x.storage_offset() == 0 and x.untyped_storage().nbytes() == x.numel() * x.element_size(), "block input must own its storage"
         if self.host is None or self.host.numel() != x.numel() or self.host.dtype != x.dtype:
             self.host = torch.empty(x.shape, dtype=x.dtype, pin_memory=True)
         d2h.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(d2h):
-            self.host.copy_(x, non_blocking=True)
+            self.host.untyped_storage().copy_(x.untyped_storage(), non_blocking=True)
             ev = torch.cuda.Event()
             ev.record(d2h)
         x.record_stream(d2h)
@@ -97,10 +98,13 @@ class BlockInputOffload(nn.Module):
         if self.x is None or not self.freed:
             return
         _, h2d = _Streams.get()
-        self.x.untyped_storage().resize_(self.nbytes)
+        st = self.x.untyped_storage()
+        st.resize_(self.nbytes)
         h2d.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(h2d):
-            self.x.copy_(self.host, non_blocking=True)
+            # storage-level copy: no tensor version bump, so the views FSDP2's
+            # RegisterPostBackwardFunction handed to the block stay valid for autograd
+            st.copy_(self.host.untyped_storage(), non_blocking=True)
             ev = torch.cuda.Event()
             ev.record(h2d)
         self.restore_done = ev
