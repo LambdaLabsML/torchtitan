@@ -2706,3 +2706,33 @@ semantics: this run mixes the residual streams as the mHC paper specifies
 torchtitan's non-mixing HcPost. Same-init loss is unaffected at this
 horizon (smoke 879 vs 838 identical to 4 digits), and the step-20 loss is in
 the usual band. **Best is now 500.3 TFLOP/s.**
+
+## Optimizer-state offload (Megatron #6244's idea): first 8-node results
+
+Branch ``dsv4_te_mhc``, ``torchtitan/components/optimizer/state_offload.py``,
+``OPT_STATE_OFFLOAD=1``. In this recipe parameters, gradients and Adam moments
+are all bf16, so the offloadable state is the two moments: 33 GiB of the
+~66 GiB static per-rank footprint (8.9B sharded params). The first step runs
+torch's fused AdamW natively, then the moments move to pinned host memory
+(942 GB per node; 132 GiB pinned for 4 ranks); later steps walk the params in
+~1 GiB chunks through two GPU staging buffers on H2D / compute / D2H streams,
+grouped by (param dtype, grad dtype) because the fused kernel needs uniform
+dtypes per call (the fp32 hc weights sit next to bf16 ones; 895 failed on
+that). Correctness: debugmodel matches the native optimizer bitwise over 4
+steps (893/894) once the H2D stream is ordered after main -- without that
+bookend its copies raced the trainer's asynchronous finiteness assert through
+the caching allocator and produced a spurious "NaN at step 2" (882-890, clean
+under ``CUDA_LAUNCH_BLOCKING=1``).
+
+| run (r02, TE delayed dense + TE mHC, 20 steps) | TFLOP/s step 20 | allocator peak |
+| --- | --- | --- |
+| 880: 7x, moments on GPU (best) | 500.3 | 238.5 GiB |
+| 897: 8x, moments offloaded | 472.1 | 228.8 GiB |
+
+The offload buys the memory it should (8x fits with 10 GiB to spare where it
+OOMed before) but costs far more than the ~0.3 s/step that 33 GiB at the
+measured 133 GB/s C2C rate implies: -5.6% net where the eighth sequence alone
+is worth +2.5%, i.e. ~1 s/step in the optimizer. The step copies each
+parameter's two moments separately (1116 params x 2 x 2 directions of pinned
+copies per step, many of them tiny) -- microbenchmark 899 and a flat
+per-chunk-buffer variant follow.
