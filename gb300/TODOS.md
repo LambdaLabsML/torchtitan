@@ -25,7 +25,11 @@ login node, 00006/12/14/61/62/66/68/71/72 drained). Session window ends
 | 950 | 128 | 16 (r03) + 8 + 8, HSDP shard=32 replicate=4 | 499.2 (505.8 @ step 20) | 207.2 GiB | |
 | 951 | 128 | same + persistent DSA workspace (commit 7fc610c5) | 509.0 (502.6 @ step 20) | 223.8 GiB | +2.0%, step spread 499-514 (950: 444-513) |
 | 952 | 128 | hero: 951 recipe, 100 steps, real C4 (`c4_local`) | 505 @ step 20, running | 225.7 GiB | TAG `hero_128_12x_c4`; loss 3.54 @ 20 on C4 |
-| 953 | 128 | reference: bf16 dense, bfx9 matmuls, eager mHC, 100 steps, C4 | queued after 952 | | TAG `ref_128_12x_c4_bf16` |
+| 953 | 128 | reference: bf16 dense, bfx9 matmuls, eager mHC | cancelled (user: optimize first) | | config `..._cudnnidx_12x_c4` exists if wanted later |
+| 954 | 32 | X0 control: 12x + workspace fix, r02 | queued after 952 | | |
+| 955 | 32 | X1: control + `NCCL_PROTO=Simple`, r03 | queued after 952 | | |
+| 956 | 32 | X2: control + HybridEP (`HYBRIDEP=1`, `..._12x_hybridep`), r03 | queued after 952 | | |
+| 957 | 32 | X3: control + profiler (`..._12x_profile`), r01 | queued after 952 | | post-fix trace for the next PGO round |
 
 Noise floor: two runs with bitwise-identical numerics (950 vs 951, c4_test)
 differ in per-step loss by 0.2 on average after step 10 (max 1.1 early);
@@ -47,17 +51,18 @@ this band", not an exact match. TFLOP/s noise is ~1% on the 10-step mean.
       plus `--nodelist`, partition `all`.
 - [x] 7a. first optimization applied and measured at 128 (A below, +2.0%)
 - [ ] 8. hero run on 128 GPUs (job 952), 100 steps, loss curve on real C4.
-      Reference (job 953) chained behind it on the same 32 nodes: same recipe
-      minus TE fp8 dense (bf16 `Linear`), `TORCHTITAN_FP32_MATMUL_PRECISION=bfx9`,
-      `TORCHTITAN_TE_MHC=0`. Both use the c4_local dataset (64 staged C4 shards
-      streamed locally, commit 5320d553) and the same schedule (warmup 2,
-      linear decay over the last 80 steps). ETA: hero ~12:50, reference ~13:40.
-      Compare with `scratchpad/curves.py` (loss, grad_norm, TFLOP/s overlay).
-- [ ] 7b. after the reference: experiment batch, 4 concurrent 8-node jobs
-      (~15 min): control = 12x + workspace fix at 32 GPUs; `NCCL_PROTO=Simple`;
-      HybridEP (`..._tedense_12x_hybridep`, `HYBRIDEP=1`); 14x microbatch
-      (`..._tedense_14x`, memory now 224 GiB at 12x). Then B0 (64 GPUs HSDP)
-      and stack whatever wins into a final 128-GPU run.
+      Uses the c4_local dataset (64 staged C4 shards streamed locally, commit
+      5320d553), warmup 2, linear decay over the last 80 steps. ETA ~12:50.
+      The bf16-dense reference (953) was cancelled to move to optimizations;
+      its config `..._cudnnidx_12x_c4` (+ `TORCHTITAN_FP32_MATMUL_PRECISION=bfx9
+      TORCHTITAN_TE_MHC=0`) is ready if a numerics comparison is wanted later.
+      Plot with `scratchpad/curves.py` (loss, grad_norm, TFLOP/s overlay).
+- [ ] 7b. experiment batch queued behind the hero (jobs 954-957, 4 concurrent
+      8-node jobs, ~15 min): X0 control = 12x + workspace fix at 32 GPUs;
+      X1 `NCCL_PROTO=Simple`; X2 HybridEP; X3 post-fix profile. Then B0 (64
+      GPUs HSDP) and stack whatever wins into a final 128-GPU run.
+      Launcher fix on the way: `HYBRIDEP=1` used to drop pydeps/EXTRA_PYTHONPATH
+      (commit 937c2062).
 
 ## Profile findings (job 946, rank 0, step 9, 18.4 s step, GPU 99.6% busy)
 
