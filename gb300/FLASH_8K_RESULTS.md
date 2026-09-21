@@ -2686,3 +2686,23 @@ design that could pay is fp8 primary expert weights all-gathered in MXFP8.
   "DSv4 mHC does not mix"), so this also changes the model to the intended
   math. Debugmodel smoke 879: 8.20762 / 3.2909 / 6.94509 vs 8.20766 / 3.2912
   / 6.94506. 8-node 7x run: job 880, result below.
+
+## New best: TE fused mHC on the 7x recipe = 500.3 TFLOP/s (job 880)
+
+| run (r02, nodes 1-8, 7x, TE delayed dense, 20 steps) | TFLOP/s step 20 (steps 12-20) | memory | loss @20 |
+| --- | --- | --- | --- |
+| 853: cudnnidx + TE dense + eager fusions | 482.8 (482-484) | 244.0 GiB | 3.00 |
+| **880: + TE fused mHC** | **500.3 (see range above)** | **238.5 GiB** | 3.06 |
+
++3.6%, -5.5 GiB, loss in band. The hyper-connection path went from ~12% of
+kernel time (Inductor kernels + fp32 upcast + TF32 N=24 GEMMs, several passes
+over the [T, 4, 4096] stream per call) to TE's fused kernels reading the
+stream once per op; it is on the critical path, so the saving converted well.
+Config: ``deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x``
+with ``TORCHTITAN_TE_MHC=1 TE_DENSE_RECIPE=delayed`` (branch ``dsv4_te_mhc``,
+``EXTRA_PYTHONPATH=/mnt/dgxc/pydeps-te:/mnt/dgxc/pydeps-cudnn``). Note the
+semantics: this run mixes the residual streams as the mHC paper specifies
+(TE's expand+combine); the 482.8 baseline and every earlier number used
+torchtitan's non-mixing HcPost. Same-init loss is unaffected at this
+horizon (smoke 879 vs 838 identical to 4 digits), and the step-20 loss is in
+the usual band. **Best is now 500.3 TFLOP/s.**
