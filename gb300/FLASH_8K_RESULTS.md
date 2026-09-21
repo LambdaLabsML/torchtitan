@@ -3033,3 +3033,17 @@ Merged branch (bounded SwiGLU on, persistent DSA workspace off), rack r02:
 pre-merge 12x (942: 513.9). 13x fits with 52 GiB of allocator headroom but
 the device is near full once the ~60 GiB outside the allocator is counted,
 which is why 14x needs the moment offload (997, running).
+
+## 14x fits with the moment offload, but loses: 503.8 TFLOP/s (job 997)
+
+14x + block-input offload + layer-wise Adam-moment offload (`OPT_STATE_OFFLOAD=1
+OPT_STATE_OFFLOAD_LAYERWISE=1`, `CUDA_MODULE_LOADING=EAGER`), merged branch,
+r02: **503.8 TFLOP/s at step 20, 204.8 GiB**, clean (no OOM retries). The
+33 GiB the moments free make 14x fit with room to spare, but the moment
+traffic under the forward costs more than the extra sequence returns: -2.7%
+vs 13x without it (996: 517.6). The run took ~16 min wall (moment migration
+at init plus slower steps) and its log flushed only at exit.
+
+**Standing best: 13x = 517.6 (job 996).** Microbatch curve with the
+block-input offload on the merged code: 12x 509.4, 13x 517.6, 14x (+moments)
+503.8; 14x without the moment offload OOMs (943).
