@@ -1067,3 +1067,12 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_12x_hy
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_12x(seq_len)
     assert _swap_ep_backend(config, "hybridep") > 0
     return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_profile_balanced(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 7x profile variant with forced load-balanced routing: splits the EP
+    barrier wait into token-imbalance vs launch jitter (pair with job 938)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_profile(seq_len)
+    config.debug.moe_force_load_balance = True
+    return config
