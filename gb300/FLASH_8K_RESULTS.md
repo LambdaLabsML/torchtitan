@@ -2996,3 +2996,12 @@ offload) and 16x (944, ~241) queued, same env.
 
 Recipe = the 500.3 stack + `TE_REDUCE_AMAX=0` + `TORCHTITAN_BLOCK_INPUT_OFFLOAD=1`
 + `..._12x`; `gb300/REPRODUCE_500.md` on `dsv4_te_mhc` has the command.
+
+## 14x does not fit even with the offload (job 943); 16x cancelled (944)
+
+14x entered the `expandable_segments` OOM retry loop before step 1 (guard
+cancelled it); 16x was cancelled unstarted. So the 6.5 GiB-per-sequence slope
+read off the reported peaks (191 -> 200 -> 215 GiB for 9x/10x/12x) does not
+extrapolate: the reported number is max *allocated*; what overflows at 14x is
+the reserved footprint at the step-1 peak. **12x is the ceiling of this recipe
+and 513.9 (job 942) stands as the best.**
