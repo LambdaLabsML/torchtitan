@@ -837,6 +837,9 @@ def _apply_te_dense(config: Trainer.Config) -> Trainer.Config:
     from torchtitan.quantization.utils import module_filter_fn
 
     fqns = [f for f in FP8_DENSE_FILTER_FQNS if f != "auto_filter_small_kn"]
+    # TE_DENSE_EXCLUDE=wq_b,wo_b: keep those projections out of TE (e.g. wq_b's
+    # [T, 32768] output passes 2^31 elements at a 9x microbatch).
+    fqns += [f for f in os.environ.get("TE_DENSE_EXCLUDE", "").split(",") if f]
     n = 0
     for fqn, lc, parent, attr in list(config.model_spec.model.traverse(Linear.Config)):
         if type(lc) is not Linear.Config or not module_filter_fn(lc, fqn, fqns):
