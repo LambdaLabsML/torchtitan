@@ -145,14 +145,23 @@ class TEGroupedExperts(GroupedExperts):
             return super().forward(x_RD, num_tokens_per_expert_E)
         splits = num_tokens_per_expert_E.to(torch.int64)
         padded, dst, rp = pad_plan(splits)
-        xp = x_RD.new_zeros(rp, x_RD.shape[1]).index_copy(0, dst, x_RD)
+        # MinimalAsyncEP hands over its full-capacity receive slot; only the
+        # first sum(counts) rows are valid, and combine expects an output with
+        # the same capacity row count.
+        r_cap = x_RD.shape[0]
+        r_valid = dst.numel()
+        xv = x_RD[:r_valid] if r_valid != r_cap else x_RD
+        xp = xv.new_zeros(rp, xv.shape[1]).index_copy(0, dst, xv)
         c = self.__dict__["_te_caches"]
         w1, w3, w2 = self.w1_EFD, self.w3_EFD, self.w2_EDF
         gate = te_grouped_mm(xp, w1.bfloat16(), padded, c[0])
         up = te_grouped_mm(xp, w3.bfloat16(), padded, c[1])
         h = self.activation_fn(gate, up)
         yp = te_grouped_mm(h, w2.bfloat16(), padded, c[2])
-        return yp.index_select(0, dst).type_as(x_RD)
+        y = yp.index_select(0, dst).type_as(x_RD)
+        if r_valid != r_cap:
+            y = F.pad(y, (0, 0, 0, r_cap - r_valid))
+        return y
 
 
 def convert_experts_config(cfg: GroupedExperts.Config) -> TEGroupedExperts.Config:
