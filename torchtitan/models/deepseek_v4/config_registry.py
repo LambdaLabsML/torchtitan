@@ -22,7 +22,6 @@ from torchtitan.trainer import Trainer
 from . import model_registry
 from .mtp import MTPLoss
 
-
 def deepseek_v4_debugmodel(
     seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
 ) -> Trainer.Config:
@@ -67,7 +66,6 @@ def deepseek_v4_debugmodel(
         ),
     )
 
-
 def deepseek_v4_mtp_debugmodel(
     seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
 ) -> Trainer.Config:
@@ -109,7 +107,6 @@ def deepseek_v4_mtp_debugmodel(
             interval=100,
         ),
     )
-
 
 def deepseek_v4_flash(seq_len: int | None = None) -> Trainer.Config:
     model_spec = model_registry("deepseek_v4_flash", seq_len=seq_len)
@@ -153,7 +150,6 @@ def deepseek_v4_flash(seq_len: int | None = None) -> Trainer.Config:
         ),
     )
 
-
 def deepseek_v4_pro(seq_len: int | None = None) -> Trainer.Config:
     model_spec = model_registry("deepseek_v4_pro", seq_len=seq_len)
     return Trainer.Config(
@@ -196,7 +192,6 @@ def deepseek_v4_pro(seq_len: int | None = None) -> Trainer.Config:
         ),
     )
 
-
 # GB300 (sm_103) requires these FlexAttention tiles at head_dim=512. Without
 # them the first forward dies with "No valid triton configs ... Required:
 # 294912, Hardware limit: 232448", and without the backward tiles specifically
@@ -222,7 +217,6 @@ _GB300_FLEX_KERNEL_OPTIONS = {
     "BLOCK_N2": 16,
 }
 
-
 def _pin_gb300_flex_tiles(config: Trainer.Config, block_size: int = 32) -> None:
     """Pin the flex tiles and sparse block size on every flex layer."""
     from torchtitan.models.common.attention import FlexInnerAttention
@@ -236,7 +230,6 @@ def _pin_gb300_flex_tiles(config: Trainer.Config, block_size: int = 32) -> None:
             # against variants that do not fit: throughput-neutral and ~228 s
             # of startup per distinct shape.
             inner.max_autotune = False
-
 
 def deepseek_v4_flash_8k_gb300(seq_len: int | None = 8192) -> Trainer.Config:
     """DeepSeek-V4 flash at seq_len 8192 on 64x GB300 (16 nodes x 4 GPUs).
@@ -295,7 +288,6 @@ def deepseek_v4_flash_8k_gb300(seq_len: int | None = 8192) -> Trainer.Config:
     config.training.steps = 30
     return config
 
-
 def deepseek_v4_flash_8k_gb300_batched(
     microbatch: int = 4, seq_len: int | None = 8192
 ) -> Trainer.Config:
@@ -314,7 +306,6 @@ def deepseek_v4_flash_8k_gb300_batched(
     config = deepseek_v4_flash_8k_gb300(seq_len)
     config.training.num_tokens_per_microbatch_per_dp_rank = microbatch * (seq_len or 8192)
     return config
-
 
 def deepseek_v4_flash_8k_gb300_batched_stages2(
     microbatch: int = 6, seq_len: int | None = 8192
@@ -348,7 +339,6 @@ def deepseek_v4_flash_8k_gb300_batched_stages2(
             inner.kernel_options = opts
     return config
 
-
 def deepseek_v4_flash_8k_gb300_batched_stages2_profile(
     microbatch: int = 6, seq_len: int | None = 8192
 ) -> Trainer.Config:
@@ -364,7 +354,6 @@ def deepseek_v4_flash_8k_gb300_batched_stages2_profile(
     config.profiler.profiler_warmup = 3
     config.profiler.profiler_active = 2
     return config
-
 
 def deepseek_v4_flash_8k_gb300_free_bwd_tiles(
     microbatch: int = 4, seq_len: int | None = 8192, autotune: bool = True
@@ -397,7 +386,6 @@ def deepseek_v4_flash_8k_gb300_free_bwd_tiles(
             inner.max_autotune = autotune
     return config
 
-
 def deepseek_v4_flash_8k_gb300_fp32_params(
     microbatch: int = 4, seq_len: int | None = 8192
 ) -> Trainer.Config:
@@ -414,7 +402,6 @@ def deepseek_v4_flash_8k_gb300_fp32_params(
     config = deepseek_v4_flash_8k_gb300_batched(microbatch, seq_len)
     config.training.dtype = "float32"
     return config
-
 
 def deepseek_v4_flash_8k_gb300_fastdata(
     microbatch: int = 4, seq_len: int | None = 8192
@@ -449,7 +436,6 @@ def deepseek_v4_flash_8k_gb300_fastdata(
     config.dataloader.num_prefetch_batches = 8
     return config
 
-
 def deepseek_v4_flash_8k_gb300_sac(
     microbatch: int = 1, ep: int = 2, seq_len: int | None = 8192
 ) -> Trainer.Config:
@@ -483,7 +469,6 @@ def deepseek_v4_flash_8k_gb300_sac(
     )
     return config
 
-
 def deepseek_v4_flash_8k_gb300_cudnn_dsa(
     microbatch: int = 4, seq_len: int | None = 8192
 ) -> Trainer.Config:
@@ -508,7 +493,6 @@ def deepseek_v4_flash_8k_gb300_cudnn_dsa(
             inner.fused_dsa_backward = True
     return config
 
-
 def _set_flex_num_stages(config: Trainer.Config, num_stages: int) -> None:
     """Override the pinned ``num_stages`` on every flex layer."""
     from torchtitan.models.common.attention import FlexInnerAttention
@@ -519,7 +503,6 @@ def _set_flex_num_stages(config: Trainer.Config, num_stages: int) -> None:
             opts = dict(inner.kernel_options or {})
             opts["num_stages"] = num_stages
             inner.kernel_options = opts
-
 
 def deepseek_v4_flash_8k_gb300_cudnn_dsa_ep2(
     microbatch: int = 6, seq_len: int | None = 8192
@@ -534,7 +517,6 @@ def deepseek_v4_flash_8k_gb300_cudnn_dsa_ep2(
     config.parallelism.expert_parallel_degree = 2
     return config
 
-
 def deepseek_v4_flash_8k_gb300_cudnn_dsa_stages2(
     microbatch: int = 6, seq_len: int | None = 8192
 ) -> Trainer.Config:
@@ -547,7 +529,6 @@ def deepseek_v4_flash_8k_gb300_cudnn_dsa_stages2(
     config = deepseek_v4_flash_8k_gb300_cudnn_dsa_ep2(microbatch, seq_len)
     _set_flex_num_stages(config, 2)
     return config
-
 
 def deepseek_v4_flash_8k_gb300_cudnn_full(
     microbatch: int = 4, seq_len: int | None = 8192
@@ -574,7 +555,6 @@ def deepseek_v4_flash_8k_gb300_cudnn_full(
             inner.fused_dsa_forward = True
     return config
 
-
 def deepseek_v4_flash_8k_gb300_cudnn_full_ep2(
     microbatch: int = 6, seq_len: int | None = 8192
 ) -> Trainer.Config:
@@ -582,7 +562,6 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2(
     config = deepseek_v4_flash_8k_gb300_cudnn_full(microbatch, seq_len)
     config.parallelism.expert_parallel_degree = 2
     return config
-
 
 def deepseek_v4_flash_8k_gb300_cudnn_full_5x(
     seq_len: int | None = 8192,
@@ -595,7 +574,6 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_5x(
     """
     return deepseek_v4_flash_8k_gb300_cudnn_full_ep2(5, seq_len)
 
-
 def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_profile(
     microbatch: int = 6, seq_len: int | None = 8192
 ) -> Trainer.Config:
@@ -607,7 +585,6 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_profile(
     config.profiler.profiler_warmup = 3
     config.profiler.profiler_active = 2
     return config
-
 
 def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(
     microbatch: int = 6, seq_len: int | None = 8192
@@ -631,7 +608,6 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(
     config.parallelism.fsdp_reshard_after_forward = "dense-never"
     return config
 
-
 def deepseek_v4_debugmodel_asyncep_densenever(
     seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
 ) -> Trainer.Config:
@@ -648,7 +624,6 @@ def deepseek_v4_debugmodel_asyncep_densenever(
     config.training.disable_cuda_graphs = True
     config.training.steps = 2
     return config
-
 
 def deepseek_v4_debugmodel_asyncep_policy(
     seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
@@ -679,7 +654,6 @@ def deepseek_v4_debugmodel_asyncep_policy(
     config.training.steps = 2
     return config
 
-
 def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_profile(
     microbatch: int = 6, seq_len: int | None = 8192
 ) -> Trainer.Config:
@@ -690,7 +664,6 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_profile(
     config.profiler.profiler_warmup = 3
     config.profiler.profiler_active = 2
     return config
-
 
 def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_fp8ag(
     microbatch: int = 6, seq_len: int | None = 8192
@@ -707,7 +680,6 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_fp8ag(
     config.parallelism.fp8_expert_all_gather = True
     return config
 
-
 def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_fp8ag_profile(
     microbatch: int = 6, seq_len: int | None = 8192
 ) -> Trainer.Config:
@@ -719,7 +691,6 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_fp8ag_profile(
     config.profiler.profiler_active = 2
     return config
 
-
 def _enable_cudnn_indexer(config: Trainer.Config) -> int:
     """Route every CSA layer's top-k selection through cuDNN's fused indexer."""
     n = 0
@@ -729,7 +700,6 @@ def _enable_cudnn_indexer(config: Trainer.Config) -> int:
             inner.cudnn_indexer = True
             n += 1
     return n
-
 
 def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx(
     microbatch: int = 6, seq_len: int | None = 8192
@@ -741,6 +711,7 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx(
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(microbatch, seq_len)
     assert _enable_cudnn_indexer(config) > 0, "no CSA layer found"
     return config
+
 FP8_DENSE_FILTER_FQNS = [
     # Kept in bf16/fp32 on purpose (Megatron's DSv4 correctness list keeps the
     # CSA compressor and indexer in high precision under FP8; the router gate
@@ -756,7 +727,6 @@ FP8_DENSE_FILTER_FQNS = [
     "attention.wkv",
     "attention.wq_a",
 ]
-
 
 def _apply_fp8_dense(config: Trainer.Config) -> Trainer.Config:
     """Swap the dense ``Linear`` configs (attention projections, shared
@@ -798,7 +768,6 @@ def _apply_fp8_dense(config: Trainer.Config) -> Trainer.Config:
     config.model_spec.model = conv.convert(config.model_spec.model)
     return config
 
-
 def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_fp8dense(
     microbatch: int = 6, seq_len: int | None = 8192
 ) -> Trainer.Config:
@@ -817,7 +786,6 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_fp8dense(
     config.comm.init_timeout_seconds = 1800
     return _apply_fp8_dense(config)
 
-
 def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_fp8dense(
     microbatch: int = 6, seq_len: int | None = 8192
 ) -> Trainer.Config:
@@ -825,7 +793,6 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_fp8dense(
     + fp8 dense linears (wq_b, wo_a, wo_b, shared w13/w2)."""
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx(microbatch, seq_len)
     return _apply_fp8_dense(config)
-
 
 def _apply_te_dense(config: Trainer.Config) -> Trainer.Config:
     """Swap the same dense ``Linear`` configs ``_apply_fp8_dense`` converts to
@@ -854,7 +821,6 @@ def _apply_te_dense(config: Trainer.Config) -> Trainer.Config:
     config.comm.init_timeout_seconds = 1800
     return config
 
-
 def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(
     microbatch: int = 6, seq_len: int | None = 8192
 ) -> Trainer.Config:
@@ -863,7 +829,6 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(
     the custom fp8 linear of the 450.8 config (job 829)."""
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx(microbatch, seq_len)
     return _apply_te_dense(config)
-
 
 def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_profile(
     microbatch: int = 6, seq_len: int | None = 8192
@@ -875,3 +840,15 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_profil
     config.profiler.profiler_warmup = 3
     config.profiler.profiler_active = 2
     return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 471 recipe at a 7x microbatch (57344 tokens per rank)."""
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(7, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_8x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 471 recipe at an 8x microbatch (65536 tokens per rank)."""
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(8, seq_len)
