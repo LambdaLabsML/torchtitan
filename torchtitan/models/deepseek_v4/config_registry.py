@@ -1241,3 +1241,9 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_bal
     """7x balanced with EP=32: experts fully local (8 per rank), no expert
     FSDP all-gather/reduce-scatter; 31/32 of routed tokens go remote."""
     return _with_ep(deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_balanced(seq_len), 32)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_8x_balanced_ep32(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """8x balanced with EP=32 (experts fully local): does EP=32's memory allow one more sequence?"""
+    return _with_ep(deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_8x_balanced(seq_len), 32)
