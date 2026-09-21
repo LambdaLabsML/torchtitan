@@ -986,3 +986,21 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_sac_ep4_1x(
     config.parallelism.expert_parallel_degree = 4
     config.activation_checkpoint = SelectiveAC.Config()
     return config
+
+def _sac_variant(microbatch: int, ep: int, seq_len: int | None = 8192) -> Trainer.Config:
+    from torchtitan.distributed.activation_checkpoint import SelectiveAC
+
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(microbatch, seq_len)
+    config.parallelism.expert_parallel_degree = ep
+    config.activation_checkpoint = SelectiveAC.Config()
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_sac_ep2_4x(seq_len: int | None = 8192) -> Trainer.Config:
+    """Selective AC, EP=2, 4x: SAC at 1x used only 89 GiB on this recipe (job 900)."""
+    return _sac_variant(4, 2, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_sac_ep4_4x(seq_len: int | None = 8192) -> Trainer.Config:
+    return _sac_variant(4, 4, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_sac_ep4_3x(seq_len: int | None = 8192) -> Trainer.Config:
+    return _sac_variant(3, 4, seq_len)
