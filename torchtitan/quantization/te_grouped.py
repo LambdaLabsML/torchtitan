@@ -122,6 +122,9 @@ def te_grouped_mm(x, w, splits, cache=None, chunk=64):
 def pad_plan(splits):
     """Rows per expert -> (padded splits % 32, destination row of every source row, padded row count)."""
     padded = (splits + 31) // 32 * 32
+    # TE grouped tensors also need the TOTAL row count % 128 == 0: grow the last
+    # group's zero padding (its extra rows carry zero dy, so wgrad is unaffected).
+    padded[-1] += (-padded.sum()) % 128
     off = torch.cumsum(splits, 0) - splits
     poff = torch.cumsum(padded, 0) - padded
     shift = torch.repeat_interleave(poff - off, splits)
