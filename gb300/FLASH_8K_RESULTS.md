@@ -2911,3 +2911,49 @@ at the next block then finds it done. Debugmodel bitwise again (932).
 Relaunched on r02 with a 7x control for the offload's equal-shape cost:
 933 (9x), 934 (7x), 935 (10x), 936 (12x); 930 is the 10x on the old copy
 placement, kept for the memory reading.
+
+## Block-input offload with the copy at block entry: 7x 475.5 / 9x 483 / 10x 486.6, and what the profile found instead (jobs 933-938)
+
+| job | microbatch | offload | TFLOP/s (step 20) | peak |
+|---|---|---|---:|---:|
+| 880 | 7x | off | **500.3** | 238.5 GiB |
+| 934 | 7x | on | 475.5 | 170.8 GiB |
+| 929 | 9x | on, copy after the block | 434.7 | 191.2 GiB |
+| 933 | 9x | on, copy at entry | 476.8 (482-485 on steps 17-19) | 191.2 GiB |
+| 930 | 10x | on, copy after the block | 433.0 | 199.5 GiB |
+| 935 | 10x | on, copy at entry | 486.6 | 199.7 GiB |
+
+Moving the D2H copy to block entry recovered 11% (434.7 -> ~483 at 9x), and
+the offload now frees 68 GiB at 7x, but it still costs 5% at equal shapes and
+the larger microbatch it buys returns only +2.3% (7x -> 10x). Bigger
+microbatches are not a lever on this recipe (as 8x layer-wise had shown).
+
+**The residual 5% is not the copies.** Rank-0 trace of the 7x offload run
+(937, profiler on: 470.3) vs the same config without it (938: 493.8):
+
+| per 2 profiled steps | offload (937) | baseline (938) |
+|---|---:|---:|
+| GEMMs / elementwise / all-gather / reduce-scatter | identical | identical |
+| Memcpy DtoH + HtoD | 1,368 + 1,338 ms at 118 GB/s, on their own streams | -- |
+| main-stream idle | 728 ms (3.3%); 67 ms of it overlaps a copy; no gap ends at a copy end | -- |
+| `ncclDevKernel_AllReduce_Sum_f32`, 1,040 calls | **1,718 ms (1.65 ms/call)** | **901 ms (0.87 ms/call)** |
+| exposed NCCL | 1,919 ms | 1,128 ms |
+
+The copies overlap completely. The whole gap is one kernel: a tiny fp32
+all-reduce issued 520 times per step, ~12 per layer -- **Transformer
+Engine's delayed-scaling amax reduction**, which TE runs synchronously on
+the compute stream at every outermost `autocast` exit (one per `TELinear`
+here, since each module owns its own autocast). Latency-bound, so it runs at
+the pace of the slowest rank, and the offload's per-rank jitter doubled it.
+But it already costs the 500.3 recipe **0.45 s of a 10.2 s step (4.4%)**,
+fully exposed. It is also unnecessary here: FSDP all-gathers identical
+weights on every rank (same local amax), and activation/gradient scales are
+legitimately per rank.
+
+New knob `TE_REDUCE_AMAX=0` (`DelayedScaling(reduce_amax=False)`; default 1
+keeps the 500.3 behaviour). Debugmodel runs (939). Queued on r02: 7x without
+the reduction (940), and 10x/12x with the block-input offload as well
+(941/942) -- if the offload's only cost was the all-reduce exposure it is now
+free, and 10x fits at 200 GiB. Traces archived at
+`/mnt/dgxc/profiles/{bio,base}_7x_iter10_traces/`; stall analysis
+`memcpy_stalls.py` alongside.
