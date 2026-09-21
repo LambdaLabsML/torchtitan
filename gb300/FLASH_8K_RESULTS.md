@@ -3233,3 +3233,30 @@ Under balanced routing every block-input-offload point sits at or under 575:
 the offload's stream traffic costs more than an extra sequence returns once
 the EP barrier is gone. Queued: 8x balanced with the layer-wise Adam-moment
 offload instead (33 GiB freed, ~0.6% cost at 8x collapsed), no block offload.
+
+## 8x under balance via the moment offload: a race found and fixed, and the cost (jobs 1036-1041)
+
+**1036, 8x balanced + layer-wise moment offload: 584.3 flat at 224.9 GiB, but
+the loss was wrong** (24.2 and 25.7 spikes at steps 4/8, 8.45 at step 20
+where every other balanced run is 3.4-4.1). Root cause: the layer-wise
+scheduler waited on the updates of layers i and i+1 at block i's pre-hook,
+assuming FSDP prefetches one block ahead; with the new `FSDP_PREFETCH_DEPTH=2`
+FSDP also issues layer i+2's all-gather during block i, while that layer's
+update was just being launched on the side stream -- the gather read
+half-updated weights. Two knobs each validated alone, never together.
+Fix (commit 70476fdc9): wait on layers i..i+depth, launch depth+1 ahead.
+Debugmodel bitwise (1040).
+
+| job | 8x/6x balanced | offload | TFLOP/s | loss@20 | peak |
+|---|---|---|---:|---:|---:|
+| 1015 | 7x | none | **587.5** | 3.40 | 238.5 GiB |
+| 1038 | 8x | moments, plain (in the optimizer step) | 551.5 | 3.51 | 224.5 GiB |
+| 1036 | 8x | moments, layer-wise, racing | 584.3 | 8.45 (broken) | 224.9 GiB |
+| 1032 | 6x | none (control) | 575.0 | 4.05 | 217.2 GiB |
+| 1039 | 6x | moments, layer-wise, fixed | 551.3 | 3.51 | 190.5 GiB |
+
+The fixed layer-wise offload costs **-4.1% under balance** (1039 vs 1032)
+where it was -0.6% in the collapsed regime (8x, 908 vs 880-era): the side
+stream's moment traffic used to hide inside the 8% barrier idle time, and
+there is no idle time to hide in now. 1041 (8x, layer-wise, fixed) pending
+to close the curve; it cannot beat 7x from a -4% start.
