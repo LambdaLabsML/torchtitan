@@ -989,3 +989,24 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_4x(
 ) -> Trainer.Config:
     """FullAC reference at 4x for the selective-AC comparison."""
     return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(4, seq_len)
+
+
+def _ep1_variant(microbatch: int, seq_len: int | None = 8192) -> Trainer.Config:
+    """EP=1: every rank runs all 256 experts on its own tokens (standard local
+    dispatcher, no EP comm); experts are FSDP-sharded 32-way like everything
+    else, so each layer's full expert set (6.4 GB) is gathered per pass. The
+    default reshard policy is required (dense-never would keep every layer's
+    experts unsharded at EP=1)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(microbatch, seq_len)
+    config.parallelism.expert_parallel_degree = 1
+    config.parallelism.fsdp_reshard_after_forward = "default"
+    assert _swap_ep_backend(config, "standard") > 0
+    return config
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep1_1x(seq_len: int | None = 8192) -> Trainer.Config:
+    return _ep1_variant(1, seq_len)
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep1_7x(seq_len: int | None = 8192) -> Trainer.Config:
+    return _ep1_variant(7, seq_len)
