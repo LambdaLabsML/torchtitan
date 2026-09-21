@@ -1017,3 +1017,10 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_12x(
 ) -> Trainer.Config:
     """12x microbatch (98304 tokens per rank); needs TORCHTITAN_BLOCK_INPUT_OFFLOAD=1."""
     return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(12, seq_len)
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_tedense_9x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """9x WITHOUT the cuDNN indexer (eager Indexer.select), TE dense on: bisects the 9x step-1 NaN."""
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_tedense(9, seq_len)
