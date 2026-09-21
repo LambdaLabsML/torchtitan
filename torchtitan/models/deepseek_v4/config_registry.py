@@ -852,3 +852,15 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_8x(
 ) -> Trainer.Config:
     """The 471 recipe at an 8x microbatch (65536 tokens per rank)."""
     return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(8, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_9x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """9x microbatch (73728 tokens per rank); needs OPT_STATE_OFFLOAD=1 to fit."""
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(9, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_10x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """10x microbatch (81920 tokens per rank); needs OPT_STATE_OFFLOAD=1 to fit."""
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(10, seq_len)
