@@ -1004,3 +1004,9 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_sac_ep4_4x(seq_len: int | None = 8192)
 
 def deepseek_v4_flash_8k_gb300_cudnn_full_sac_ep4_3x(seq_len: int | None = 8192) -> Trainer.Config:
     return _sac_variant(3, 4, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_4x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """FullAC reference at 4x for the selective-AC comparison."""
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(4, seq_len)
