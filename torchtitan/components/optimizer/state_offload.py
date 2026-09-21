@@ -26,6 +26,7 @@ from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 
 ENABLED = os.environ.get("OPT_STATE_OFFLOAD", "0") == "1"
+_DEBUG = os.environ.get("OPT_STATE_OFFLOAD_DEBUG", "0") == "1"
 _CHUNK_ELEMS = int(float(os.environ.get("OPT_STATE_OFFLOAD_CHUNK_GIB", "1")) * 2**30 // 2)  # bf16 elems per moment
 
 
@@ -111,12 +112,26 @@ class _Offloader:
                 main.wait_event(h2d_done)
                 params = [_local(p) for p in chunk]
                 grads = [_local(p.grad) for p in chunk]
+                steps = [optim.state[p]["step"] for p in chunk]
+                if _DEBUG:
+                    for p_, g_ in zip(params, grads):
+                        assert p_.is_contiguous() and g_.is_contiguous(), (p_.shape, p_.stride(), g_.stride())
+                        assert p_.dtype == g_.dtype == dtype, (p_.dtype, g_.dtype, dtype)
+                # torch.optim's fused path increments the step counters BEFORE the kernel
+                torch._foreach_add_(steps, 1.0)
                 torch._fused_adamw_(
                     params, grads, [m for m, _ in views], [v for _, v in views], [],
-                    [optim.state[p]["step"] for p in chunk],
+                    steps,
                     lr=lr, beta1=beta1, beta2=beta2, weight_decay=wd, eps=eps,
                     amsgrad=False, maximize=False,
                 )
+                if _DEBUG:
+                    torch.cuda.synchronize()
+                    bad = [(tuple(p_.shape), str(p_.dtype)) for p_, (m, v) in zip(params, views)
+                           if not (torch.isfinite(p_).all() and torch.isfinite(m).all() and torch.isfinite(v).all())]
+                    if bad:
+                        import logging
+                        logging.getLogger(__name__).error("state offload: non-finite after chunk %d: %s (lr=%s steps=%s)", k, bad[:4], lr, steps[0].item())
                 upd = torch.cuda.Event(); upd.record(main)
                 self.d2h.wait_event(upd)
                 with torch.cuda.stream(self.d2h):
