@@ -43,6 +43,8 @@ SM100+ the query-head count must divide 128 and TopK must be a multiple of 64.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 _DSA = None
@@ -50,6 +52,41 @@ _TOPK_ALIGN_SM100 = 64
 _TOPK_ALIGN_SM90 = 128
 _HEAD_ALIGN_SM100 = 128
 _HEAD_ALIGN_SM90 = 64
+
+_BWD_WORKSPACE: torch.Tensor | None = None
+
+
+def _backward_workspace(q_THD: torch.Tensor, kv_ND: torch.Tensor) -> torch.Tensor | None:
+    """Persistent scratch for the SM100 deterministic backward (grow-only).
+
+    Left to the wrapper, each layer's backward allocates a fresh uint8 scratch
+    of 26-32 GB (12x microbatch at 8k) and frees it right after. With ~210 GiB
+    reserved the caching allocator cannot place it without releasing cached
+    blocks first, which is a cudaFree plus a device synchronize: 0.1-1.2 s per
+    occurrence, and one rank's stall becomes every rank's at the next
+    collective (job 946 profile: ~850 ms per step, 4.6%, at the start of the
+    backward). One buffer shared by all layers removes the churn; the kernel
+    clears the parts it accumulates into. TORCHTITAN_DSA_PERSISTENT_WORKSPACE=0
+    restores the per-call allocation.
+    """
+    if os.environ.get("TORCHTITAN_DSA_PERSISTENT_WORKSPACE", "1") != "1":
+        return None
+    major, _ = torch.cuda.get_device_capability(q_THD.device)
+    if major != 10:  # the SM90 backend takes no scratch
+        return None
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import (
+        _interface_sm100 as iface,
+    )
+
+    total_s_q, num_heads, head_dim = q_THD.shape
+    nbytes = iface.flash_attn_bwd_sm100_workspace_size(
+        total_s_q, kv_ND.shape[0], head_dim, num_heads, True
+    )
+    global _BWD_WORKSPACE
+    ws = _BWD_WORKSPACE
+    if ws is None or ws.numel() < nbytes or ws.device != q_THD.device:
+        ws = _BWD_WORKSPACE = torch.empty(nbytes, dtype=torch.uint8, device=q_THD.device)
+    return ws
 
 
 def _dsa_namespace():
@@ -196,9 +233,10 @@ class _CudnnDsaBackward(torch.autograd.Function):
             rotate_tail_(out, cache, rd=ctx.out_rope_rd, inverse=False)
             d_out = rotate_tail(d_out.contiguous(), cache, rd=ctx.out_rope_rd, inverse=False)
         dsa = _dsa_namespace()
+        q, kv = q.contiguous(), kv.contiguous()
         result = dsa.sparse_attention_backward_wrapper(
-            q.contiguous(),
-            kv.contiguous(),
+            q,
+            kv,
             out.contiguous(),
             d_out.contiguous(),
             lse.float().contiguous(),
@@ -211,6 +249,7 @@ class _CudnnDsaBackward(torch.autograd.Function):
             # forward-vs-recompute mismatch that activation checkpointing
             # rejects.
             deterministic=True,
+            workspace=_backward_workspace(q, kv),
         )
         dq = result["dq"].to(q.dtype)
         dkv = result["dkv"].to(kv.dtype)
