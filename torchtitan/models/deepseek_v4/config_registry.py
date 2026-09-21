@@ -1085,3 +1085,19 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_13x_ba
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(13, seq_len)
     config.debug.moe_force_load_balance = True
     return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_balanced(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 7x recipe with forced load-balanced routing (balanced-regime number)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(7, seq_len)
+    config.debug.moe_force_load_balance = True
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_10x_balanced(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 10x recipe with forced load-balanced routing (needs the block-input offload)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(10, seq_len)
+    config.debug.moe_force_load_balance = True
+    return config
