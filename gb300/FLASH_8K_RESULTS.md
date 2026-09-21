@@ -3299,3 +3299,10 @@ already (5.6% exposed at EP=2), while the dispatch/combine copy -- SM stores
 over NVLink at ~620 GB/s, 1/2 remote at EP=2 -- becomes 31/32 remote at
 EP=32, roughly doubling a 7% item, on top of a 32-rank barrier per leg.
 9x EP=32 (1061) pending as the last point; it cannot change the ranking.
+
+**1061, 9x EP=32: OOM retry loop before step 2, cancelled by the guard.** So
+the EP=32 curve is 7x ~521 / 8x 523.6 (231.6 GiB) / 9x does not fit, and
+the balanced best stays **EP=2, 7x, 587.5 (job 1015)**. EP=32 is not a
+throughput lever on this recipe: what it removes (expert weight gather and
+reduce-scatter) was already ~95% hidden, what it adds (a near-all-remote
+dispatch copy and a 32-rank barrier per leg) is on the critical path.
