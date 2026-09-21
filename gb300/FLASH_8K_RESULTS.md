@@ -2874,3 +2874,13 @@ again**, so the 9x failure is not TE's wq_b cast. 8x is fine; something breaks
 between 65,536 and 73,728 tokens per rank. Bisect runs: 918 (9x, all of TE
 dense on), 921 (9x without the cuDNN indexer), 922 (9x without TE mHC). 10x/12x
 (919/920) cancelled until the cause is known.
+
+**9x step-1 NaN, root cause: int32 offset overflow in the fused RoPE Triton
+kernel.** ``_rotate_tail_kernel`` indexed rows as ``program_id(0) * stride``;
+for the attention q/o tensors [T, 64, 512] that product passes 2^31 exactly
+at 65,536 rows (8x = 1.000 x 2^31 fits, 9x = 1.125 x 2^31 does not), so 9x
+read out of bounds. Probe 923 reproduced it on one GPU (exact at 65,536,
+illegal memory access at 73,728); casting the row index to int64 fixes it
+(probe 924: exact at both). Bisect runs 918/921/922 and the wq_b exclusion
+were red herrings, as this explains. Block-input-offload runs relaunched with
+the fix: 925 (9x), 926 (10x), 927 (12x).
