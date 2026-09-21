@@ -1299,3 +1299,12 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_8x_bal
 ) -> Trainer.Config:
     """8x balanced with EP=32 (experts fully local): does EP=32's memory allow one more sequence?"""
     return _with_ep(deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_8x_balanced(seq_len), 32)
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_9x_balanced_ep32(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """9x balanced with EP=32 (borderline: ~259 GB + the pool/NCCL/cuDNN outside the allocator)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(9, seq_len)
+    config.debug.moe_force_load_balance = True
+    return _with_ep(config, 32)
