@@ -2795,3 +2795,42 @@ died at step 1 with a non-finite loss independent of the offload (898); the
 likely cause is TE's cast kernels on wq_b's [T, 32768] output crossing 2^31
 elements at 73,728 tokens (8x sits just under). Job 908 retries 9x with wq_b
 kept out of TE (``TE_DENSE_EXCLUDE=wq_b``, ~-1% for that projection).
+
+**9x with the layer-wise offload (job 908, wq_b kept out of TE): does not
+fit** -- expandable_segments OOM retry loop before step 1 (free 18 MB while
+mapping 20 MB), cancelled by the guard. 8x peaked at 229.1 GiB, the ninth
+sequence adds ~19 GiB, and ~25 GiB live outside the allocator, so 9x sits at
+the 276 GiB edge even with 33 GiB of moments off the GPU. Another 10-15 GiB
+(drop dense-never at -1.1%, or the clone-based receive-slot fix back to 2
+slots) would be needed for an expected net of ~+1%. **Layer-wise offload
+track closed: correct (bitwise), hides the moment traffic completely
+(472 -> 497 at 8x), but there is no microbatch headroom left for it to turn
+a profit. Best stays 500.3 TFLOP/s at 7x (job 880).**
+
+**Selective AC re-check, all runs (moment offload on, TE dense + TE mHC +
+cuDNN indexer):**
+
+| SAC run (r02, 20 steps) | TFLOP/s | allocator peak |
+| --- | --- | --- |
+| 900: EP=4, 1x | 166.7 | 89 GiB |
+| 907: EP=4, 3x | 312.7 | 136 GiB |
+| 906: EP=4, 4x | 335-353 | 158 GiB |
+| 905: EP=2, 4x | 384.9 | 170 GiB |
+| FullAC EP=2, 4x (909) | see below | |
+| FullAC EP=2, 7x (880, best) | 500.3 | 238.5 GiB |
+
+SAC fits far higher than the 181.69-era sweep found (~31 GiB per sequence
+now, so ~6x would fit), but it is slower than FullAC at every microbatch
+tried, and EP=4 is worse than EP=2 (a larger receive pool, no activation
+sharding). The reason is the policy, not the memory: torchtitan's default
+save set keeps outputs of ``aten.linear``, ``mm``, SDPA/flex attention,
+``topk`` and Inductor-compiled code, and recomputes everything produced
+outside the aten dispatcher -- which on this recipe is the expensive part
+(cuDNN DSA forward, TE dense linears, TE mHC, ``_grouped_mm``) plus the EP
+dispatch; what it stores (compiled elementwise outputs) is cheap to recompute.
+Inverting that needs the custom ops wrapped so the policy can see them, and
+the MoE path cannot avoid recompute in any case: its backward needs the routed
+input, which is a symmetric-buffer alias that must not be saved, and a copy is
+~2.4 GB per layer per 6 sequences. The recoverable recompute is therefore the
+non-MoE part (~10% of the step) against tens of GiB per sequence of saved
+attention/dense outputs. Not pursued.
