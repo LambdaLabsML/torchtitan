@@ -24,7 +24,7 @@ login node, 00006/12/14/61/62/66/68/71/72 drained). Session window ends
 | 949 | 96 | 8+8+8, HSDP shard=32 replicate=3 | 502.5 (501.9 @ step 20) | 207.6 GiB | HSDP holds the 32-GPU number across 3 racks |
 | 950 | 128 | 16 (r03) + 8 + 8, HSDP shard=32 replicate=4 | 499.2 (505.8 @ step 20) | 207.2 GiB | |
 | 951 | 128 | same + persistent DSA workspace (commit 7fc610c5) | 509.0 (502.6 @ step 20) | 223.8 GiB | +2.0%, step spread 499-514 (950: 444-513) |
-| 952 | 128 | hero: 951 recipe, 100 steps, real C4 (`c4_local`) | 505 @ step 20, running | 225.7 GiB | TAG `hero_128_12x_c4`; loss 3.54 @ 20 on C4 |
+| 952 | 128 | **hero**: 951 recipe, 100 steps, real C4 (`c4_local`) | **504.2 mean steps 11-100** (min 495.6, max 506.3) | 226.5 GiB | exit 0, 36 min wall; loss 11.99 -> 2.745, grad_norm 12.9 -> 0.13; curve `gb300/hero_128_12x_c4.png` |
 | 953 | 128 | reference: bf16 dense, bfx9 matmuls, eager mHC | cancelled (user: optimize first) | | config `..._cudnnidx_12x_c4` exists if wanted later |
 | 954 | 32 | X0 control: 12x + workspace fix, r02 | queued after 952 | | |
 | 955 | 32 | X1: control + `NCCL_PROTO=Simple`, r03 | queued after 952 | | |
@@ -50,7 +50,10 @@ this band", not an exact match. TFLOP/s noise is ~1% on the 10-step mean.
       or 16 nodes per rack. Launch: `--parallelism.data_parallel_replicate_degree 4`
       plus `--nodelist`, partition `all`.
 - [x] 7a. first optimization applied and measured at 128 (A below, +2.0%)
-- [ ] 8. hero run on 128 GPUs (job 952), 100 steps, loss curve on real C4.
+- [x] 8. hero run on 128 GPUs (job 952), 100 steps, loss curve on real C4:
+      504.2 TFLOP/s mean over steps 11-100, loss 2.745 at step 100, smooth
+      monotone descent after the step 4-5 LR-peak bump that every run on this
+      branch shows; grad_norm decays with the linear LR decay. Plot committed.
       Uses the c4_local dataset (64 staged C4 shards streamed locally, commit
       5320d553), warmup 2, linear decay over the last 80 steps. ETA ~12:50.
       The bf16-dense reference (953) was cancelled to move to optimizations;
