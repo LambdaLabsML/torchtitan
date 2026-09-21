@@ -238,6 +238,16 @@ def init_buffer(
     max_routed_tokens = (
         group.size() * tokens_per_slot * min(top_k, num_local_experts)
     )
+    # MINIMAL_ASYNC_EP_POOL_FACTOR: size each receive slot at factor x the
+    # per-rank expected receive (tokens x top_k) instead of the worst case
+    # (every rank sending everything here). The worst case is ep_size x the
+    # expectation: 90 GB per slot at EP=32/7x. Under balanced routing the
+    # actual receive equals the expectation; the dispatch assert catches
+    # overflow. Default: unset = worst case (unchanged behaviour).
+    _factor = os.environ.get("MINIMAL_ASYNC_EP_POOL_FACTOR")
+    if _factor is not None:
+        expected = tokens_per_slot * min(top_k, num_local_experts)
+        max_routed_tokens = min(max_routed_tokens, int(float(_factor) * expected) + 127 & ~127)
     num_experts = group.size() * num_local_experts
 
     logger.info(
