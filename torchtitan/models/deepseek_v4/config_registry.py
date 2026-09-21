@@ -1250,3 +1250,12 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_6x_bal
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_6x_balanced(seq_len)
     assert _enable_dual_microbatch(config) > 0
     return config
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_8x_balanced(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """8x with forced balanced routing (needs the block-input offload)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(8, seq_len)
+    config.debug.moe_force_load_balance = True
+    return config
