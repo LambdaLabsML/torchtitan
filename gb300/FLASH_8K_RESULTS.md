@@ -2760,3 +2760,26 @@ forward, and make each block's pre-forward wait on its own update event.
 Expected recovery ~+2.5% per extra sequence up to the 276 GiB ceiling (8x, 9x
 if its NaN is fixed), against HBM contention with the forward. Not built.
 **Best stays 500.3 TFLOP/s at 7x (job 880).**
+
+## Layer-wise deferred optimizer step (Megatron LayerWise, #4509/#5388 idea) and a selective-AC re-check
+
+**Layer-wise step, built** (``OPT_STATE_OFFLOAD_LAYERWISE=1`` on top of the
+moment offload, ``state_offload._LayerwiseScheduler``): ``step()`` only
+captures per-layer work (grad references, lr/betas) and updates the non-layer
+parameters at once; each decoder layer's H2D-moments / fused AdamW / D2H
+write-back runs on side streams during the NEXT forward, two layers ahead.
+Every block's forward pre-hook (``prepend=True``, ahead of FSDP2's own hook)
+makes main wait on the update events of its own layer and the next one --
+FSDP2's implicit prefetch all-gathers layer i+1 during layer i, and its
+all-gather stream waits on main, so it gathers updated shards. Grad references
+are held until waited on so ``zero_grad(set_to_none=True)`` cannot free them.
+Debugmodel: **bitwise identical to the native optimizer over 5 steps**
+(903 vs 902). 8-node 8x: job 904.
+
+**Selective AC re-check (job 900, EP=4, 1x, TE dense + TE mHC + cuDNN
+indexer + moment offload): 166.7 TFLOP/s at 89 GiB.** The 181.69-era sweep
+needed 217 GiB for SAC at 1x; the fused mHC (no fp32 stream intermediates),
+cuDNN attention/indexer and the offloaded moments cut that to 89 GiB, so SAC
+should now fit at 3x-4x. SAC removes most of the FullAC recompute (~a quarter
+of the step) against a smaller microbatch's ~2.5%-per-sequence penalty, so
+this is worth measuring: jobs 905 (EP2 4x), 906 (EP4 4x), 907 (EP4 3x).
