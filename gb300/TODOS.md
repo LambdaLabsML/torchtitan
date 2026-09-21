@@ -82,6 +82,11 @@ Every NCCL kernel in the trace is `RING_LL`.
       so `training.disable_cuda_graphs=False` becomes possible, but every rank
       then all-gathers all 256 experts per layer (12.9 GB/layer; ledger EP=1
       results were a collapse on the old recipe). Try after A-C.
+- [ ] D2. HybridEP dispatcher (user request): launcher `HYBRIDEP=1`, configs
+      `..._hep4/6/8` from the earlier sweep (jobs 784-795: HybridEP measured
+      2.9% below MinimalAsyncEP on the 1k recipe, and it forces CUDA graphs).
+      Retest on the 12x recipe with `_swap_ep_backend(config, "hybridep")`
+      since the dispatcher barrier is now 12% of the step.
 - [ ] E. Remaining EP barrier waits (1.6 s/rank, 100 barriers of 1-90 ms) are
       routing imbalance between the two EP peers. No cheap fix.
 - [x] F. (closed) TE MXFP8 grouped experts: ledger jobs 871-878. MXFP8 grouped
