@@ -965,3 +965,11 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_tee
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x(seq_len)
     assert _apply_te_experts(config) > 0
     return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_teexperts(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """TE MXFP8 grouped experts on the cudnnidx + TE dense recipe (6x fits; 7x OOMs, job 875)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(microbatch, seq_len)
+    assert _apply_te_experts(config) > 0
+    return config
