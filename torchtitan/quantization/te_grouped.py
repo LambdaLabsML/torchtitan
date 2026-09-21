@@ -119,6 +119,109 @@ def te_grouped_mm(x, w, splits, cache=None, chunk=64):
     return torch.cat(outs, 0)
 
 
+class _TEExpertsChain(torch.autograd.Function):
+    """The whole w1/w3/w2 expert chain for ALL local experts in one Function.
+
+    One autograd node instead of 3 GEMMs x chunks: the input is quantized once
+    and shared by w1 and w3, every chunk writes straight into slices of one
+    output / gradient buffer (no per-chunk input slicing, whose backward built
+    a full-size zero tensor per chunk, and no ``torch.cat``), and the two dgrad
+    GEMMs accumulate into one dx. Profile 871 put those three at ~15 ms of the
+    22 ms glue over the 13.4 ms of MXFP8 GEMM time.
+    """
+
+    @staticmethod
+    def _gemm(A, B, out, layout, accumulate=False):
+        from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm_for_grouped_tensor
+
+        general_grouped_gemm_for_grouped_tensor(A, B, out, layout=layout, accumulate=accumulate)
+
+    @staticmethod
+    def _weight(w, cache, key_extra):
+        tex = _tex()
+        E, O, I = w.shape
+        key = (w.data_ptr(), w._version, w.shape, key_extra)
+        if cache.get("key") == key:
+            return cache["gw"]
+        gw = tex.group_quantize(w.reshape(E * O, I), _quantizer(), E, None)
+        cache["key"], cache["gw"] = key, gw
+        return gw
+
+    @staticmethod
+    def forward(ctx, xp, w1, w3, w2, padded, caches, act):
+        tex = _tex()
+        E, Fh, D = w1.shape
+        Rp = xp.shape[0]
+        chunk = 64
+        gate = torch.empty(Rp, Fh, device=xp.device, dtype=xp.dtype)
+        up = torch.empty_like(gate)
+        y = torch.empty(Rp, D, device=xp.device, dtype=xp.dtype)
+        cuts = [0] + torch.cumsum(padded, 0)[chunk - 1::chunk].tolist()  # one host sync
+        if cuts[-1] != Rp:
+            cuts.append(Rp)
+        saved = []
+        h_full = None
+        for i, e0 in enumerate(range(0, E, chunk)):
+            e1 = min(E, e0 + chunk)
+            r0, r1 = cuts[i], cuts[i + 1]
+            sp = padded[e0:e1]
+            n = e1 - e0
+            ss, (_, in_off, hid_off) = _offsets(sp, D, Fh)
+            gx = tex.group_quantize(xp[r0:r1], _quantizer(), n, ss, tensor_offsets=in_off)
+            gw1 = _TEExpertsChain._weight(w1[e0:e1], caches[0].setdefault(i, {}), i)
+            gw3 = _TEExpertsChain._weight(w3[e0:e1], caches[1].setdefault(i, {}), i)
+            gw2 = _TEExpertsChain._weight(w2[e0:e1], caches[2].setdefault(i, {}), i)
+            _TEExpertsChain._gemm(gw1, gx, _grouped(gate[r0:r1], n, ss, hid_off, Fh), "TN")
+            _TEExpertsChain._gemm(gw3, gx, _grouped(up[r0:r1], n, ss, hid_off, Fh), "TN")
+            saved.append((e0, e1, r0, r1, ss, in_off, hid_off, gx, gw1, gw3, gw2))
+        h = act(gate, up)
+        for (e0, e1, r0, r1, ss, in_off, hid_off, gx, gw1, gw3, gw2) in saved:
+            n = e1 - e0
+            gh = tex.group_quantize(h[r0:r1], _quantizer(), n, ss, tensor_offsets=hid_off)
+            _TEExpertsChain._gemm(gw2, gh, _grouped(y[r0:r1], n, ss, in_off, D), "TN")
+            ctx_gh = gh
+            saved[saved.index((e0, e1, r0, r1, ss, in_off, hid_off, gx, gw1, gw3, gw2))] = (
+                e0, e1, r0, r1, ss, in_off, hid_off, gx, gw1, gw3, gw2, ctx_gh)
+        ctx.saved = saved
+        ctx.save_for_backward(gate, up)
+        ctx.shapes = (E, Fh, D, Rp, xp.dtype)
+        ctx.act = act
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        tex = _tex()
+        gate, up = ctx.saved_tensors
+        E, Fh, D, Rp, dtype = ctx.shapes
+        dy = dy.contiguous()
+        dh = torch.empty(Rp, Fh, device=dy.device, dtype=dtype)
+        dw2 = torch.empty(E, D, Fh, device=dy.device, dtype=dtype)
+        for (e0, e1, r0, r1, ss, in_off, hid_off, gx, gw1, gw3, gw2, gh) in ctx.saved:
+            n = e1 - e0
+            gdy = tex.group_quantize(dy[r0:r1], _quantizer(), n, ss, tensor_offsets=in_off)
+            _TEExpertsChain._gemm(gw2, gdy, _grouped(dh[r0:r1], n, ss, hid_off, Fh), "NN")
+            _TEExpertsChain._gemm(gh, gdy, [dw2[e] for e in range(e0, e1)], "NT")
+        # activation backward (SwiGLU): h = silu(gate) * up
+        with torch.enable_grad():
+            g_ = gate.detach().requires_grad_(True)
+            u_ = up.detach().requires_grad_(True)
+            h_ = ctx.act(g_, u_)
+            dgate, dup = torch.autograd.grad(h_, (g_, u_), dh)
+        dx = torch.empty(Rp, D, device=dy.device, dtype=dtype)
+        dw1 = torch.empty(E, Fh, D, device=dy.device, dtype=dtype)
+        dw3 = torch.empty_like(dw1)
+        for (e0, e1, r0, r1, ss, in_off, hid_off, gx, gw1, gw3, gw2, gh) in ctx.saved:
+            n = e1 - e0
+            gdg = tex.group_quantize(dgate[r0:r1].contiguous(), _quantizer(), n, ss, tensor_offsets=hid_off)
+            gdu = tex.group_quantize(dup[r0:r1].contiguous(), _quantizer(), n, ss, tensor_offsets=hid_off)
+            gdx = _grouped(dx[r0:r1], n, ss, in_off, D)
+            _TEExpertsChain._gemm(gw1, gdg, gdx, "NN")
+            _TEExpertsChain._gemm(gw3, gdu, gdx, "NN", accumulate=True)
+            _TEExpertsChain._gemm(gx, gdg, [dw1[e] for e in range(e0, e1)], "NT")
+            _TEExpertsChain._gemm(gx, gdu, [dw3[e] for e in range(e0, e1)], "NT")
+        return dx, dw1, dw3, dw2, None, None, None
+
+
 def pad_plan(splits):
     """Rows per expert -> (padded splits % 32, destination row of every source row, padded row count)."""
     # TE's grouped quantize needs EVERY group's rows % 128 == 0 (probe 867), not just 32.
@@ -158,10 +261,9 @@ class TEGroupedExperts(GroupedExperts):
         xp = xv.new_zeros(rp, xv.shape[1]).index_copy(0, dst, xv)
         c = self.__dict__["_te_caches"]
         w1, w3, w2 = self.w1_EFD, self.w3_EFD, self.w2_EDF
-        gate = te_grouped_mm(xp, w1.bfloat16(), padded, c[0])
-        up = te_grouped_mm(xp, w3.bfloat16(), padded, c[1])
-        h = self.activation_fn(gate, up)
-        yp = te_grouped_mm(h, w2.bfloat16(), padded, c[2])
+        yp = _TEExpertsChain.apply(
+            xp, w1.bfloat16(), w3.bfloat16(), w2.bfloat16(), padded, c, self.activation_fn
+        )
         y = yp.index_select(0, dst).type_as(x_RD)
         if r_valid != r_cap:
             y = F.pad(y, (0, 0, 0, r_cap - r_valid))
