@@ -39,6 +39,12 @@ export PYTHONPATH="$WORKTREE:/mnt/dgxc/pydeps${EXTRA_PYTHONPATH:+:$EXTRA_PYTHONP
 # build its CUDA driver shim there ("Python.h: No such file", job 686). gcc
 # honours CPATH; the headers are copied from a node that has them.
 export CPATH="/mnt/dgxc/pyinclude/python3.12:/mnt/dgxc/pyinclude${CPATH:+:$CPATH}"
+# CUBLAS_NEW=1: TE's fused cuBLASLt grouped GEMM (TE experts) needs cuBLASLt >= 13.3;
+# torch ships 13.1.1 and preloads it by absolute path, so only LD_PRELOAD of the
+# nvidia-cublas 13.8 wheel's libraries (same soname) switches it.
+if [ "${CUBLAS_NEW:-0}" = "1" ]; then
+  export LD_PRELOAD="/mnt/dgxc/cublas-new/nvidia/cu13/lib/libcublasLt.so.13:/mnt/dgxc/cublas-new/nvidia/cu13/lib/libcublas.so.13${LD_PRELOAD:+:$LD_PRELOAD}"
+fi
 # Optional fp32 matmul precision override (bfx9 default / tf32 / ieee).
 export TORCHTITAN_FP32_MATMUL_PRECISION=${TORCHTITAN_FP32_MATMUL_PRECISION:-bfx9}
 
