@@ -28,8 +28,8 @@ login node, 00006/12/14/61/62/66/68/71/72 drained). Session window ends
 | 953 | 128 | reference: bf16 dense, bfx9 matmuls, eager mHC | cancelled (user: optimize first) | | config `..._cudnnidx_12x_c4` exists if wanted later |
 | 954 | 32 | X0 control: 12x + workspace fix, r02 | 493.1 (492.7 @ step 20) | 225.6 GiB | lower than 945 (503.3) on the same nodes 2 h earlier; A/B 961 isolates the fix |
 | 959 | 32 | X4: EP=1, 7x (`..._ep1_7x`) | 441 (436.2 @ step 20) | 198.1 GiB | -12% vs EP=2 at 7x: full-expert all-gather per layer costs more than the dispatcher. EP=1+CUDA graphs dropped. |
-| 960 | 64 | B0: HSDP shard=32 replicate=2 (r01 8 + r02 8) | running | | |
-| 961 | 32 | X5: control with `TORCHTITAN_DSA_PERSISTENT_WORKSPACE=0`, r03 | running | | same-hour A/B for the fix at 32 GPUs |
+| 960 | 64 | B0: HSDP shard=32 replicate=2 (r01 8 + r02 8) | 503.3 (499.4 @ step 20) | 226.0 GiB | recovers the 32-GPU rate (plain FSDP over 64: 485.2) |
+| 961 | 32 | X5: control with `TORCHTITAN_DSA_PERSISTENT_WORKSPACE=0`, r03 | 500.8 (507.1 @ step 20) | 210.3 GiB | vs 954 fix-on 493.1 (r02): at 32 GPUs the fix reads -1.5% across racks, while it was +2.0% back-to-back at 128 (951 vs 950). Benefit scales with world size (any straggler stalls everyone), cost (16 GiB more reserved) does not. Kept for 128. |
 | 962 | 32 | X6: EP=4 at 12x (`--parallelism.expert_parallel_degree 4`), r03 | queued | | user request; prior: EP=2 beat EP=4 by ~8% on this attention recipe |
 | 955 | 32 | X1: control + `NCCL_PROTO=Simple`, r03 | 496.4 (494.3 @ step 20) | 225.4 GiB | vs control 954: see below |
 | 956 | 32 | X2: control + HybridEP | crash at init | | NVLink-domain size 4 vs EP=2 |
@@ -114,7 +114,7 @@ to the edge. Analysis scripts: `scratchpad/prof_summary.py`, `straggler.py`,
 - [ ] A2. `NCCL_PROTO=Simple`: every collective runs LL today; the ledger
       measured +0.85% on an old recipe and the dedicated protocol test (job
       783) never ran. Env-only, in the 7b batch.
-- [ ] B0. **64 GPUs as HSDP shard=32 replicate=2** (one 16-node rack): plain
+- [x] B0. (done, job 960: 503.3) **64 GPUs as HSDP shard=32 replicate=2** (one 16-node rack): plain
       FSDP over 64 gave 485; HSDP at 96/128 gave 502-509, so the 64 number is
       likely recoverable the same way. Trades the 30 GiB memory saving back.
 - [ ] B. **14x microbatch** (`..._tedense_14x`, 114688 tokens/rank). Never
@@ -148,7 +148,7 @@ to the edge. Analysis scripts: `scratchpad/prof_summary.py`, `straggler.py`,
       as a stream gap on odd ranks. Residual barrier (1.6 s/rank) is genuine
       peer sync; even ranks carry ~220 ms more expert GEMM (experts 0-127
       receive more tokens than 128-255).
-- [ ] I. **Elementwise over padded EP capacity** (~3-4%, half a day). The
+- [ ] I. (implemented, commit 54cca37c; A/B jobs below) **Elementwise over padded EP capacity** (~3-4%, half a day). The
       expert-path elementwise kernels (SiLU, gate*up, dgrad add) run over the
       dispatcher's full receive capacity (1,179,648 rows) while the grouped
       GEMMs respect the real offsets; expected fill is ~50% with top-k 6 over
