@@ -8,6 +8,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -106,6 +108,9 @@ class SqrtSoftplus(UnaryActivationFn):
         return F.softplus(x).sqrt()
 
 
+_SWIGLU_BOUNDED = os.environ.get("TORCHTITAN_SWIGLU_BOUNDED", "1") == "1"
+
+
 @leaf_compile(group="moe", dynamic=True)
 def _swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """SwiGLU, fused into one kernel.
@@ -134,7 +139,14 @@ class SwiGLU(BinaryActivationFn):
         up: torch.Tensor,
         **kwargs: Any,
     ) -> torch.Tensor:
-        del kwargs
+        # ``num_valid_rows`` (a device int scalar) restricts the work to the
+        # valid prefix of a capacity-padded routed activation; see
+        # swiglu_bounded.py. TORCHTITAN_SWIGLU_BOUNDED=0 keeps the full pass.
+        num_valid_rows = kwargs.get("num_valid_rows")
+        if num_valid_rows is not None and _SWIGLU_BOUNDED:
+            from torchtitan.models.common.swiglu_bounded import swiglu_bounded
+
+            return swiglu_bounded(gate, up, num_valid_rows)
         return _swiglu(gate, up)
 
 
