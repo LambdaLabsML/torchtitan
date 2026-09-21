@@ -108,10 +108,12 @@ class BlockInputOffload(nn.Module):
 
     def _on_output_grad(self, grad):
         main = torch.cuda.current_stream()
-        if self.restore_done is None:
-            self._restore()  # not prefetched (e.g. last layer): restore now
-        main.wait_event(self.restore_done)
-        if self.prev is not None:
+        if self.freed:  # not prefetched yet: restore now
+            self._restore()
+        if self.restore_done is not None:
+            main.wait_event(self.restore_done)
+        # the last layer's input is never freed (no next block frees it); fine.
+        if self.prev is not None and self.prev.freed:
             self.prev._restore()  # one layer ahead
         return grad
 
