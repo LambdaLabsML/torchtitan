@@ -929,3 +929,17 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_teexpe
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(microbatch, seq_len)
     assert _apply_te_experts(config) > 0
     return config
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_9x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """9x microbatch (73728 tokens per rank); needs OPT_STATE_OFFLOAD=1 to fit."""
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(9, seq_len)
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_10x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """10x microbatch (81920 tokens per rank); needs OPT_STATE_OFFLOAD=1 to fit."""
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(10, seq_len)
