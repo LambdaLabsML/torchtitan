@@ -2652,3 +2652,37 @@ The reusable pieces (TE build, cuBLAS 13.8 preload switch, the 128-row
 grouped layout facts, the single-Function chain) are on the branch; the
 design that could pay is fp8 primary expert weights all-gathered in MXFP8.
 **Best stays 482.8 TFLOP/s at 7x (job 853).**
+
+## Megatron DSv4 tracker items 2.5.1-2.5.3 vs this recipe
+
+* **2.5.2 hybrid-attention fusion (cuDNN CSA/HCA, #4894; compressor
+  gated-pooling to cuDNN, #5984; THD op fusions, #7064).** Already covered:
+  cuDNN DSA forward+backward and the cuDNN fused indexer are in the recipe.
+  What is not covered is small: the compressor's gated pooling is
+  ``aten::sum`` over [6, 10240, 64, 512] + [6, 8256, 64, 512] plus a few cats,
+  ~100 ms per 2 steps (0.4% of kernel time) in the 847 trace; #7064 is
+  THD-layout (packed sequences) specific to Megatron. Not worth a run.
+* **2.5.3 fused GroupedGEMM + ClampedSwiGLU (#5130).** The activation fusion
+  lives in TE's fused grouped MLP, which is fp8/NVFP4-only -- the path the
+  section above shows cannot fit or pay here. torch's cutlass ``_grouped_mm``
+  has no activation epilogue; our SwiGLU is already one compiled Triton
+  kernel (``triton_poi_fused_mul_silu``, 381 + 273 ms per 2 steps, 2.9%). The
+  "hash-routing force balance" half of it we already have as the router's
+  ``_debug_force_load_balance``.
+* **2.5.1 mHC fusion (#3828, #4624, TE Triton mHC #2790): promising, not
+  implemented -- now is.** On the 457.6 recipe the hyper-connection path is
+  ~12% of kernel time (847 trace: ~1.9 s of Inductor hc kernels + ~0.8 s of
+  TF32 N=24 mixing GEMMs per 2 steps), sits on the critical path with nothing
+  overlapping it, and its ideal traffic is ~1/4 of that. Our earlier
+  ``dsv4_fused_mhc`` port fused only sinkhorn/aggregate/post (+0.4% on a
+  387 base). TE 2.19 ships the full kernel set with autograd
+  (``transformer_engine/pytorch/triton/mhc.py``: projection+RMS, scale,
+  log-space sinkhorn, aggregate, expand+combine). Branch ``dsv4_te_mhc``
+  (worktree /mnt/dgxc/worktrees/temhc), ``TORCHTITAN_TE_MHC=1``: the decoder
+  keeps its residual stream in TE's ``[T, D, n]`` layout, HcPre/HcPost call
+  TE, HcHead permutes back once per step, and ``hc_fn`` is re-laid-out to TE's
+  (C, n) column order per call (1.5 MB). Semantics: TE's post step is the
+  paper's residual mixing; torchtitan's eager HcPost does not mix (ledger,
+  "DSv4 mHC does not mix"), so this also changes the model to the intended
+  math. Debugmodel smoke 879: 8.20762 / 3.2909 / 6.94509 vs 8.20766 / 3.2912
+  / 6.94506. 8-node 7x run: job 880, result below.
