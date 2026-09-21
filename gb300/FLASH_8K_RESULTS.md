@@ -2492,3 +2492,46 @@ e4m3 (step-1 grad_norm 13 vs 52-55 for the other recipes; debugmodel 1.24 vs
 3.29) and the step-1 update is poor; the amax history fills and it is normal by
 step 5. Acceptable behind a warm-up; for step-1-sensitive comparisons use
 ``TE_DENSE_RECIPE=mxfp8`` (449, no artifact).
+
+## New best: eager-site fusions on top of cudnnidx + TE dense = 471.0 TFLOP/s (job 852)
+
+Answering "can the elementwise-fusion idea be made to work with the cuDNN
+indexer": not that commit (its site is gone), but the technique applied to
+what the 457.6 profile (job 847, trace ``teexp/outputs/profiling/traces/
+iteration_10_j847``, attribution via ``/mnt/dgxc/attrib_trace.py``) still
+showed eager. Branch ``dsv4_eager_fusions`` (worktree
+/mnt/dgxc/worktrees/fusions), two commits on top of the 457.6 stack:
+
+1. **Copy-free grouped low-rank output projection** (``attention.py``,
+   ``_GroupedLowRankProj``): ``einsum("tgd,grd->tgr")`` permuted the
+   [T, 8, 4096] attention output (3.2 GiB) into batch-major and copied its
+   output back token-major -- 487 ms per 2 steps of pure copies (2.2% of
+   kernel time). Replaced with strided ``bmm`` writing through transposed
+   views; bitwise identical (probe 848: 15.21 -> 11.75 ms fwd+bwd per layer).
+2. **Indexer query RoPE in place** (``compressor.py``): the indexer runs on
+   detached inputs with its auxiliary loss dropped, so its
+   split -> complex rope -> cat (aten::cat + copy_ + mul on [49152, 64, 64],
+   ~250 ms per 2 steps, 1.1%) becomes one in-place launch of the existing
+   Triton ``rotate_tail_``. Debugmodel matches the reference to 1e-5.
+
+| run (r02, nodes 1-8, 20 steps, TE delayed) | TFLOP/s step 20 (steps 12-20) | memory |
+| --- | --- | --- |
+| 840: cudnnidx + TE dense (previous best) | 457.6 (451-459) | 221.2 GiB |
+| 850: + copy-free output projection | 458.4 | 227.0 GiB |
+| **852: + indexer RoPE in place** | **471.0 (see range above)** | 224.6 GiB |
+
++2.9% total. The split is instructive: the output-projection copies were
+twice the kernel time of the indexer rope yet converted to +0.2%, while the
+indexer rope converted to +2.7% -- the indexer runs on the critical path
+ahead of the cuDNN top-k with nothing to overlap it (its inputs are
+detached; the FSDP gathers are already hidden under attention), so removing
+its eager passes shortens the step one-for-one, whereas the output-projection
+copies sat where communication was already hiding compute. Same lesson as
+the whole campaign: fuse what is exposed, not what is large.
+
+Remaining eager on the 852 recipe worth a look later (from the 847
+attribution, per 2 steps): FSDP expert all-gather copy-out/in 597 ms (FSDP2
+internals), MinimalAsyncEP combine accumulate 173 ms, hc residual-grad
+accumulate 130 ms (autograd), ~150 ms of [T, 4096] casts/copies spread over
+~10 sites per layer, and ~200 ms of index sorts of which only the static HCA
+compaction (64 ms) is cacheable. Nothing single above 1%.
