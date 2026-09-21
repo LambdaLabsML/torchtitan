@@ -91,12 +91,20 @@ class _Offloader:
             if cur:
                 chunks.append(cur)
             main = torch.cuda.current_stream()
+            # Order the side streams after everything main has issued so far (grads,
+            # the trainer's async finiteness assert, the previous step's kernels) and
+            # after the previous step's write-backs before anything is reused.
+            self.h2d.wait_stream(main)
+            self.h2d.wait_stream(self.d2h)
             for k, chunk in enumerate(chunks):
                 buf_m, buf_v = self.staging[k % 2]
                 total = sum(_local(p).numel() for p in chunk)
                 if total > _CHUNK_ELEMS:  # oversized single param: dedicated temp buffers
-                    buf_m = torch.empty(total, device=device, dtype=dtype)
-                    buf_v = torch.empty(total, device=device, dtype=dtype)
+                    with torch.cuda.stream(self.h2d):  # allocate on the stream that writes first
+                        buf_m = torch.empty(total, device=device, dtype=dtype)
+                        buf_v = torch.empty(total, device=device, dtype=dtype)
+                    buf_m.record_stream(main); buf_v.record_stream(main)
+                    buf_m.record_stream(self.d2h); buf_v.record_stream(self.d2h)
                 # the staging pair is free once chunk k-2's write-back finished
                 if self.last_d2h_events[k % 2] is not None:
                     self.h2d.wait_event(self.last_d2h_events[k % 2])
@@ -141,6 +149,9 @@ class _Offloader:
                         _local(st["exp_avg"]).copy_(m, non_blocking=True); _local(st["exp_avg_sq"]).copy_(v, non_blocking=True)
                 ev = torch.cuda.Event(); ev.record(self.d2h)
                 self.last_d2h_events[k % 2] = ev
+            # main must not run ahead into work that could free/reuse anything the
+            # write-back still reads; the copies themselves keep draining.
+            main.wait_stream(self.h2d)
         for hook in optim._optimizer_step_post_hooks.values():
             hook(optim, (), {})
 
