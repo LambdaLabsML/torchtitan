@@ -97,18 +97,62 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         if self.moe_enabled:
             assert self.moe is not None
             ffn_input = self.ffn_norm(x)
-            if getattr(self.moe.router, "hash", False):
-                x = self.moe(
-                    ffn_input,
-                    padding_mask_T=padding_mask,
-                    input_ids_T=input_ids_T,
-                )
+            router_kw = (
+                {"input_ids_T": input_ids_T}
+                if getattr(self.moe.router, "hash", False)
+                else {}
+            )
+            if _DISPATCH_OVERLAP and self.moe.shared_experts is not None:
+                x = self._moe_dispatch_overlap(ffn_input, padding_mask, router_kw)
             else:
-                x = self.moe(ffn_input, padding_mask_T=padding_mask)
+                x = self.moe(ffn_input, padding_mask_T=padding_mask, **router_kw)
         else:
             x = self.feed_forward(self.ffn_norm(x))
         x = self.hc_post(x, residual, post, comb)
         return x
+
+    def _moe_dispatch_overlap(self, ffn_in, padding_mask, router_kw):
+        """MoE forward with the EP dispatch on a side stream and the shared
+        experts on the main stream beside it (TORCHTITAN_DISPATCH_OVERLAP=1).
+
+        MinimalAsyncEP's dispatch is a synchronous custom op: its peer copy
+        (~7% of the step, NVLink-store bound, SMs mostly idle) and barrier
+        block the stream they run on. The shared experts (~3.5% of the step)
+        depend only on ``ffn_in``, so issued on the main stream while the
+        dispatch runs on the comm stream they fill that window. The earlier
+        variant (branch dsv4_shared_expert_overlap) put the shared experts on
+        the side stream instead and paid +35-40 GiB for the second allocator
+        pool; here only the dispatch's outputs live on the side stream.
+        Same ops and shapes as ``MoE.forward``, so the result is unchanged.
+        """
+        from torchtitan.models.common.moe import maybe_set_sparse_mesh
+
+        moe = self.moe
+        scores, eids, rmap = moe.router(
+            ffn_in, moe.expert_bias_E, padding_mask_T=padding_mask, **router_kw
+        )
+        counts = rmap.sum(dim=0)
+        main = torch.cuda.current_stream()
+        comm = _dual_mb_comm_stream()
+        start = torch.cuda.Event()
+        start.record(main)
+        with torch.cuda.stream(comm):
+            comm.wait_event(start)
+            for a in (ffn_in, scores, eids, counts):
+                _record_stream(a, comm)
+            routed_in, n_e, meta = moe.routed_experts.token_dispatcher.dispatch(
+                ffn_in, scores, eids, counts
+            )
+        done = torch.cuda.Event()
+        done.record(comm)
+        shared_out = moe.shared_experts(ffn_in)  # main stream, beside the dispatch
+        main.wait_event(done)
+        for t in (routed_in, n_e):
+            _record_stream(t, main)
+        with maybe_set_sparse_mesh():
+            routed_out = moe.routed_experts.inner_experts(routed_in, n_e)
+        out = moe.routed_experts.token_dispatcher.combine(routed_out, meta, ffn_in)
+        return out + shared_out
 
     def _attn_and_ffn_pre(self, x, attention_masks, positions):
         """Attention sub-block plus the FFN's HC pre-mix and norm."""
@@ -251,6 +295,7 @@ class _FsdpSyncOnBackward(torch.autograd.Function):
         return grad, None
 
 
+_DISPATCH_OVERLAP = os.environ.get("TORCHTITAN_DISPATCH_OVERLAP", "0") == "1"
 _DUAL_MB_COMM_STREAM = None
 
 
