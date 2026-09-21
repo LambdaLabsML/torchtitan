@@ -141,7 +141,14 @@ class _TEExpertsChain(torch.autograd.Function):
     def _weight(w, cache, key_extra):
         tex = _tex()
         E, O, I = w.shape
-        key = (w.data_ptr(), w._version, w.shape, key_extra)
+        # FSDP frees and re-gathers the unsharded weight for the FullAC recompute,
+        # so data_ptr/_version change within a step. Key on the values instead: a
+        # strided sample checksum (one tiny host sync) is stable across the
+        # forward, recompute and backward of a step and changes at optimizer.step.
+        flat = w.reshape(-1)
+        stride = max(1, flat.numel() // 4096)
+        sig = flat[::stride].float().sum().item()
+        key = (sig, w.shape, key_extra)
         if cache.get("key") == key:
             return cache["gw"]
         gw = tex.group_quantize(w.reshape(E * O, I), _quantizer(), E, None)
