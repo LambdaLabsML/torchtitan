@@ -97,7 +97,9 @@ class GroupedExperts(Module):
         up_RF = self._grouped_mm(
             A=x_RD.bfloat16(), weight_EOI=self.w3_EFD, offs=offsets_E
         )
-        h_RF = self.activation_fn(gate_RF, up_RF)
+        # Rows at or past the last offset were not written by the GEMMs and are
+        # not read by the next one; the activation may skip them (swiglu_bounded).
+        h_RF = self.activation_fn(gate_RF, up_RF, num_valid_rows=offsets_E[-1:])
         return self._grouped_mm(A=h_RF, weight_EOI=self.w2_EDF, offs=offsets_E).type_as(
             x_RD
         )
