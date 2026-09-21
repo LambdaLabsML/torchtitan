@@ -2983,3 +2983,16 @@ either.
 jitter-through-a-barrier cost. Still under the 7x best without the offload
 (506.1): the 41 GiB the offload frees buys a microbatch that returns less
 than the offload costs. 12x (942) queued for the record.
+
+## New best: 12x + block-input offload + `TE_REDUCE_AMAX=0` = 513.9 TFLOP/s (job 942)
+
+**513.9 TFLOP/s at step 20 (512-515 steady over steps 17-20), 215.2 GiB**,
+rack r02: +1.5% over the 7x best (940: 506.1), +2.7% over 500.3. The offload
+finally pays: at 12x the microbatch gain outgrows the offload's ~1.5%
+residual (7x 506.1 -> 10x 498.8 -> 12x 513.9 with the offload on; the 10x
+point sits low, within the ~1% run-to-run spread of this regime). 64 GiB
+remain: 14x (943, ~228 GiB by the 6.5 GiB-per-sequence slope with the
+offload) and 16x (944, ~241) queued, same env.
+
+Recipe = the 500.3 stack + `TE_REDUCE_AMAX=0` + `TORCHTITAN_BLOCK_INPUT_OFFLOAD=1`
++ `..._12x`; `gb300/REPRODUCE_500.md` on `dsv4_te_mhc` has the command.
