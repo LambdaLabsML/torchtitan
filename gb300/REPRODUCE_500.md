@@ -1,4 +1,4 @@
-# DeepSeek-V4-flash, 8k seq, 32x GB300: 513.9 TFLOP/s (job 942)
+# DeepSeek-V4-flash, 8k seq, 32x GB300: 517.6 TFLOP/s (job 996)
 
 Branch `dsv4_te_mhc` = the full stack. Everything below default-off is a knob.
 
@@ -7,12 +7,12 @@ Branch `dsv4_te_mhc` = the full stack. Everything below default-off is a knob.
 RACK=r02 WORKTREE=<this checkout> \
 EXTRA_PYTHONPATH=/mnt/dgxc/pydeps-te:/mnt/dgxc/pydeps-cudnn \
 TORCHTITAN_FP32_MATMUL_PRECISION=tf32 TE_DENSE_RECIPE=delayed TE_REDUCE_AMAX=0 TORCHTITAN_TE_MHC=1 \
-TORCHTITAN_BLOCK_INPUT_OFFLOAD=1 \
-CONFIG=deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_12x STEPS=20 TAG=best \
+TORCHTITAN_BLOCK_INPUT_OFFLOAD=1 TORCHTITAN_DSA_PERSISTENT_WORKSPACE=0 \
+CONFIG=deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_13x STEPS=20 TAG=best \
 /mnt/dgxc/sbatch_rack.sh --parsable --nodes=8 --time=00:50:00 gb300/dsv4_64xgb300.slurm
 ```
-8 nodes x 4 GB300 in ONE rack (inter-rack IB is slow); the config is 12 sequences
-of 8192 per rank (215 GiB peak; 7x without the offload = 506.1 at 238.5 GiB), EP=2, FSDP over the rest, FullAC, MinimalAsyncEP dispatcher
+8 nodes x 4 GB300 in ONE rack (inter-rack IB is slow); the config is 13 sequences
+of 8192 per rank (224.6 GiB peak; 12x = 509.4-513.9, 7x without the offload = 506.1), EP=2, FSDP over the rest, FullAC, MinimalAsyncEP dispatcher
 with 4 receive slots (2 slots corrupt expert weight grads: see ledger).
 
 ## What is in the recipe (in stacking order, each measured in the ledger)
@@ -27,7 +27,10 @@ stream kept as [T, D, n]) -> 7x microbatch (500.3, job 880) -> `TE_REDUCE_AMAX=0
 (skips TE's per-module synchronous amax all-reduce, 520 per step; 506.1, job
 940) -> `TORCHTITAN_BLOCK_INPUT_OFFLOAD=1` (FullAC block inputs to pinned host,
 copy at block entry, one-layer-deep restore in backward; -68 GiB at 7x) which
-makes 12x fit -> 12x microbatch (513.9, job 942).
+makes 12x fit -> 12x microbatch (513.9, job 942) -> 13x on the merged branch
+(bounded SwiGLU on by default; `TORCHTITAN_DSA_PERSISTENT_WORKSPACE=0`, the
+persistent workspace costs 16 GiB and -1.5% at 32 GPUs and is for 128) = 517.6
+(job 996). 14x needs `OPT_STATE_OFFLOAD=1 OPT_STATE_OFFLOAD_LAYERWISE=1` too.
 
 ## External pieces not in this repo (paths on the yqb01 cluster)
 * venv: `/mnt/dgxc/venvs/dsv4n` (torch 2.15 nightly cu130, aarch64).
