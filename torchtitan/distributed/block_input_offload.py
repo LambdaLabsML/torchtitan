@@ -7,9 +7,9 @@ layers -- 60% of the ~19.4 GiB each extra sequence of microbatch costs on
 this recipe. This wrapper releases that storage during the forward and
 restores it one layer ahead of use in the backward:
 
-* forward: run the (FSDP-wrapped, checkpointed) block; copy the input to a
-  persistent pinned buffer on a D2H stream; at the NEXT block's forward, once
-  that copy has landed, free the input's GPU storage (``resize_(0)`` on the
+* forward: at block entry copy the input to a persistent pinned buffer on a
+  D2H stream (overlapping this block's forward); at the NEXT block's forward,
+  once that copy has landed, free the input's GPU storage (``resize_(0)`` on the
   very tensor the checkpoint closure holds, so the recompute later sees the
   same object).
 * backward: a hook on the block output's gradient (which fires before the
@@ -138,9 +138,14 @@ class BlockInputOffload(nn.Module):
         if not (self.training and torch.is_grad_enabled() and x.is_cuda):
             return self.inner(x, *args, **kwargs)
         self._release_prev()
-        out = self.inner(x, *args, **kwargs)
+        # Copy BEFORE running the block: x is complete at entry, so the D2H
+        # transfer overlaps this block's forward. Issued after the block (as in
+        # the first version) it could only start once the forward had drained
+        # and the next block's release then waited on it: 43 x 2.4 GB at 9x
+        # fully exposed, ~2 s of a ~15 s step (job 929: 434.7 vs 500 TFLOP/s).
         self._offload(x)
         self.restore_done = None
+        out = self.inner(x, *args, **kwargs)
         if isinstance(out, torch.Tensor) and out.requires_grad:
             out.register_hook(self._on_output_grad)
         return out
