@@ -2597,3 +2597,41 @@ barrier, and the routing-regime caveat applies equally to both. It does use
 17 GiB less memory (no fixed-capacity receive pool). **Not adopted.** The
 "async EP transport" lever would need the fine-grained schedule Megatron pairs
 DeepEP with, which is the same schedule that lost as dual-microbatch here.
+
+## TE MXFP8 grouped experts, integrated (branch `dsv4_eager_fusions`, `torchtitan/quantization/te_grouped.py`)
+
+``TEGroupedExperts`` runs the w1/w3/w2 chain through TE's fused cuBLASLt
+grouped GEMM (``group_quantize`` + ``general_grouped_gemm_for_grouped_tensor``,
+device-side splits) in one autograd Function for all local experts:
+64-expert chunks (fused-path cap) writing into slices of single output and
+gradient buffers, one quantized input shared by w1 and w3, the two dgrad GEMMs
+accumulated into one dx, SwiGLU backward via autograd on the saved gate/up.
+Config ``..._cudnnidx_tedense_teexperts`` (+ ``_7x``), launcher ``CUBLAS_NEW=1``
+(cuBLASLt 13.8 preload; neutral for the rest of the model: 876 vs 861 =
+470.8 vs 471.0). What it took (all in the ledger's job numbers):
+
+* **Group alignment is 128 rows, not 32** (probe 867: the grouped quantize's
+  layout asserts ``rows % 128``; the 32 came from the per-tensor MXFP8 check),
+  and the grouped total must be % 128 too. Routed rows are padded once per
+  layer (index_copy) and un-padded once; MinimalAsyncEP's full-capacity slot
+  is handled by working on the valid prefix and padding the output back.
+* **Glue mattered more than GEMMs.** First version: 0.72x torch bf16 per layer
+  (MXFP8 GEMMs 13.4 ms vs 23.9 bf16, but 22 ms of per-chunk input-slice
+  gradients (memset+copy+add), double x quantization and ``torch.cat``, profile
+  871). Single-Function rewrite: **1.04x balanced, 1.22x collapsed** with cached
+  weights (873); remaining glue is the pad/unpad copies (~5 ms) and one
+  quantize per GEMM operand.
+* **fp8 weights cannot be cached across the step under FSDP**: 3 weights x
+  128 experts x 2048 x 4096 at 2 bytes (both usages) = 6.4 GB per layer, 277 GB
+  over 43 layers -- job 877 OOMed at 6x with the cache (875 at 7x too). Without
+  it the weights are quantized in every pass (~4 ms per layer-pass, ~3% of the
+  step), which is most of the GEMM gain.
+* Numerics: fp8-level (rel 6.6e-2 on outputs/grads vs bf16 in isolation);
+  debugmodel smoke 874: 8.20769 / 3.2911 / 6.94565 vs 8.20766 / 3.2912 / 6.94506.
+
+Result at 6x without the cache: job 878 (below). The design that would make
+this pay is Megatron's: fp8 *primary* expert weights sharded and all-gathered
+in MXFP8 (one quantize per optimizer step, half the gather bytes, no
+per-pass quantize) feeding this grouped GEMM directly, plus dispatcher-level
+128-row padding to drop the copies -- a day or two of FSDP2-extension work,
+not attempted here.
