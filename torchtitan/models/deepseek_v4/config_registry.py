@@ -973,3 +973,16 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_teexpe
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(microbatch, seq_len)
     assert _apply_te_experts(config) > 0
     return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_sac_ep4_1x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """Selective AC at EP=4 on the current recipe (TE dense + cuDNN indexer), 1x
+    microbatch -- the only microbatch SAC's saved activations have ever fit (the
+    181.69-recipe sweep, jobs 557-561). Re-measured on the 500.3 recipe."""
+    from torchtitan.distributed.activation_checkpoint import SelectiveAC
+
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(1, seq_len)
+    config.parallelism.expert_parallel_degree = 4
+    config.activation_checkpoint = SelectiveAC.Config()
+    return config
