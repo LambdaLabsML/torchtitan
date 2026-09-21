@@ -2581,3 +2581,19 @@ run in this ledger (840-853) recomputed a slightly different routing than its
 forward -- a small, silent numerics wobble, not a crash. The stateless MXFP8
 recipe recomputes bit-identically. Retest pair queued under MXFP8: 860 (DeepEP)
 vs 861 (MinimalAsyncEP), both 7x on r02.
+
+**DeepEP vs MinimalAsyncEP at 8k/7x, both TE MXFP8 dense, r02 nodes 1-8, 20 steps:**
+
+| dispatcher | TFLOP/s step 20 (steps 19-20) | memory | loss @20 |
+| --- | --- | --- | --- |
+| MinimalAsyncEP (861) | 471.0 (471.0-471.2) | 244.9 GiB | 3.14 |
+| DeepEP v2.1.0 ElasticBuffer (860) | 444.8 (437.0-444.8) | 228.1 GiB | 3.43 |
+
+DeepEP is -5.6% (was -6.6% at 1k/EP=4). torchtitan's DeepEP dispatcher uses
+the compact, host-synced, backward-able layout for training, so none of
+DeepEP's asynchronous overlap is exercised; on an intra-node EP=2 pair its
+dispatch/combine kernels simply cost more than MinimalAsyncEP's row copy and
+barrier, and the routing-regime caveat applies equally to both. It does use
+17 GiB less memory (no fixed-capacity receive pool). **Not adopted.** The
+"async EP transport" lever would need the fine-grained schedule Megatron pairs
+DeepEP with, which is the same schedule that lost as dual-microbatch here.
