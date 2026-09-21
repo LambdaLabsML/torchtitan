@@ -943,3 +943,17 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_10x(
 ) -> Trainer.Config:
     """10x microbatch (81920 tokens per rank); needs OPT_STATE_OFFLOAD=1 to fit."""
     return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(10, seq_len)
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_sac_ep4_1x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """Selective AC at EP=4 on the current recipe (TE dense + cuDNN indexer), 1x
+    microbatch -- the only microbatch SAC's saved activations have ever fit (the
+    181.69-recipe sweep, jobs 557-561). Re-measured on the 500.3 recipe."""
+    from torchtitan.distributed.activation_checkpoint import SelectiveAC
+
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(1, seq_len)
+    config.parallelism.expert_parallel_degree = 4
+    config.activation_checkpoint = SelectiveAC.Config()
+    return config
