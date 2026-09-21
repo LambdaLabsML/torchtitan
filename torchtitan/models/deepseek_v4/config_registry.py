@@ -1076,3 +1076,12 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_pro
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_profile(seq_len)
     config.debug.moe_force_load_balance = True
     return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_13x_balanced(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 13x recipe with forced load-balanced routing (Megatron's
+    --moe-router-force-load-balancing equivalent): the balanced-regime number."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(13, seq_len)
+    config.debug.moe_force_load_balance = True
+    return config
