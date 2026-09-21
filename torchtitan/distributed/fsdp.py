@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 import logging
 from typing import Any, TYPE_CHECKING
 
@@ -429,39 +430,39 @@ def apply_fsdp_to_decoder(
     if ep_degree == 1:
         return
 
-    # set up explicit prefetching when EP is enabled for forward
+    # set up explicit prefetching when EP is enabled for forward.
+    # FSDP_PREFETCH_DEPTH (default 1): how many blocks ahead each block's
+    # all-gather is issued. At depth 1 the 7x profile still shows 2.7% of the
+    # step as exposed all-gather; each extra level costs one more block of
+    # gathered parameters resident (~2 GiB here).
+    depth = max(1, int(os.environ.get("FSDP_PREFETCH_DEPTH", "1")))
     transformer_blocks = list(model.layers.values())
-    next_transformer_blocks = transformer_blocks[1:] + [None]
+    n_blocks = len(transformer_blocks)
 
-    if model.tok_embeddings is not None and len(model.layers) > 0:
-        model.tok_embeddings.set_modules_to_forward_prefetch([transformer_blocks[0]])
+    if model.tok_embeddings is not None and n_blocks > 0:
+        model.tok_embeddings.set_modules_to_forward_prefetch(transformer_blocks[:depth])
 
-    for transformer_block, next_transformer_block in zip(
-        transformer_blocks, next_transformer_blocks
-    ):
-        if next_transformer_block is not None:
+    for i, transformer_block in enumerate(transformer_blocks):
+        targets = transformer_blocks[i + 1 : i + 1 + depth]
+        if len(targets) < depth and model.norm is not None and model.lm_head is not None:
+            targets = targets + [model.norm, model.lm_head]
+        if targets:
             # pyrefly: ignore [not-callable]
-            transformer_block.set_modules_to_forward_prefetch([next_transformer_block])
-        elif model.norm is not None and model.lm_head is not None:
-            # pyrefly: ignore [not-callable]
-            transformer_block.set_modules_to_forward_prefetch(
-                [model.norm, model.lm_head]
-            )
+            transformer_block.set_modules_to_forward_prefetch(targets)
+    if depth > 1:
+        logger.info(f"FSDP explicit prefetch depth {depth} (forward and backward)")
 
     # set up explicit prefetching when EP is enabled for backward
     # pyrefly: ignore [no-matching-overload]
     reversed_transformer_blocks = list(reversed(model.layers.values()))
-    prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
 
-    if model.norm is not None and model.lm_head is not None and len(model.layers) > 0:
-        model.lm_head.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
+    if model.norm is not None and model.lm_head is not None and n_blocks > 0:
+        model.lm_head.set_modules_to_backward_prefetch(reversed_transformer_blocks[:depth])
 
-    for transformer_block, prev_transformer_block in zip(
-        reversed_transformer_blocks, prev_transformer_blocks
-    ):
-        if prev_transformer_block is not None:
+    for i, transformer_block in enumerate(reversed_transformer_blocks):
+        targets = reversed_transformer_blocks[i + 1 : i + 1 + depth]
+        if len(targets) < depth and model.tok_embeddings is not None:
+            targets = targets + [model.tok_embeddings]
+        if targets:
             # pyrefly: ignore [missing-attribute]
-            transformer_block.set_modules_to_backward_prefetch([prev_transformer_block])
-        elif model.tok_embeddings is not None:
-            # pyrefly: ignore [missing-attribute]
-            transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])
+            transformer_block.set_modules_to_backward_prefetch(targets)

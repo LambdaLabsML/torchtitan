@@ -1113,3 +1113,13 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_13x(
 ) -> Trainer.Config:
     """The 500 recipe at a 13x microbatch (106496 tokens per rank); needs the block-input offload."""
     return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(13, seq_len)
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_profile_balanced(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 7x profile variant with forced load-balanced routing: splits the EP
+    barrier wait into token-imbalance vs launch jitter (pair with job 938)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_profile(seq_len)
+    config.debug.moe_force_load_balance = True
+    return config
