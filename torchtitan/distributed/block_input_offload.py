@@ -65,7 +65,10 @@ class BlockInputOffload(nn.Module):
         try:
             return super().__getattr__(name)
         except AttributeError:
-            return getattr(self.inner, name)
+            inner = self.__dict__.get("_modules", {}).get("inner")
+            if inner is None or name == "inner":
+                raise
+            return getattr(inner, name)
 
     # --- forward side ---
     def _offload(self, x: torch.Tensor) -> None:
