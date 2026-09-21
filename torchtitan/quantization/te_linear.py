@@ -40,12 +40,23 @@ def get_recipe():
             NVFP4BlockScaling,
         )
 
-        _recipe = {
-            "mxfp8": MXFP8BlockScaling,
-            "delayed": DelayedScaling,
-            "current": Float8CurrentScaling,
-            "nvfp4": NVFP4BlockScaling,
-        }[_RECIPE_NAME]()
+        if _RECIPE_NAME == "delayed":
+            # TE_REDUCE_AMAX=0 drops the per-module amax all-reduce that TE issues
+            # (synchronously, on the compute stream) at every outermost autocast
+            # exit -- one per TELinear per pass, 520 tiny fp32 all-reduces per step
+            # here, 0.45 s of a 10.2 s step at 7x (profiles 937/938). Weights are
+            # identical on every rank after the FSDP all-gather, so their local
+            # amax already agrees; activation/gradient scales are legitimately
+            # per rank.
+            _recipe = DelayedScaling(
+                reduce_amax=os.environ.get("TE_REDUCE_AMAX", "1") == "1"
+            )
+        else:
+            _recipe = {
+                "mxfp8": MXFP8BlockScaling,
+                "current": Float8CurrentScaling,
+                "nvfp4": NVFP4BlockScaling,
+            }[_RECIPE_NAME]()
     return _recipe
 
 
