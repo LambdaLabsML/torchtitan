@@ -36,9 +36,9 @@ login node, 00006/12/14/61/62/66/68/71/72 drained). Session window ends
 | 966 | 32 | K2: 7x without offload, fix on, r01 | 494.9 | 242.8 GiB | 12x+offload (~503) nets only +1.6% over 7x without |
 | 967 | 32 | X7c: bounded SwiGLU, zero mode | crash step 2 | | root cause of 963/967: int32 element-offset overflow above row 1,048,576 in the kernels (fixed, commit f7f66b26) |
 | 968 | 64 | X8: HSDP replicate=2 + `NCCL_PROTO=Simple`, same nodes as 960 | 504.1 | 223.9 GiB | vs 960 503.3: no effect |
-| 969 | 32 | X7d: bounded SwiGLU with the offset fix, r03 | running | | vs 964 control on the same rack |
+| 969 | 32 | X7d: bounded SwiGLU with the offset fix, r03 | **512.5** (513.4 @ step 20), min 510.3 | 223.1 GiB | **+2.6% vs 964 (499.4)** on the same rack; loss 3.02 vs 3.11 @ 20 (noise) |
 | 964 | 32 | X7b: SwiGLU control (`TORCHTITAN_SWIGLU_BOUNDED=0`), r03 | 499.4 (505.0 @ step 20) | 225.3 GiB | same-rack control for 969 |
-| 970 | 128 | FINAL: fix + bounded SwiGLU, HSDP replicate=4 | queued behind 969 | | TAG `final_128_12x_ws_swiglu`; cancel/resubmit without SwiGLU if 969 disappoints |
+| 970 | 128 | FINAL: fix + bounded SwiGLU, HSDP replicate=4 | running (started 13:51) | | TAG `final_128_12x_ws_swiglu`; baselines 950 499.2 / 951 509.0 |
 | 955 | 32 | X1: control + `NCCL_PROTO=Simple`, r03 | 496.4 (494.3 @ step 20) | 225.4 GiB | vs control 954: see below |
 | 956 | 32 | X2: control + HybridEP | crash at init | | NVLink-domain size 4 vs EP=2 |
 | 958 | 32 | X2b: HybridEP, domain size 2 | crash at step 1 | | CheckpointError: routed row count differs on recompute (see D2) |
@@ -156,7 +156,7 @@ to the edge. Analysis scripts: `scratchpad/prof_summary.py`, `straggler.py`,
       as a stream gap on odd ranks. Residual barrier (1.6 s/rank) is genuine
       peer sync; even ranks carry ~220 ms more expert GEMM (experts 0-127
       receive more tokens than 128-255).
-- [ ] I. (implemented, commit 54cca37c; A/B jobs below) **Elementwise over padded EP capacity** (~3-4%, half a day). The
+- [x] I. (done: +2.6% at 32 GPUs, 969 vs 964; commits 54cca37c, d23fb9a5, f7f66b26) **Elementwise over padded EP capacity** (~3-4%, half a day). The
       expert-path elementwise kernels (SiLU, gate*up, dgrad add) run over the
       dispatcher's full receive capacity (1,179,648 rows) while the grouped
       GEMMs respect the real offsets; expected fill is ~50% with top-k 6 over
