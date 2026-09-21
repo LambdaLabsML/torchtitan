@@ -46,7 +46,8 @@ def _swiglu_fwd_kernel(
     rows = r0 + tl.arange(0, BLOCK_R)
     cols = tl.program_id(1) * BLOCK_F + tl.arange(0, BLOCK_F)
     mask = (rows[:, None] < n) & (cols[None, :] < F)
-    offs = rows[:, None] * stride_r + cols[None, :]
+    # 64-bit offsets: rows * F passes 2^31 above row 1,048,576 at F=2048.
+    offs = rows[:, None].to(tl.int64) * stride_r + cols[None, :]
     g = tl.load(gate_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     u = tl.load(up_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     h = g * tl.sigmoid(g) * u
@@ -67,7 +68,8 @@ def _swiglu_bwd_kernel(
     rows = r0 + tl.arange(0, BLOCK_R)
     cols = tl.program_id(1) * BLOCK_F + tl.arange(0, BLOCK_F)
     mask = (rows[:, None] < n) & (cols[None, :] < F)
-    offs = rows[:, None] * stride_r + cols[None, :]
+    # 64-bit offsets: rows * F passes 2^31 above row 1,048,576 at F=2048.
+    offs = rows[:, None].to(tl.int64) * stride_r + cols[None, :]
     g = tl.load(gate_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     u = tl.load(up_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     dh = tl.load(dh_ptr + offs, mask=mask, other=0.0).to(tl.float32)
