@@ -1212,3 +1212,32 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_6x_bal
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_6x_balanced(seq_len)
     assert _enable_dual_microbatch(config) > 0
     return config
+
+def _with_ep(config: Trainer.Config, ep: int) -> Trainer.Config:
+    """Override the expert-parallel degree of a finished recipe. MinimalAsyncEP
+    sizes its receive pool at ep_size x the per-rank tokens by default, which
+    is 90 GB per slot at EP=32; set MINIMAL_ASYNC_EP_POOL_FACTOR (e.g. 2) so
+    the pool is 2x the expected receive instead (balanced routing only)."""
+    config.parallelism.expert_parallel_degree = ep
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_1x_balanced_ep8(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """2-node smoke for cross-node symmetric memory: 1x, balanced, EP=8."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(1, seq_len)
+    config.debug.moe_force_load_balance = True
+    return _with_ep(config, 8)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_balanced_ep8(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """7x balanced with EP=8 (two nodes per expert group; 32 local experts)."""
+    return _with_ep(deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_balanced(seq_len), 8)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_balanced_ep32(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """7x balanced with EP=32: experts fully local (8 per rank), no expert
+    FSDP all-gather/reduce-scatter; 31/32 of routed tokens go remote."""
+    return _with_ep(deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_balanced(seq_len), 32)
