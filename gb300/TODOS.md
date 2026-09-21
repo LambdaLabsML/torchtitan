@@ -30,7 +30,12 @@ login node, 00006/12/14/61/62/66/68/71/72 drained). Session window ends
 | 959 | 32 | X4: EP=1, 7x (`..._ep1_7x`) | 441 (436.2 @ step 20) | 198.1 GiB | -12% vs EP=2 at 7x: full-expert all-gather per layer costs more than the dispatcher. EP=1+CUDA graphs dropped. |
 | 960 | 64 | B0: HSDP shard=32 replicate=2 (r01 8 + r02 8) | 503.3 (499.4 @ step 20) | 226.0 GiB | recovers the 32-GPU rate (plain FSDP over 64: 485.2) |
 | 961 | 32 | X5: control with `TORCHTITAN_DSA_PERSISTENT_WORKSPACE=0`, r03 | 500.8 (507.1 @ step 20) | 210.3 GiB | vs 954 fix-on 493.1 (r02): at 32 GPUs the fix reads -1.5% across racks, while it was +2.0% back-to-back at 128 (951 vs 950). Benefit scales with world size (any straggler stalls everyone), cost (16 GiB more reserved) does not. Kept for 128. |
-| 962 | 32 | X6: EP=4 at 12x (`--parallelism.expert_parallel_degree 4`), r03 | queued | | user request; prior: EP=2 beat EP=4 by ~8% on this attention recipe |
+| 962 | 32 | X6: EP=4 at 12x (`--parallelism.expert_parallel_degree 4`), r03 | hang | | stuck in step-1 backward (main thread idle in a compiled leaf, GPUs at 0-2%) for 25 min; cancelled. Dispatcher deadlock at 4 ranks with the EP=2-tuned slot count; prior was -8% anyway. |
+| 963 | 32 | X7a: bounded SwiGLU, skip mode (commit 54cca37c) | crash step 4 | | "loss or grad norm not finite"; local test: NaN rows past the last offset do NOT leak through `_grouped_mm` fwd/bwd |
+| 965 | 32 | K1: 7x with block-input offload, fix on, r02 | 483.9 | 175.4 GiB | offload still costs ~2.2% of its own at 7x |
+| 966 | 32 | K2: 7x without offload, fix on, r01 | 494.9 | 242.8 GiB | 12x+offload (~503) nets only +1.6% over 7x without |
+| 967 | 32 | X7c: bounded SwiGLU, zero mode (commit d23fb9a5), r03 | running | | outputs allocated zeroed; isolates whether a consumer reads the tail |
+| 964 | 32 | X7b: SwiGLU control (`TORCHTITAN_SWIGLU_BOUNDED=0`), r03 | queued behind 962 | | same-rack control for 967 |
 | 955 | 32 | X1: control + `NCCL_PROTO=Simple`, r03 | 496.4 (494.3 @ step 20) | 225.4 GiB | vs control 954: see below |
 | 956 | 32 | X2: control + HybridEP | crash at init | | NVLink-domain size 4 vs EP=2 |
 | 958 | 32 | X2b: HybridEP, domain size 2 | crash at step 1 | | CheckpointError: routed row count differs on recompute (see D2) |
@@ -158,7 +163,7 @@ to the edge. Analysis scripts: `scratchpad/prof_summary.py`, `straggler.py`,
 - [ ] J. **Re-profile at 128 GPUs after the fix** (15 min): residual allocator
       churn (the fix recovered 2.0 of the 4.6% and the card sits at 278 of
       284 GB) and whether the cross-rack replica all-reduce is exposed.
-- [ ] K. **Re-measure the offload's own cost at 7x**: this morning's pair
+- [x] K. (measured: 483.9 with vs 494.9 without at 7x, jobs 965/966, fix on -> the offload costs ~2.2% by itself, not the allocator stall; its stream handling is a remaining target) **Re-measure the offload's own cost at 7x**: this morning's pair
       (937/938, profiler on) put it at 4.8%. If that was mostly the allocator
       stall it is now free; otherwise there is a second offload issue.
 - [x] L. (dead end) cuDNN DSA backward launch granularity: 33k launches/step
