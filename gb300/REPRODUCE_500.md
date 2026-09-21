@@ -1,4 +1,4 @@
-# DeepSeek-V4-flash, 8k seq, 32x GB300: 578.5 TFLOP/s balanced routing (job 1008) / 519.1 collapsed (job 1006)
+# DeepSeek-V4-flash, 8k seq, 32x GB300: 587.5 TFLOP/s balanced routing (job 1015) / 519.1 collapsed (job 1006)
 
 Branch `dsv4_te_mhc` = the full stack. Everything below default-off is a knob.
 
@@ -11,17 +11,21 @@ vanishes and the same kernels run +14% faster. Balanced is the proxy for
 trained routing; collapsed is what step 20 from scratch really does. Name the
 regime with every number.
 
-## The balanced run (578.5, job 1008)
+## The balanced run (587.5, job 1015)
 ```
 RACK=r02 WORKTREE=<this checkout> \
 EXTRA_PYTHONPATH=/mnt/dgxc/pydeps-te:/mnt/dgxc/pydeps-cudnn \
 TORCHTITAN_FP32_MATMUL_PRECISION=tf32 TE_DENSE_RECIPE=delayed TE_REDUCE_AMAX=0 TORCHTITAN_TE_MHC=1 \
 TORCHTITAN_DSA_PERSISTENT_WORKSPACE=0 FSDP_PREFETCH_DEPTH=2 \
+MINIMAL_ASYNC_EP_COPY_BLOCK_M=16 MINIMAL_ASYNC_EP_COPY_WARPS=4 \
 CONFIG=deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_balanced STEPS=20 TAG=best_balanced \
 /mnt/dgxc/sbatch_rack.sh --parsable --nodes=8 --time=00:50:00 gb300/dsv4_64xgb300.slurm
 ```
-No offload: in the balanced regime 7x (578.5) beats 10x+offload (572.3) and
-13x+offload (549.7).
+No offload: in the balanced regime 7x beats 10x+offload (572.3) and 13x+offload
+(549.7). `MINIMAL_ASYNC_EP_COPY_BLOCK_M=16 MINIMAL_ASYNC_EP_COPY_WARPS=4` is the
+EP row-copy launch geometry (16 rows per CTA instead of 4, 4 warps instead of
+8): -17% per dispatch/combine copy in the 2-GPU microbench, 578.5 -> 587.5 on
+the 8-node run, bitwise.
 
 ## The collapsed run (519.1, job 1006)
 ```
@@ -29,6 +33,7 @@ RACK=r02 WORKTREE=<this checkout> \
 EXTRA_PYTHONPATH=/mnt/dgxc/pydeps-te:/mnt/dgxc/pydeps-cudnn \
 TORCHTITAN_FP32_MATMUL_PRECISION=tf32 TE_DENSE_RECIPE=delayed TE_REDUCE_AMAX=0 TORCHTITAN_TE_MHC=1 \
 TORCHTITAN_BLOCK_INPUT_OFFLOAD=1 TORCHTITAN_DSA_PERSISTENT_WORKSPACE=0 FSDP_PREFETCH_DEPTH=2 \
+MINIMAL_ASYNC_EP_COPY_BLOCK_M=16 MINIMAL_ASYNC_EP_COPY_WARPS=4 \
 CONFIG=deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_13x STEPS=20 TAG=best \
 /mnt/dgxc/sbatch_rack.sh --parsable --nodes=8 --time=00:50:00 gb300/dsv4_64xgb300.slurm
 ```
