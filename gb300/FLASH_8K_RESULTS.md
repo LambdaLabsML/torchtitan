@@ -3093,3 +3093,13 @@ microbatch optimum likely shifts down in the balanced regime (128 small
 expert groups instead of ~6 huge ones; the offload's cost no longer buys a
 barrier-free step). Queued unprofiled: 7x balanced (no offload) and 10x
 balanced (offload), both with prefetch 2 and no amax all-reduce.
+
+## Balanced regime, 7x without offload = 578.5 TFLOP/s (job 1008)
+
+7x, no offload, `TE_REDUCE_AMAX=0`, prefetch 2, persistent workspace off,
+forced balanced routing, r02: **578.5 at step 20, steps 16-20 within 575.1-578.5**
+(the flat plateau the collapsed regime never shows), 238.5 GiB. +14% over the
+collapsed 7x (940: 506.1) and above the 13x balanced stack (1007: 549.7,
+noisy). In the balanced regime the expert GEMMs run as 128 similar groups
+and the EP barrier is gone, so the larger microbatch no longer buys anything
+the offload has to pay for. 10x balanced (1009) pending to close the curve.
