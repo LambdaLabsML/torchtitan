@@ -28,7 +28,8 @@ login node, 00006/12/14/61/62/66/68/71/72 drained). Session window ends
 | 953 | 128 | reference: bf16 dense, bfx9 matmuls, eager mHC | cancelled (user: optimize first) | | config `..._cudnnidx_12x_c4` exists if wanted later |
 | 954 | 32 | X0 control: 12x + workspace fix, r02 | queued after 952 | | |
 | 955 | 32 | X1: control + `NCCL_PROTO=Simple`, r03 | queued after 952 | | |
-| 956 | 32 | X2: control + HybridEP (`HYBRIDEP=1`, `..._12x_hybridep`), r03 | queued after 952 | | |
+| 956 | 32 | X2: control + HybridEP | crash at init | | NVLink-domain size 4 vs EP=2 |
+| 958 | 32 | X2b: HybridEP, domain size 2 | crash at step 1 | | CheckpointError: routed row count differs on recompute (see D2) |
 | 957 | 32 | X3: control + profiler (`..._12x_profile`), r01 | queued after 952 | | post-fix trace for the next PGO round |
 
 Noise floor: two runs with bitwise-identical numerics (950 vs 951, c4_test)
@@ -125,11 +126,16 @@ to the edge. Analysis scripts: `scratchpad/prof_summary.py`, `straggler.py`,
       so `training.disable_cuda_graphs=False` becomes possible, but every rank
       then all-gathers all 256 experts per layer (12.9 GB/layer; ledger EP=1
       results were a collapse on the old recipe). `_ep1_variant` configs exist.
-- [ ] D2. HybridEP dispatcher (user request): config
-      `..._tedense_12x_hybridep` (commit b066f2c4), launch with `HYBRIDEP=1`
-      (build at `/mnt/dgxc/DeepEP-hybrid`; it forces CUDA graphs). Earlier
-      sweep (jobs 784-795, 1k recipe): 2.9% below MinimalAsyncEP. Retest now
-      that the dispatcher barrier is 12% of the step. In the 7b batch.
+- [x] D2. (blocked) HybridEP dispatcher: two attempts on the 12x recipe.
+      956: `NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN` must equal the EP group
+      (2, launcher default 4). 958: with that fixed, FullAC's recompute fails
+      with `CheckpointError` -- the routed row count differs between forward
+      (362816) and recompute (363112) because the router flips on near-ties,
+      and HybridEP uses the real (unpadded) row count as a tensor shape.
+      MinimalAsyncEP's fixed-capacity slots hide the same flips. Needs the
+      router top-k saved across the recompute (ledger's "structural fix") or
+      selective AC; not a same-day change. Launcher PYTHONPATH fix 937c2062
+      stays.
 - [x] E. (explained) The even/odd barrier asymmetry was item A: odd ranks'
       main streams show 840 ms less kernel time in an identical step, i.e.
       the straggler stall was absorbed as barrier spinning on even ranks and
