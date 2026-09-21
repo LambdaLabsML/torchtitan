@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import glob
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -240,6 +241,21 @@ DATASETS: dict[str, SingleDatasetConfig] = {
             split="train",
             load_dataset_kwargs={
                 "data_files": "tests/assets/c4_test/data.json",
+            },
+        ),
+        processor=TextProcessor.Config(),
+        post_filters=(lambda sample: sample is not None,),
+    ),
+    "c4_local": SingleDatasetConfig(
+        # C4 en train shards staged on the cluster (see /mnt/dgxc/data/fetch_c4.py):
+        # streamed from local files so 128 ranks do not depend on the Hub. With
+        # fewer shards than DP ranks, split_dataset_by_node skips examples; at
+        # 12x/8k a rank reads ~2.7 GB gz per 100 steps, which the NFS sustains.
+        source=HuggingFaceStreamingSource.Config(
+            path="json",
+            split="train",
+            load_dataset_kwargs={
+                "data_files": sorted(glob.glob("/mnt/dgxc/data/c4_local/en/*.json.gz")),
             },
         ),
         processor=TextProcessor.Config(),
