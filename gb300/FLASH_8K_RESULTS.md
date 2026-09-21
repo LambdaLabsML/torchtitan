@@ -3005,3 +3005,22 @@ read off the reported peaks (191 -> 200 -> 215 GiB for 9x/10x/12x) does not
 extrapolate: the reported number is max *allocated*; what overflows at 14x is
 the reserved footprint at the step-1 peak. **12x is the ceiling of this recipe
 and 513.9 (job 942) stands as the best.**
+
+## 13x/14x attempts, a false hang, and 12x on the merged branch (jobs 991-997)
+
+Both offloads together are bitwise on the debugmodel (991). 992 (14x + block-
+input offload + layer-wise moment offload) and 993 (13x) were **cancelled by
+me by mistake**: their logs showed nothing after the first-forward warnings
+while GPUs sat at 100%, which I read as a spin-wait deadlock. It is pipe
+buffering -- 995 (12x) logged step 1 at 4.5 min as usual, but the line only
+became visible at exit. Nothing is known about 13x/14x from those two jobs.
+
+Meanwhile the branch had ~25 commits from the parallel 128-GPU session
+(bounded SwiGLU with 64-bit offsets, default on: +2.6% on r03 at 32 GPUs;
+persistent cuDNN DSA backward workspace, default on: +16 GiB and -1.5% at 32
+GPUs, kept for 128; C4 dataset; 515.0 at 128 GPUs, job 970). Worktree synced.
+**995: 12x + block-input offload + `TE_REDUCE_AMAX=0`, persistent workspace
+off, bounded SwiGLU on, r02 = 509.4 TFLOP/s at step 20, 213.3 GiB** -- vs
+942's 513.9 on the pre-merge code, i.e. the bounded SwiGLU gain did not show
+on r02 (within the ~1% spread). Requeued on the merged code: 996 (13x), 997
+(14x + moment offload, `CUDA_MODULE_LOADING=EAGER`).
