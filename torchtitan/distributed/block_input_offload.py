@@ -110,13 +110,26 @@ class BlockInputOffload(nn.Module):
         self.restore_done = ev
         self.freed = False
 
+    def _drop(self) -> None:
+        """Release this layer's (restored) input for good: called once the layer's
+        backward has run. Without this every restored input stays resident to the
+        end of the backward and the peak is unchanged (job 925 OOM at 9x)."""
+        if self.x is not None:
+            self.x.untyped_storage().resize_(0)
+            self.x = None
+            self.freed = False
+            self.restore_done = None
+
     def _on_output_grad(self, grad):
         main = torch.cuda.current_stream()
+        # grad reaching this block's output means the block above has finished
+        # its backward: its input is no longer needed by anyone.
+        if self.next is not None:
+            self.next._drop()
         if self.freed:  # not prefetched yet: restore now
             self._restore()
         if self.restore_done is not None:
             main.wait_event(self.restore_done)
-        # the last layer's input is never freed (no next block frees it); fine.
         if self.prev is not None and self.prev.freed:
             self.prev._restore()  # one layer ahead
         return grad
