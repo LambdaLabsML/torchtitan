@@ -154,9 +154,18 @@ def offload_step(optim: Optimizer) -> None:
         off = _offloaders[id(optim)] = _Offloader()
     if not off.migrated:
         optim.step()  # first step: fused AdamW creates the (bf16) moments on the GPU
-        n = off.migrate(optim)
+        if os.environ.get("OPT_STATE_OFFLOAD_NO_MIGRATE", "0") == "1":
+            n = 0  # bisect aid: keep moments on the GPU, still use the chunked step (D2D copies)
+        else:
+            n = off.migrate(optim)
         off.migrated = True
-        torch.cuda.empty_cache()
+        if os.environ.get("OPT_STATE_OFFLOAD_NO_EMPTY_CACHE", "0") != "1":
+            torch.cuda.empty_cache()
+        if _DEBUG:
+            torch.cuda.synchronize()
+            badp = [tuple(p.shape) for g in optim.param_groups for p in g["params"] if not torch.isfinite(_local(p)).all()]
+            import logging
+            logging.getLogger(__name__).info("state offload debug: after first step+migrate, non-finite params: %s", badp[:5])
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             import logging
 
