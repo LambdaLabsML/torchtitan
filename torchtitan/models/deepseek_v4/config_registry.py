@@ -1062,3 +1062,36 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_12x_pr
     config.profiler.profiler_warmup = 3
     config.profiler.profiler_active = 2
     return config
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_12x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """Numerics reference for the 12x hero run: same recipe minus the TE fp8
+    dense linears (bf16 Linear). Run with TORCHTITAN_FP32_MATMUL_PRECISION=bfx9
+    and TORCHTITAN_TE_MHC=0 so only the non-numerics knobs (cuDNN DSA and
+    indexer, dense-never, async EP, block-input offload) remain."""
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx(12, seq_len)
+
+
+def _on_c4_local(config: Trainer.Config) -> Trainer.Config:
+    """Train on the locally staged C4 shards instead of the 2000-document
+    c4_test fixture, which a 128-GPU 12x step laps several times over."""
+    config.dataloader.dataset = ConcatThenSplitPackingConfig(dataset=DATASETS["c4_local"])
+    return config
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_12x_c4(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 12x hero recipe on real C4 (loss-curve runs)."""
+    return _on_c4_local(
+        deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_12x(seq_len)
+    )
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_12x_c4(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The bf16-dense numerics reference on real C4 (pair with the hero run)."""
+    return _on_c4_local(deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_12x(seq_len))
