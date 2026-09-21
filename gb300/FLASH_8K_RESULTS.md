@@ -3047,3 +3047,29 @@ at init plus slower steps) and its log flushed only at exit.
 **Standing best: 13x = 517.6 (job 996).** Microbatch curve with the
 block-input offload on the merged code: 12x 509.4, 13x 517.6, 14x (+moments)
 503.8; 14x without the moment offload OOMs (943).
+
+## Where the exposed communication is, and the balanced-routing profile (jobs 938 vs 1001)
+
+Exposed communication in the 7x baseline trace (938), counting the
+symmetric-memory EP kernels that run on the main stream:
+
+| kind | share of step |
+|---|---:|
+| EP barrier spin-wait (peers late) | 8.0% |
+| EP dispatch/combine SM copy kernel (bf16) | 7.4% |
+| FSDP reduce-scatter, exposed | 2.9% |
+| FSDP all-gather, exposed (with 1-deep explicit prefetch) | 2.7% |
+| TE amax all-reduce (since removed) | 4.7% |
+
+**The barrier is routing imbalance, not jitter.** Same config, same env, with
+`debug.moe_force_load_balance` (1001, `..._7x_profile_balanced`): barrier
+1,698 -> 35 ms per two steps, copy kernel unchanged (~1.55 s), and the
+profiled step runs at **579.5 TFLOP/s vs 493.8** (+17%). Our 20-step runs
+sit in the collapsed-routing regime (router sends most tokens to ~6 experts
+from step 2), and that skew is what every rank waits out at each EP barrier.
+Megatron's benchmarks use `--moe-router-force-load-balancing` for this
+reason; ours have been reporting the collapsed-regime number. Both numbers
+are real for their regime; the balanced one is the closer proxy for trained
+routing. Queued: 1006 (13x, `FSDP_PREFETCH_DEPTH=2`, collapsed), 1007 (13x,
+balanced, prefetch 2). Traces: `/mnt/dgxc/profiles/bal_7x_iter10_traces/`,
+analysis `exposed_comm.py` next to `memcpy_stalls.py`.
