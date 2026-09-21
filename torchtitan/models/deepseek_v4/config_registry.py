@@ -904,3 +904,9 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_12x_pr
     config.profiler.profiler_warmup = 3
     config.profiler.profiler_active = 2
     return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_13x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 500 recipe at a 13x microbatch (106496 tokens per rank); needs the block-input offload."""
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(13, seq_len)
