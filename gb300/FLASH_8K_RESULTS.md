@@ -3163,3 +3163,29 @@ also unblock the dual-microbatch overlap that lost 6% to SM contention.
 established on the balanced plateau (1015 vs 1008) and the knobs stay on in
 both headline commands. Headline pair now: **587.5 balanced (7x, 1015) /
 519.1 collapsed (13x + offload, 1006)**.
+
+## Copy engines for EP dispatch: measured, not viable (job 1028, `/mnt/dgxc/bench_ce_copy.py`)
+
+Two GPUs, the remote half of a 7x dispatch leg (172,032 rows x 4096 bf16 =
+1.41 GB per rank, both ranks pushing):
+
+| path | ms | GB/s |
+|---|---:|---:|
+| SM kernel (16,4,2048), gather + remote store in one pass | 2.21 | 639 |
+| copy engine, one contiguous 1.41 GB peer `copy_` (ceiling) | 1.83 | 772 |
+| + the gather into staging it requires | +0.51 | |
+| copy engine, 128 per-expert segments (receiver is expert-major), `copy_` loop | 2.42 | 582 |
+| `cuMemcpyBatchAsync` (128 segments in one call) | driver rejected the call (CUDA_ERROR_INVALID_VALUE) | |
+| local D2D `copy_` of the same bytes | 0.41 | 3415 |
+
+Copy engines reach only ~770 GB/s over this NVLink pair, 20% above the SM
+kernel's stores, and the CE path must first gather the remote rows into a
+contiguous staging buffer (0.51 ms): 2.34 ms sequential vs 2.21 ms for the
+kernel that does both in one pass. The realistic layout (128 segments per
+peer, sizes known only on the device, so a D2H sync plus 128 launches per
+leg) is slower still. The only way a CE path pays is as the enabler of a
+dual-microbatch overlap, which lost 6% here for reasons that include the
+half-size GEMMs and NVLink contention with FSDP gathers, not only SM
+contention. Closed. The SM copy at 16 rows/CTA is within ~20% of what this
+link delivers to any engine; the remaining exposed communication (~6% copy,
+~5% FSDP tails) needs overlap, not a faster copy.
