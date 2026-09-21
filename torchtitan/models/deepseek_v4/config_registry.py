@@ -910,3 +910,34 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_13x(
 ) -> Trainer.Config:
     """The 500 recipe at a 13x microbatch (106496 tokens per rank); needs the block-input offload."""
     return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(13, seq_len)
+
+def _swap_ep_backend(config: Trainer.Config, backend: str) -> int:
+    """Replace every MoE token dispatcher config with the one ``backend`` builds
+    (same num_experts/top_k/hidden_dim), keeping every other mutation the recipe
+    already applied to the model spec. Returns the number swapped."""
+    from torchtitan.models.common.config_utils import make_token_dispatcher_config
+    from torchtitan.models.common.moe import MoE
+
+    n = 0
+    for _, moe_cfg, _, _ in config.model_spec.model.traverse(MoE.Config):
+        td = moe_cfg.routed_experts.token_dispatcher
+        moe_cfg.routed_experts.token_dispatcher = make_token_dispatcher_config(
+            num_experts=td.num_experts,
+            top_k=td.top_k,
+            comm_backend=backend,
+            hidden_dim=td.hidden_dim,
+        )
+        n += 1
+    return n
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_deepep(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 482.8 recipe (7x) with DeepEP v2's ElasticBuffer dispatch in place of
+    MinimalAsyncEP (run with DEEPEP=1 so the launcher sets CUDA_HOME/NVSHMEM/
+    PYTHONPATH). EP=2 is intra-node, so GIN stays disabled. Earlier, at 1k and
+    EP=4, DeepEP measured -6.6% vs MinimalAsyncEP; attention is now far cheaper
+    and the EP dispatch copy + barrier are the largest exposed item, so retest."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x(seq_len)
+    assert _swap_ep_backend(config, "deepep") > 0
+    return config
