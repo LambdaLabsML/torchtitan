@@ -195,9 +195,23 @@ class Indexer(Module):
         rd = self.rope_head_dim
         q = self.wq_b(qr)
         q = q.view(seqlen, self.num_index_heads, self.head_dim)
-        q_nope, q_rope = torch.split(q, [self.head_dim - rd, rd], dim=-1)
-        q_rope = self.rope(q_rope, positions=positions)
-        q = torch.cat([q_nope, q_rope], dim=-1)
+        if q.is_cuda and q.stride(-1) == 1 and rd & (rd - 1) == 0:
+            # The indexer runs on detached inputs with its auxiliary loss
+            # dropped (see Attention.forward), so no autograd is needed here:
+            # rotate the rope tail in place with the fused Triton kernel
+            # instead of split -> complex rope -> cat, which materialised the
+            # [T, H_idx, 128] tensor three times (~250 ms/step in the job 847
+            # profile: aten::cat, copy_, mul on [49152, 64, 64]).
+            from torchtitan.models.deepseek_v4.fused_rope import rotate_tail_
+
+            cache_ri = torch.view_as_real(
+                self.rope._reshape_cache(q[..., -rd:], positions)
+            )
+            q = rotate_tail_(q, cache_ri, rd=rd, inverse=False)
+        else:
+            q_nope, q_rope = torch.split(q, [self.head_dim - rd, rd], dim=-1)
+            q_rope = self.rope(q_rope, positions=positions)
+            q = torch.cat([q_nope, q_rope], dim=-1)
         q = self._rotate_activation(q)
         k = self.compressor(x, positions=positions)
         k = self._rotate_activation(k)
