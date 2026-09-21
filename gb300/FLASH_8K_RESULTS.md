@@ -3124,3 +3124,35 @@ balanced EP now exposes at the FSDP gathers). All runs: `TE_REDUCE_AMAX=0`,
 **Headline pair for this recipe on 32 GB300 at 8k: 578.5 TFLOP/s balanced
 (7x, job 1008) / 519.1 collapsed (13x + offload, job 1006).** Report both
 with the regime named; Megatron's published MoE numbers are the balanced kind.
+
+## EP row-copy geometry: +1.6%, new balanced best 587.5 (job 1015); FP8 dispatch measured and dropped
+
+Two-GPU microbenchmark of MinimalAsyncEP's `_copy_rows_to_peer_ptrs_kernel`
+at the 7x shape (344,064 rows x 4096 bf16 = 2.82 GB per rank per leg, half
+local / half remote, both ranks pushing; `/mnt/dgxc/bench_ep_copy.py`, jobs
+1011/1013, reproducible to 0.01 ms across rounds):
+
+| geometry (rows/CTA, warps, col tile) | mixed | remote-only |
+|---|---:|---:|
+| (4, 8, 2048) production | 2.70 ms | -- |
+| (1, 4, 2048) | 2.65 ms | 5.17 ms (545 GB/s) |
+| **(16, 4, 2048)** | **2.24 ms** | **4.53 ms (622 GB/s)** |
+| (1, 4, 1024) | 2.36 ms | 4.56 ms |
+| (32, 4, 2048), (64, 4, 1024) | 3.1-3.2 ms | 6.2-6.4 ms |
+
+The remote half is the whole cost (local-only 0.79 ms, plain clone 0.82 ms);
+SM-initiated NVLink stores top out near 620 GB/s per direction here. New env
+knobs `MINIMAL_ASYNC_EP_COPY_BLOCK_M/WARPS/BLOCK_N` (defaults = production).
+**8-node A/B, 7x balanced: 587.5 at step 20 (586.2-587.8 plateau) vs 578.5
+(575.1-578.5), +1.6%**, bitwise on the debugmodel (1014). Collapsed 13x A/B
+queued.
+
+**FP8 dispatch (fused per-row e4m3 quantize in the copy + receive-side
+dequant to bf16): 1.60 + 0.60 = 2.20 ms vs 2.65 bf16.** The dequant pass eats
+most of the byte saving because the experts consume the receive buffer as
+bf16 directly (no permute to fuse into), it applies to 2 of the 6 legs
+(forward + recompute dispatch; gradients stay bf16 as in DeepEP/Megatron),
+and it changes numerics: ~0.3% of the step at best. Not built. The lever
+that remains for the copy is moving it off the SMs onto copy engines
+(gather to a contiguous staging buffer, batched peer memcpy), which would
+also unblock the dual-microbatch overlap that lost 6% to SM contention.
