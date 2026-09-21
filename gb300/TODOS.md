@@ -27,10 +27,10 @@ login node, 00006/12/14/61/62/66/68/71/72 drained). Session window ends
 | 952 | 128 | **hero**: 951 recipe, 100 steps, real C4 (`c4_local`) | **504.2 mean steps 11-100** (min 495.6, max 506.3) | 226.5 GiB | exit 0, 36 min wall; loss 11.99 -> 2.745, grad_norm 12.9 -> 0.13; curve `gb300/hero_128_12x_c4.png` |
 | 953 | 128 | reference: bf16 dense, bfx9 matmuls, eager mHC | cancelled (user: optimize first) | | config `..._cudnnidx_12x_c4` exists if wanted later |
 | 954 | 32 | X0 control: 12x + workspace fix, r02 | queued after 952 | | |
-| 955 | 32 | X1: control + `NCCL_PROTO=Simple`, r03 | queued after 952 | | |
+| 955 | 32 | X1: control + `NCCL_PROTO=Simple`, r03 | 496.4 (494.3 @ step 20) | 225.4 GiB | vs control 954: see below |
 | 956 | 32 | X2: control + HybridEP | crash at init | | NVLink-domain size 4 vs EP=2 |
 | 958 | 32 | X2b: HybridEP, domain size 2 | crash at step 1 | | CheckpointError: routed row count differs on recompute (see D2) |
-| 957 | 32 | X3: control + profiler (`..._12x_profile`), r01 | queued after 952 | | post-fix trace for the next PGO round |
+| 957 | 32 | X3: control + profiler (`..._12x_profile`), r01 | 502-506 on non-dump steps | 226.0 GiB | post-fix traces overwrite `outputs/profiling/traces/iteration_10` (946's are gone; findings recorded here) |
 
 Noise floor: two runs with bitwise-identical numerics (950 vs 951, c4_test)
 differ in per-step loss by 0.2 on average after step 10 (max 1.1 early);
