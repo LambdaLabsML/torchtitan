@@ -123,4 +123,9 @@ def parallelize_deepseekv3(
         from torchtitan.distributed.fp8_allgather import debug_log_fsdp_expert_storage
 
         debug_log_fsdp_expert_storage(model)
+    from torchtitan.distributed import block_input_offload
+
+    if block_input_offload.ENABLED:
+        n = block_input_offload.apply_block_input_offload(model)
+        logger.info("block-input offload: wrapped %d decoder blocks", n)
     return model
