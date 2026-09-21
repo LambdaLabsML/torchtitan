@@ -2557,3 +2557,27 @@ MinimalAsyncEP section, not implemented. Neither is clearly net positive over
 7x. **Best is now 482.8 at 7x** (config
 ``deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x``,
 branch ``dsv4_eager_fusions``).
+
+## DeepEP retest on the 7x recipe, and a FullAC + delayed-scaling caveat (job 857)
+
+DeepEP v2.1.0 was already built (``/mnt/dgxc/DeepEP``, 09-14, after the
+``mlx5dv.h`` header fix) and had been measured at 1k/EP=4 (job 449: -6.6% vs
+MinimalAsyncEP). Retesting at 8k/7x because attention is now cheap and the EP
+dispatch copy + barrier are the largest exposed item. Config
+``..._tedense_7x_deepep`` (``_swap_ep_backend`` keeps every other recipe
+mutation), launcher ``DEEPEP=1`` (its PYTHONPATH line now keeps pydeps and
+``EXTRA_PYTHONPATH``).
+
+**Job 857 (DeepEP + TE delayed scaling) crashed in the first backward:**
+``CheckpointError: recomputed values ... different metadata`` -- the recomputed
+dispatch received 348,654 routed rows vs 347,986 in the forward. Cause: TE's
+``DelayedScaling`` advances its amax history between the forward and the
+FullAC recompute (torch's checkpoint does not enter TE's recompute phase, so
+the saved fp8 scales are not restored); the recompute quantizes the dense
+projections with newer scales, a few tokens change their top-k experts, and
+DeepEP's variable-size outputs expose the mismatch. **MinimalAsyncEP's
+fixed-capacity buffers mask exactly the same drift**, so every delayed-scaling
+run in this ledger (840-853) recomputed a slightly different routing than its
+forward -- a small, silent numerics wobble, not a crash. The stateless MXFP8
+recipe recomputes bit-identically. Retest pair queued under MXFP8: 860 (DeepEP)
+vs 861 (MinimalAsyncEP), both 7x on r02.
