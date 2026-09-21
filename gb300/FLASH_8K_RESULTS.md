@@ -2884,3 +2884,30 @@ illegal memory access at 73,728); casting the row index to int64 fixes it
 (probe 924: exact at both). Bisect runs 918/921/922 and the wq_b exclusion
 were red herrings, as this explains. Block-input-offload runs relaunched with
 the fix: 925 (9x), 926 (10x), 927 (12x).
+
+## Block-input offload: two defects found at 9x, then 434.7 TFLOP/s at 191 GiB (job 929)
+
+**925 (9x) still OOM-crawled with the offload on.** The wrapper restored each
+block input one layer ahead in the backward but never released it again, so
+by the end of the backward all 43 inputs were resident: the step's peak
+(late backward, where the FullAC recompute of the deepest blocks meets the
+full grad set) was unchanged. Fix: when the gradient reaches block i's output
+the block above has finished its backward, so its restored input is dropped
+there (``_drop``). Debugmodel stays bitwise (928). 926/927 cancelled.
+
+**929 (9x, fixed release): 434.7 TFLOP/s at 191.2 GiB**, loss trajectory
+identical in shape to the 7x best (both spike at step 4), no OOM retries.
+Peak is 47 GiB under the 7x recipe without offload (238.5), so 10x and 12x
+fit -- but 434.7 is -13% vs 500.3, and the step time says why: 15.1 s per
+step at 9x vs 10.2 s at 7x is ~2.0 s more than a proportional scale-up
+(13.1 s), and 43 blocks x 2.4 GB per direction at the ~89 GB/s pinned copy
+rate is ~2.3 s. The copies were almost fully exposed. Cause, in my code: the
+D2H copy was enqueued *after* the block forward behind an event on the main
+stream, so it could only start when that forward had drained, and the very
+next op on the main stream (the next block's release) waited for it -- the
+transfer sat between two blocks instead of under one. Moved to block entry
+(x is complete there), so it overlaps the block's own forward; the release
+at the next block then finds it done. Debugmodel bitwise again (932).
+Relaunched on r02 with a 7x control for the offload's equal-shape cost:
+933 (9x), 934 (7x), 935 (10x), 936 (12x); 930 is the 10x on the old copy
+placement, kept for the memory reading.
