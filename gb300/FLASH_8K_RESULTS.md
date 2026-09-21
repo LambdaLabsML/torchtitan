@@ -3260,3 +3260,13 @@ where it was -0.6% in the collapsed regime (8x, 908 vs 880-era): the side
 stream's moment traffic used to hide inside the 8% barrier idle time, and
 there is no idle time to hide in now. 1041 (8x, layer-wise, fixed) pending
 to close the curve; it cannot beat 7x from a -4% start.
+
+**1041, 8x balanced + layer-wise moment offload (fixed): 583.0 at step 20
+(583.0-587.9), loss 3.32 (sane), 224.9 GiB.** A tie with 7x without offload
+(587.5) within the spread, slightly below. The extra sequence buys ~+3.5%
+over what 6x+layer-wise did (551.3), and the offload gives almost all of it
+back. **Verdict on "use the memory": at 8k on 32 GB300s the 7x fill point is
+the optimum for this recipe; every way of fitting more (block-input offload,
+plain or layer-wise moment offload) costs at least what the extra sequence
+returns under balanced routing. The headroom you see at 6x is one sequence
+short of full, not spare capacity.** Balanced best stays 587.5 (job 1015).
