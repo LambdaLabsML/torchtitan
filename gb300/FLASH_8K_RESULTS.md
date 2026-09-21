@@ -2957,3 +2957,20 @@ the reduction (940), and 10x/12x with the block-input offload as well
 free, and 10x fits at 200 GiB. Traces archived at
 `/mnt/dgxc/profiles/{bio,base}_7x_iter10_traces/`; stall analysis
 `memcpy_stalls.py` alongside.
+
+## New best: `TE_REDUCE_AMAX=0` on the 7x recipe = 506.1 TFLOP/s (job 940)
+
+Same config as 880 plus `TE_REDUCE_AMAX=0`, rack r02: **506.1 TFLOP/s at
+step 20 (505-506 steady over steps 16-20), 238.5 GiB**, +1.2% over 500.3.
+Step-20 loss 3.166 vs 3.057 -- within the run-to-run spread already seen
+between numerically identical runs (934: 2.94, 935: 3.05, 929: 3.11).
+
+Only a quarter of the 0.45 s/step the all-reduces occupied came back. The
+rest was rank skew: a latency-bound collective on the compute stream runs at
+the pace of the slowest rank, so its 0.87 ms/call was mostly waiting, and
+with the all-reduces gone the same wait moves to the next collective (the
+FSDP all-gathers and EP barriers). The skew itself is the EP-rank token
+imbalance of the collapsed-routing regime these 20-step runs sit in. 941
+(10x + block-input offload) and 942 (12x) with the knob are queued; if the
+offload's 5% was the same skew through the all-reduce, it will not vanish
+either.
