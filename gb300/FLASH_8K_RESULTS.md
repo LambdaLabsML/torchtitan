@@ -3217,3 +3217,19 @@ recompute is selective rather than FullAC, and CUDA graphs remove the launch
 cost of the finer schedule; none of those three transfer to this stack.
 Closed. The overlap route to the remaining ~6% copy / ~5% FSDP tails is not
 available with MinimalAsyncEP + FullAC; the balanced best stays at 587.5.
+
+## Using the memory: the 7x fill point, and 8x under balance (jobs 1032, 1035)
+
+6x balanced reports 217 GiB and 7x 238.5 GiB, ~21 GiB per sequence; the
+device is 276.5 GiB and ~23 GB of it is the MinimalAsyncEP receive pool
+(plus NCCL/cuDNN) outside the allocator, so **7x is the fill point** and
+8x without offload OOMs (854). Options to convert headroom into speed:
+skipping recompute needs 97 GB per layer at 7x (out), keeping expert weights
+resident fits ~3 layers at 6x and none at 7x (<0.5%, not built).
+
+**8x balanced + block-input offload (1035): 566.0 at step 20 (560.7-566.0),
+177 GiB** -- below 7x without offload (587.5) and even 10x with it (572.3).
+Under balanced routing every block-input-offload point sits at or under 575:
+the offload's stream traffic costs more than an extra sequence returns once
+the EP barrier is gone. Queued: 8x balanced with the layer-wise Adam-moment
+offload instead (33 GiB freed, ~0.6% cost at 8x collapsed), no block offload.
