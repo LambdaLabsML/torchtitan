@@ -18,7 +18,8 @@ or wait for the `###### END` marker in the `.out`.
 | 947 | 64 | r03, 16 nodes, FSDP over 64 | 485.2 | 177 GiB | -3.6% vs 32; 30 GiB freed by wider sharding |
 | 948 | 96 | 8+8+8, FSDP over 96 | crash | | shared-expert fused w13 init: 2048 pairs not divisible by 96 |
 | 949 | 96 | 8+8+8, HSDP shard=32 replicate=3 | 502.5 (501.9 @ step 20) | 207.6 GiB | HSDP holds the 32-GPU number across 3 racks |
-| 950 | 128 | 16 (r03) + 8 + 8, HSDP shard=32 replicate=4 | running | | |
+| 950 | 128 | 16 (r03) + 8 + 8, HSDP shard=32 replicate=4 | 499.2 (505.8 @ step 20) | 207.2 GiB | |
+| 951 | 128 | same + persistent DSA workspace (commit 7fc610c5) | 509.0 (502.6 @ step 20) | 223.8 GiB | +2.0%, step spread 499-514 (950: 444-513) |
 
 ## Scale-out queue
 
@@ -27,7 +28,7 @@ or wait for the `###### END` marker in the `.out`.
 - [x] 3. analyze the profile (findings below)
 - [x] 4. 64 GPUs, one rack (job 947)
 - [x] 5. 96 GPUs, 8 nodes per rack, HSDP (job 949): 502.5
-- [ ] 6. 128 GPUs: 16 on r03 + 8 on r01 + 8 on r02, HSDP shard=32 replicate=4 (job 950)
+- [x] 6. 128 GPUs: 16 on r03 + 8 on r01 + 8 on r02, HSDP shard=32 replicate=4 (job 950): 499.2
       (two shard groups on r03). Slurm orders ranks by hostname and the shard
       axis is the inner mesh axis, so pick exactly 8 or 16 nodes per rack.
 - [ ] 7. optimize the best of 4/5/6 (profile + PGO, list below)
@@ -56,7 +57,7 @@ Every NCCL kernel in the trace is `RING_LL`.
 
 ## Optimization candidates, in order
 
-- [ ] A. **The 850 ms stall at the forward->backward transition** (4.6% of
+- [x] A. (fixed, commit 7fc610c5, +2.0% at 128 GPUs, job 951 vs 950) **The 850 ms stall at the forward->backward transition** (4.6% of
       the step). On every odd rank the compute stream idles ~875 ms waiting
       for a 1.04 s all-gather that runs alongside a 0.96 s reduce-scatter;
       steady-state per-layer all-gathers take ~60 ms. The even rank then waits
