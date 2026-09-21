@@ -25,6 +25,8 @@ fusion this replaces (`_swiglu` in activation.py).
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -78,6 +80,11 @@ def _swiglu_bwd_kernel(
 
 _BLOCK_R = 8
 _BLOCK_F = 1024
+# TORCHTITAN_SWIGLU_BOUNDED=zero allocates the outputs zeroed (a memset per
+# tensor) so rows past the count are 0 rather than uninitialised. Job 963
+# (skip mode, uninitialised tail) went non-finite at step 4.
+_ZERO_TAIL = os.environ.get("TORCHTITAN_SWIGLU_BOUNDED", "1") == "zero"
+_alloc = torch.zeros_like if _ZERO_TAIL else torch.empty_like
 
 
 def _check(gate: torch.Tensor, up: torch.Tensor, num_valid_rows: torch.Tensor) -> None:
@@ -93,7 +100,7 @@ class _SwiGLUBounded(torch.autograd.Function):
         gate = gate.contiguous()
         up = up.contiguous()
         rows, cols = gate.shape
-        h = torch.empty_like(gate)
+        h = _alloc(gate)
         grid = (triton.cdiv(rows, _BLOCK_R), triton.cdiv(cols, _BLOCK_F))
         _swiglu_fwd_kernel[grid](
             gate, up, h, num_valid_rows, cols, gate.stride(0),
@@ -107,8 +114,8 @@ class _SwiGLUBounded(torch.autograd.Function):
         gate, up, num_valid_rows = ctx.saved_tensors
         dh = dh.contiguous()
         rows, cols = gate.shape
-        dgate = torch.empty_like(gate)
-        dup = torch.empty_like(up)
+        dgate = _alloc(gate)
+        dup = _alloc(up)
         grid = (triton.cdiv(rows, _BLOCK_R), triton.cdiv(cols, _BLOCK_F))
         _swiglu_bwd_kernel[grid](
             dh, gate, up, dgate, dup, num_valid_rows, cols, gate.stride(0),

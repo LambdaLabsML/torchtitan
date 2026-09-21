@@ -108,7 +108,7 @@ class SqrtSoftplus(UnaryActivationFn):
         return F.softplus(x).sqrt()
 
 
-_SWIGLU_BOUNDED = os.environ.get("TORCHTITAN_SWIGLU_BOUNDED", "1") == "1"
+_SWIGLU_BOUNDED = os.environ.get("TORCHTITAN_SWIGLU_BOUNDED", "1") in ("1", "zero")
 
 
 @leaf_compile(group="moe", dynamic=True)
