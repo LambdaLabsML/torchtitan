@@ -9,8 +9,8 @@ device-side splits measured 1.12x torch's bf16 ``_grouped_mm`` balanced and
 Constraints handled here:
 * the fused path takes at most 64 groups per kernel -> chunks of 64 experts,
   one host sync per chunk boundary for the row cut;
-* MXFP8 needs every group's row count to be a multiple of 32 -> routed rows are
-  padded once per layer (index_copy into a zeroed buffer), the whole w1/w3/w2
+* TE grouped quantize needs every group's row count to be a multiple of 128 -> routed rows are
+  padded once per layer to 128-row groups (index_copy into a zeroed buffer), the whole w1/w3/w2
   chain runs in the padded layout, and the output is un-padded once;
 * weight quantization (~4 ms per layer-call) is cached per step, keyed on the
   unsharded weight's ``data_ptr``/``_version``, so the FullAC recompute and
@@ -121,7 +121,8 @@ def te_grouped_mm(x, w, splits, cache=None, chunk=64):
 
 def pad_plan(splits):
     """Rows per expert -> (padded splits % 32, destination row of every source row, padded row count)."""
-    padded = (splits + 31) // 32 * 32
+    # TE's grouped quantize needs EVERY group's rows % 128 == 0 (probe 867), not just 32.
+    padded = (splits + 127) // 128 * 128
     # TE grouped tensors also need the TOTAL row count % 128 == 0: grow the last
     # group's zero padding (its extra rows carry zero dy, so wgrad is unaffected).
     padded[-1] += (-padded.sum()) % 128
