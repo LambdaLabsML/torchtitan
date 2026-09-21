@@ -3024,3 +3024,12 @@ off, bounded SwiGLU on, r02 = 509.4 TFLOP/s at step 20, 213.3 GiB** -- vs
 942's 513.9 on the pre-merge code, i.e. the bounded SwiGLU gain did not show
 on r02 (within the ~1% spread). Requeued on the merged code: 996 (13x), 997
 (14x + moment offload, `CUDA_MODULE_LOADING=EAGER`).
+
+## New best: 13x + block-input offload + `TE_REDUCE_AMAX=0` = 517.6 TFLOP/s (job 996)
+
+Merged branch (bounded SwiGLU on, persistent DSA workspace off), rack r02:
+**517.6 TFLOP/s at step 20 (514.8-517.6 over steps 17-20), 224.6 GiB**,
++1.6% over 12x on the same code and day (995: 509.4) and +0.7% over the
+pre-merge 12x (942: 513.9). 13x fits with 52 GiB of allocator headroom but
+the device is near full once the ~60 GiB outside the allocator is counted,
+which is why 14x needs the moment offload (997, running).
