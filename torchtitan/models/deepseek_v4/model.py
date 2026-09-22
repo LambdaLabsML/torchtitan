@@ -89,11 +89,19 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
                 x, input_ids_T, attention_masks, positions, padding_mask
             )
         residual = x
-        x, post, comb = self.hc_attn_pre(x)
+        pre = self.hc_attn_pre(x)
+        if len(pre) == 4:  # TORCHTITAN_MHC_GRAD_CHAIN: use the pass-through view as the residual
+            x, post, comb, residual = pre
+        else:
+            x, post, comb = pre
         x = self.attention(self.attention_norm(x), attention_masks, positions)
         x = self.hc_post(x, residual, post, comb)
         residual = x
-        x, post, comb = self.hc_ffn_pre(x)
+        pre = self.hc_ffn_pre(x)
+        if len(pre) == 4:
+            x, post, comb, residual = pre
+        else:
+            x, post, comb = pre
         if self.moe_enabled:
             assert self.moe is not None
             ffn_input = self.ffn_norm(x)
