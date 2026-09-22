@@ -1,4 +1,4 @@
-# DeepSeek-V4-flash, 8k seq, 32x GB300: 743.8 TFLOP/s balanced routing (job 1112) / 519.1 collapsed (job 1006)
+# DeepSeek-V4-flash, 8k seq, 32x GB300: 747.1 TFLOP/s balanced routing (job 1120) / 519.1 collapsed (job 1006)
 
 Branch `dsv4_te_mhc` = the full stack. Everything below default-off is a knob.
 
@@ -11,7 +11,7 @@ vanishes and the same kernels run +14% faster. Balanced is the proxy for
 trained routing; collapsed is what step 20 from scratch really does. Name the
 regime with every number.
 
-## The balanced run (743.8, job 1112)
+## The balanced run (747.1, job 1120; plateau 747-753)
 ```
 RACK=r02 WORKTREE=<this checkout> \
 EXTRA_PYTHONPATH=/mnt/dgxc/pydeps-te:/mnt/dgxc/pydeps-cudnn \
@@ -19,16 +19,18 @@ TORCHTITAN_FP32_MATMUL_PRECISION=tf32 TE_DENSE_RECIPE=delayed TE_REDUCE_AMAX=0 T
 TORCHTITAN_DSA_PERSISTENT_WORKSPACE=0 FSDP_PREFETCH_DEPTH=2 \
 MINIMAL_ASYNC_EP_COPY_BLOCK_M=16 MINIMAL_ASYNC_EP_COPY_WARPS=4 \
 MINIMAL_ASYNC_EP_POOL_FACTOR=1.25 MOE_PACKED_EXPERT_WEIGHTS=1 FSDP_DIRECT_GATHER=1 TE_MHC_BF16_GRAD_PHI=1 \
-TORCHTITAN_DSA_DETERMINISTIC=0 FSDP_DIRECT_REDUCE_SCATTER=1 CUBLAS_NEW=1 MINIMAL_ASYNC_EP_COPY_TMA=1 \
+TORCHTITAN_DSA_DETERMINISTIC=0 FSDP_DIRECT_REDUCE_SCATTER=1 CUBLAS_NEW=1 MINIMAL_ASYNC_EP_COPY_TMA=1 COMPRESSOR_BF16_GEMM=1 \
 CONFIG=deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_9x_balanced STEPS=20 TAG=best_balanced \
 /mnt/dgxc/sbatch_rack.sh --parsable --nodes=8 --time=00:50:00 gb300/dsv4_64xgb300.slurm
 ```
-9 sequences per rank with no offload (243.2 GiB). `FSDP_DIRECT_REDUCE_SCATTER=1`
+9 sequences per rank with no offload (237.2 GiB). `FSDP_DIRECT_REDUCE_SCATTER=1`
 feeds the packed expert gradient's own flat view to the reduce-scatter instead
 of a staged `chunk_cat` copy (723.6 -> 733.1). `CUBLAS_NEW=1` preloads cuBLAS
 13.8 (`/mnt/dgxc/cublas-new/nvidia/cu13/lib`) for the dense GEMMs (733.1 -> 738.3). `MINIMAL_ASYNC_EP_COPY_TMA=1` moves the
 EP dispatch/combine row copy to TMA bulk stores (738.3 -> 743.8; EP=2, bf16,
-columns % 256 only). Needs branch commit
+columns % 256 only). `COMPRESSOR_BF16_GEMM=1` runs the compressor's wkv/wgate
+as bf16-in/fp32-out GEMMs instead of an fp32 autocast that cast x and the
+weights up on every call (+0.9%, -6 GiB; combined with TMA: 747.1). Needs branch commit
 `b8672e291` or later: the direct gather's first version waited on the compute
 stream and serialized every prefetched expert gather (685.7 -> 723.6 fixed). The last three knobs are the
 2026-09-22 additions: `MINIMAL_ASYNC_EP_POOL_FACTOR=1.25` bounds MinimalAsyncEP's
