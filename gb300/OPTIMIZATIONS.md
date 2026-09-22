@@ -1,0 +1,163 @@
+# DeepSeek-V4-flash on 32x GB300: every optimization, labeled for PR splitting
+
+Branch `dsv4_te_mhc` (LambdaLabsML/torchtitan), 147 commits over upstream base
+`6857b67b6` ("DSv4 Flash: Batched DSA Patched via Claude (#22)"). Numbers are
+TFLOP/s per GPU, 8 nodes x 4 GB300 in one NVL72 rack, seq 8192, 20-step runs;
+the regime (collapsed = raw router from random init, balanced = forced load
+balancing, Megatron's `--moe-router-force-load-balancing`) is stated on every
+number because they differ by ~14% on the same code (job 940 vs 1008). Full
+evidence: `gb300/FLASH_8K_RESULTS.md` on branch `dsv4_flash_64xgb300`.
+Exact reproduction command: `gb300/REPRODUCE_500.md`.
+
+Status legend: **ON** = in the 685.7 recipe; **OFF** = merged, default off,
+measured neutral/negative or regime-specific; **CLOSED** = measured negative,
+code kept only where it documents the measurement; **FIX** = correctness.
+
+Two sessions worked this branch. Units 20-23 are the second session's (commits
+authored `clowman`, 2026-09-21) and are labeled as such; everything else is
+from this campaign.
+
+---
+
+## Part A -- units in the 685.7 TFLOP/s recipe (in stacking order)
+
+### 1. Full-bf16 training recipe + GB300 launcher  **ON**
+- Commits: `61c080063`, `a9eeca59a`, `81df0e70e`, `1737fcfa4`, `fcc371a4b`, `937de5bf4`, `2cbe50db2`
+- Files: `torchtitan/models/deepseek_v4/config_registry.py` (gb300 configs), `gb300/dsv4_64xgb300.slurm`, `/mnt/dgxc/sbatch_rack.sh` (cluster-side)
+- What: bf16 params/grads/optimizer states (the lever that makes 8k fit; fp32 default costs ~80 GiB/rank), fused bf16 Adam, the Slurm launcher (CPATH for header-less nodes, `CUBLAS_NEW=1` cuBLAS 13.8 preload, `DEEPEP`/`HYBRIDEP` PYTHONPATH handling, single-rack submission).
+- Effect: enabling. Numerics: bf16 optimizer states (deliberate recipe choice).
+- PR: config + launcher; no library code.
+
+### 2. cuDNN fused DSA sparse-attention backward and forward  **ON**
+- Commits: `6eacaec50`, `4c92a64e5`, `df7daf6e0`, `d7340953a`, `ca4f61ea2`, `42319144a`, `c537579c7`, `738f6cf16`, `49f4122dd`, `d52d4157e`, `ec91517d6`
+- Files: `torchtitan/models/deepseek_v4/cudnn_dsa.py` (new), `attention.py`, `compressor.py` (stable-sort deterministic selection), tests
+- Knob: config `cudnn_dsa` (flag on the attention config)
+- Effect: 170 -> 368 (collapsed, early recipe); the largest single step of the campaign. Requires cuDNN frontend 1.29 with the DSA wrappers in `/mnt/dgxc/pydeps-cudnn` (external).
+- Numerics: bitwise-checked against the eager path in the A/B test.
+
+### 3. `TORCHTITAN_FP32_MATMUL_PRECISION` (TF32 for the fp32 matmuls)  **ON**
+- Commit: `09fad6a97`. File: `torchtitan/models/deepseek_v4/config_registry.py` / model glue.
+- Knob: `TORCHTITAN_FP32_MATMUL_PRECISION=tf32` (default `bfx9`).
+- Effect: part of the 500 recipe (router/mHC fp32 matmuls). Numerics: TF32 in fp32 matmuls.
+
+### 4. Fused output inverse RoPE in the DSA Function  **ON**
+- Commit: `9a0a58d4f` (+ `754bdca2f` FIX). Files: `torchtitan/models/deepseek_v4/fused_rope.py` (Triton), `cudnn_dsa.py`
+- Effect: ~+3%. FIX `754bdca2f`: int64 row offsets -- the int32 index overflowed past 65,536 rows of [T,64,512], which is exactly the 9x microbatch (step-1 NaN, probes 923/924).
+
+### 5. FSDP `dense-never` reshard policy  **ON**
+- Commits: `7c0f1e79e`, `1b0e35498`. File: `torchtitan/distributed/fsdp.py`
+- Knob: `FSDP_POLICY=dense-never` (dense params stay unsharded between forward and backward; experts still reshard).
+- Effect: positive in the 400-450 era (ledger); 13.6 GiB of dense params resident.
+
+### 6. MinimalAsyncEP receive pool: 4 slots  **FIX / ON**
+- Commit: `cb2205745`. File: `torchtitan/distributed/minimal_async_ep/api.py`
+- Knob: `MINIMAL_ASYNC_EP_SLOTS` (default 4). Experts save a raw alias of the receive slot; with 2 slots the backward comm ops rewrote it before the wgrad GEMM read it (0.12-0.13% gradient error, jobs 754/768). 8 for the dual-microbatch schedule.
+
+### 7. cuDNN fused indexer top-k  **ON**
+- Commits: `942577746`, `d3585c435`, `aa46bd50c`. File: `torchtitan/models/deepseek_v4/cudnn_indexer.py` (new)
+- Knob: config `cudnn_indexer`. Effect: 401 -> 441 (+10%), -11 GiB (collapsed). Local (per-sequence) ids, -1 pads, 32/64 heads only (eager fallback otherwise).
+
+### 8. Transformer Engine fp8 dense linears (`TELinear`)  **ON**
+- Commits: `864e56fbe`, `460a9d861`, `f07adb168` (+ superseded torchao/custom fp8: `b54d2ca98`, `d2ed70184`, `0c37e573a`, `cd3496b4c`, `5338ddf21`, `116cb32ba`, `50bf0d07e`, `5df0f8c32`, `33fe4297f`)
+- Files: `torchtitan/quantization/te_linear.py` (new), `config_registry.py` (`_apply_te_dense`), `torchtitan/quantization/*` (custom tensorwise fp8, kept as the torchao-free fallback)
+- Knobs: `TE_DENSE=1`, `TE_DENSE_RECIPE=delayed|mxfp8|current|nvfp4`, `TE_DENSE_EXCLUDE`; `FP8_DENSE*` for the non-TE path.
+- Effect: 450.8 (custom fp8) -> 457.6 (TE delayed scaling), 449 for MXFP8/NVFP4. Pattern: keep torchtitan's parameter, hold an unregistered `te.Linear`, re-point its weight each forward (FSDP2-compatible). External: TE 2.19 in `/mnt/dgxc/pydeps-te`.
+- Numerics: fp8 dense GEMMs (delayed scaling); caveat: FullAC recompute uses newer amax history than the forward (routing can flip on near-ties; MinimalAsyncEP's fixed buffers tolerate it, DeepEP's did not).
+
+### 9. `TE_REDUCE_AMAX=0`  **ON**
+- Commit: `3624a0dc0`. File: `te_linear.py`
+- What: TE reduces fp8 amaxes with a synchronous all-reduce at every outermost autocast exit -- one per TELinear per pass, 520 tiny fp32 all-reduces per step, 4.4% exposed. FSDP gathers identical weights on every rank, so the reduction is unnecessary.
+- Effect: 500.3 -> 506.1 (collapsed). Only +1.2% of the 4.4%: the rest was rank skew the barrier had been absorbing. Numerics: per-rank fp8 scales.
+
+### 10. Eager-site fusions: copy-free grouped low-rank projection, in-place indexer RoPE  **ON**
+- Commits: `88ff93074`, `674a1b93d`. Files: `attention.py` (`_GroupedLowRankProj` strided bmm), `compressor.py`
+- Effect: 457.6 -> 471.0. Numerics: bitwise.
+
+### 11. TE fused mHC kernels  **ON**
+- Commit: `c3d0a85aa`. Files: `torchtitan/models/deepseek_v4/mhc.py`, `model.py` (residual stream kept as [T, D, n])
+- Knob: `TORCHTITAN_TE_MHC=1`. Effect: 482.8 -> 500.3. Also fixes upstream torchtitan's HcPost, whose comb term equals the residual (does not mix). MTP unsupported on this path.
+- External patch (NOT in git): `/mnt/dgxc/pydeps-te/transformer_engine/pytorch/triton/mhc.py`, `mHCProjectionOp.backward`: `TE_MHC_BF16_GRAD_PHI=1` casts the [M,32] grad down to bf16 instead of the [T, n*C] activation up to fp32 (fp32 accumulation kept). 607.2 -> 614.2 (balanced). Re-apply after any TE reinstall; a PR against TE is the right home.
+
+### 12. Microbatch variants and balanced-routing variants  **ON (9x balanced)**
+- Commits: `8c168fe60`, `d3e87c3fb`, `7f4ddc202`, `e99ec2c3a`, `664ae74dd`, `401e75b58`, `88ff72894`, `c477ba5fe`, `4f7189a15` (profile), `10994d078`, `daf630cd4`, `f30d6d05c`, `73084a41b` (EP variants)
+- File: `config_registry.py`. Knob: config name (`_7x` ... `_16x`, `_Nx_balanced`, `_ep8/_ep32`, `_profile`). `config.debug.moe_force_load_balance` for the balanced regime.
+- Effect: 7x is the fill point without offload (587.5 balanced); 9x with units 15-19 (685.7).
+
+### 13. `FSDP_PREFETCH_DEPTH`  **ON (=2)**
+- Commit: `4f7189a15`. File: `torchtitan/distributed/fsdp.py`
+- Effect: 517.6 -> 519.1 (collapsed 13x), neutral within spread, +0.8 GiB. Kept on. Interaction: see unit 17 FIX.
+
+### 14. MinimalAsyncEP row-copy launch geometry  **ON**
+- Commit: `882bb741e`. Files: `minimal_async_ep/api.py`, `kernels.py`
+- Knobs: `MINIMAL_ASYNC_EP_COPY_BLOCK_M=16 MINIMAL_ASYNC_EP_COPY_WARPS=4` (`_BLOCK_N` 2048). Microbench: 2.70 -> 2.24 ms per dispatch leg (`/mnt/dgxc/bench_ep_copy.py`).
+- Effect: 578.5 -> 587.5 (balanced 7x). Numerics: bitwise.
+
+### 15. `MINIMAL_ASYNC_EP_POOL_FACTOR`  **ON (=1.25, balanced only)**
+- Commits: `73084a41b`, `987fa5996`. Files: `minimal_async_ep/api.py`, `torchtitan/models/common/token_dispatcher.py`
+- What: bounds the receive pool and the capacity-padded routed activation at factor x the expected receive instead of ep_size x. Required for EP>2 (90 GB/slot at EP=32 otherwise). Overflow trips a device-side assert.
+- Effect: 587.5 -> 589.1, -3.6 GiB (balanced). **Balanced-regime knob**: collapsed routing overflows it. The 3 hash-routed layers are not forced-balanced (25% headroom).
+
+### 16. Packed expert weights + FSDP2 direct all-gather  **ON**
+- Commits: `2e1331d0f`, `56cbfc6b7`, `1f2dd2e05`, `222d24885`, `4902b9c54`
+- Files: `torchtitan/distributed/fsdp_direct_gather.py` (new; patches `_fsdp_collectives.foreach_all_gather` / `foreach_all_gather_copy_out`), `torchtitan/models/common/moe.py` (GroupedExperts packed layout), `torchtitan/models/deepseek_v4/sharding.py`, `torchtitan/models/deepseek_v3/parallelize.py` (import hook)
+- Knobs: `MOE_PACKED_EXPERT_WEIGHTS=1 FSDP_DIRECT_GATHER=1`
+- What: FSDP2 copies every all-gather out of a staging buffer on the compute stream (1.85% of the step for expert weights, ~17 GiB in-flight staging). A one-parameter group sharded on dim 0 gathers straight into its unsharded storage. Experts packed as [3E, F*D] dim-0 chunks (NOT [E,3,N]: batch-strided GEMM weight + three zero-filled select_backward passes = -9%, job 1080).
+- Effect: 589.1 -> 591.9 at 7x, -17 GiB; the memory fit 8x without offload: 607.2 (balanced). Numerics: init is no longer bitwise with the 3-parameter layout (DTensor random init keyed to the global shape; each region keeps its std); state-dict key changes (`w_3EN`).
+- PR notes: the FSDP patch is generic torch-internals monkeypatching; upstream FSDP2 could take the single-param fast path natively. Checkpoint adapters for the packed key are not written.
+
+### 17. Optimizer-state offload (chunked Adam moments, plain and layer-wise)  **OFF**
+- Commits: `78f8a5794`, `b2bf7c07b`, `095ecf8a9`, `00a248724`, `83e17b9b6`, `95e826040`, `c904332aa`, `a74bcd0f7`, `afce197bc`, FIX `70476fdc9`
+- Files: `torchtitan/components/optimizer/state_offload.py` (new), `optimizer.py`
+- Knobs: `OPT_STATE_OFFLOAD=1`, `OPT_STATE_OFFLOAD_LAYERWISE=1`, `_AHEAD`, `_CHUNK_GIB`, `_DEBUG`
+- Effect: plain -5.6% (8x collapsed); layer-wise -0.6% collapsed but -4.1% balanced (side-stream traffic hid in the EP barrier's idle time, which balance removes). Frees 33 GiB. FIX `70476fdc9`: the layer-wise wait/launch distance must follow `FSDP_PREFETCH_DEPTH` (depth 2 let a layer's all-gather read half-updated weights: silent bad loss, job 1036).
+
+### 18. FullAC block-input offload  **OFF**
+- Commits: `e412f6b7a`, `8c0e697fb`, `857c3b14b`, `534194475`, `03556702a`, `7d00c041c`, `c50ef5f74`
+- File: `torchtitan/distributed/block_input_offload.py` (new), `parallelize.py`
+- Knob: `TORCHTITAN_BLOCK_INPUT_OFFLOAD=1`. Bitwise. -68 GiB at 7x. Lessons in commits: release restored inputs after the block above's backward; issue D2H at block entry.
+- Effect: collapsed regime +2.7% (513.9 at 13x); balanced regime every offload point loses to 7x without it. Kept for memory-constrained use.
+
+### 19. cuDNN DSA backward: `TORCHTITAN_DSA_DETERMINISTIC=0`  **ON**
+- Commit: `93f7014a0`. File: `cudnn_dsa.py`
+- What: deterministic mode forces the generic M64 kernel with per-CTA dKV shards (20.0 GiB scratch at 8x) plus a fold kernel; the atomic path needs 0.19 GiB and runs ~2x faster on the backward kernel.
+- Effect: 614.2 -> 677.9 at 8x (+10.4%), -13 GiB; 9x then fits: **685.7**. Numerics: dK/dV summation order varies run to run (as in every flash-attention backward). Default stays deterministic.
+
+---
+
+## Part B -- second session's units (author `clowman`, 2026-09-21), on the same branch
+
+### 20. Persistent DSA backward workspace  **OFF at 32 GPUs, ON at 128**
+- Commit: `7fc610c56`. Knob: `TORCHTITAN_DSA_PERSISTENT_WORKSPACE` (default 1; the 685.7 run sets 0). +2.0% at 128 GPUs (allocator stalls), -1.5% and +16 GiB at 32. Largely moot once unit 19 shrinks the scratch to 0.19 GiB -- re-measure.
+
+### 21. Bounded SwiGLU  **ON by default**
+- Commits: `54cca37cf`, `d23fb9a55`, `f7f66b262`. Files: `torchtitan/models/common/swiglu_bounded.py`, `activation.py`, `moe.py`. Knob `TORCHTITAN_SWIGLU_BOUNDED` (default on). +2.6% at 32 GPUs on r03 in the collapsed regime; not visible on r02 (995 vs 942). Changed the debugmodel's bitwise reference at the 1e-5 level.
+
+### 22. C4 local streaming dataset + 12x hero configs  **infra**
+- Commit: `5320d5534`. 128-GPU hero runs: 515.0 (job 970), logs in `gb300/logs/`.
+
+### 23. HybridEP dispatcher variant  **CLOSED**
+- Commits: `b066f2c47`, `937c20622`. Crashes at init (NVLink domain 4 vs EP=2) and on the FullAC recompute shape mismatch.
+
+---
+
+## Part C -- measured and closed (code retained as documentation of the measurement)
+
+| unit | commits | result |
+|---|---|---|
+| fp8 all-gather of expert weights (Megatron #5470) | `9b3798776`, `f13f059c6`, `b415d0786` | -0.9%: gathers already 95% overlapped, dequant inline HBM-bound. Contains a real fix: torchtitan's SPMD shard op strips tensor subclasses (`_preserve` namespace). |
+| TE MXFP8 grouped experts (`te_grouped.py`) | `ba8be8c19` .. `66a0f00e4` | 1.04-1.22x per layer at kernel level, but fp8 weight cache is 277 GB and the chain holds +27 GiB at the backward peak: OOM at 6x. Needs cuBLASLt >= 13.3 (`CUBLAS_NEW=1`). |
+| DeepEP dispatcher variant | `b4914341c` | -5.6% (host-synced compact layout). |
+| Two-microbatch EP overlap (`dual_microbatch`) | `016e6aefc`, `9271189b0`, `fdc082753`, `c3bc027a2` | -6% collapsed, -20% balanced: the split costs more than the ~6% copy it hides. Knob `DUAL_MB=1`, default off. |
+| Shared-expert overlap, both stream placements | branches `dsv4_shared_expert_overlap`, `dsv4_dispatch_overlap` | 0 gain: nothing runs "beside" the SM-resident copy kernel. |
+| FP8 dispatch / copy engines for the EP copy | benches `/mnt/dgxc/bench_ep_copy.py`, `bench_ce_copy.py` | ~0.3% / loses after the gather (772 GB/s CE ceiling). |
+| EP=8 / EP=32 | unit 12 variants | 537.7 / ~523 vs 587.5: dispatch copy goes 1/2 -> 31/32 remote. |
+| Selective AC configs | `bb45c44eb`, `e374c3234`, `9e029ef9f`, `2cbf22f2d` | slower than FullAC at every batch. |
+| MXFP8 expert GEMMs via torchao path | bench `/mnt/dgxc/bench_mxfp8_experts.py` | 1.10x fwd+bwd, 1.0x fwd: ~1.7% ceiling under FullAC, not built. |
+| Residual-gradient accumulation fusion | analysis | byte-neutral without a chained fp32 grad_output (TE kernels take bf16). |
+
+## Part D -- tooling (small PRs or keep local)
+- `6f225c524` profiler `PROFILER_WITH_STACK`, debugmodel `DEBUG_PROFILE` knob.
+- Cluster-side, not in repo: `/mnt/dgxc/attrib_trace.py`, `/mnt/dgxc/profiles/*/analyze_trace.py`, `exposed_comm.py`, `memcpy_stalls.py`, the `bench_*.py` microbenchmarks, the OOM-crawl guard script.
+
+## Suggested PR order (by dependency)
+1. Unit 1 (recipe/launcher) -> 2. Units 2+4 (cuDNN DSA + fused RoPE, with the int64 fix) -> 3. Unit 7 (indexer) -> 4. Unit 8+9 (TE dense + amax) -> 5. Unit 10 (eager fusions) -> 6. Unit 11 (TE mHC; TE-side patch as a separate upstream PR) -> 7. Units 5+13 (FSDP policies) -> 8. Units 6+14+15 (MinimalAsyncEP: slots, geometry, pool factor) -> 9. Unit 16 (packed experts + direct gather) -> 10. Unit 19 (DSA determinism knob) -> 11. Units 17+18 (offloads, default off) -> 12. Unit 12 configs -> 13. Part C as one "measured experiments" PR or dropped.
