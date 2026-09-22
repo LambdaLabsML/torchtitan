@@ -1,4 +1,4 @@
-# DeepSeek-V4-flash, 8k seq, 32x GB300: 685.7 TFLOP/s balanced routing (job 1097) / 519.1 collapsed (job 1006)
+# DeepSeek-V4-flash, 8k seq, 32x GB300: 723.6 TFLOP/s balanced routing (job 1100) / 519.1 collapsed (job 1006)
 
 Branch `dsv4_te_mhc` = the full stack. Everything below default-off is a knob.
 
@@ -11,7 +11,7 @@ vanishes and the same kernels run +14% faster. Balanced is the proxy for
 trained routing; collapsed is what step 20 from scratch really does. Name the
 regime with every number.
 
-## The balanced run (685.7, job 1097)
+## The balanced run (723.6, job 1100)
 ```
 RACK=r02 WORKTREE=<this checkout> \
 EXTRA_PYTHONPATH=/mnt/dgxc/pydeps-te:/mnt/dgxc/pydeps-cudnn \
@@ -23,7 +23,9 @@ TORCHTITAN_DSA_DETERMINISTIC=0 \
 CONFIG=deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_9x_balanced STEPS=20 TAG=best_balanced \
 /mnt/dgxc/sbatch_rack.sh --parsable --nodes=8 --time=00:50:00 gb300/dsv4_64xgb300.slurm
 ```
-9 sequences per rank with no offload (239.8 GiB). The last three knobs are the
+9 sequences per rank with no offload (243.9 GiB). Needs branch commit
+`b8672e291` or later: the direct gather's first version waited on the compute
+stream and serialized every prefetched expert gather (685.7 -> 723.6 fixed). The last three knobs are the
 2026-09-22 additions: `MINIMAL_ASYNC_EP_POOL_FACTOR=1.25` bounds MinimalAsyncEP's
 receive pool and capacity-padded routed activation at 1.25x the expected
 receive instead of ep_size x (balanced regime only: imbalanced routing beyond
