@@ -3519,3 +3519,30 @@ init draw (packed weights), bf16-rounded grad_H in the mHC projection wgrad,
 and run-to-run summation order in the attention backward; everything else is
 scheduling. Overnight items 1 (residual-grad fusion) and 3 (MXFP8 experts)
 closed on measurement; item 2 turned into the DSA determinism finding.
+
+## Profile of the 685.7 stack, and the direct gather's hidden serialization: 723.6 TFLOP/s (jobs 1098-1100)
+
+Profile 1098 (7x balanced, all knobs, `/mnt/dgxc/profiles/best685_7x_iter10_traces/`):
+kernel time 17.1 s per two steps (22.9 before the DSA change), but compute
+busy only 85.9% of the window and **NCCL 12.9% exposed** (2.1% before): the
+all-gather was 92% exposed (1,756 of 1,915 ms) at an unchanged 7.2 ms per
+call. Gap analysis: 1,700 of 2,177 ms of main-stream idle sat right before
+the expert GEMM, and the GEMM started 0.02 ms after each gather ended (21 ms
+of slack in the pre-direct-gather trace). Timeline: the expert gather
+*started* at the MoE's own pre-forward, right after the dispatch copy.
+
+Cause: `fsdp_direct_gather.foreach_all_gather` did
+`all_gather_stream.wait_stream(current)` before the gather. Under FullAC the
+CPU runs a block ahead, so the compute queue already held the current block's
+attention when the prefetched gather was issued, and the gather could not
+start until that attention had executed -- a prefetch turned just-in-time.
+Stock FSDP2 waits only on the previous reshard's event (via the copy-in
+stream), which is the whole dependency. Fix (commit `b8672e291`): drop the
+compute-stream wait; allocate the unsharded storage on the gather stream so
+the allocator's per-stream pool covers reuse. Debugmodel bitwise (1099).
+
+**9x balanced (1100): 723.6 TFLOP/s at step 20 (721.9-724.5 plateau), 243.9 GiB,
+loss 3.60 -- vs 685.7 (1097): +5.5%.** (+4 GiB: the unsharded expert storage
+now lives in the gather stream's pool.) This also means the direct gather's
+earlier +0.5% (1084) was the copy-out saving minus the serialization it
+introduced; the 8x/9x gains were partly masking it.
