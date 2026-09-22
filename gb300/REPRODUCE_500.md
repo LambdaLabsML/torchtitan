@@ -1,4 +1,4 @@
-# DeepSeek-V4-flash, 8k seq, 32x GB300: 747.1 TFLOP/s balanced routing (job 1120) / 519.1 collapsed (job 1006)
+# DeepSeek-V4-flash, 8k seq, 32x GB300: 756.1 TFLOP/s balanced routing (job 1126; 40-step mean 756.8, job 1129) / 519.1 collapsed (job 1006)
 
 Branch `dsv4_te_mhc` = the full stack. Everything below default-off is a knob.
 
@@ -11,7 +11,7 @@ vanishes and the same kernels run +14% faster. Balanced is the proxy for
 trained routing; collapsed is what step 20 from scratch really does. Name the
 regime with every number.
 
-## The balanced run (747.1, job 1120; plateau 747-753)
+## The balanced run (756.1 at step 20, job 1126; 40-step steps 21-40 mean 756.8, job 1129)
 ```
 RACK=r02 WORKTREE=<this checkout> \
 EXTRA_PYTHONPATH=/mnt/dgxc/pydeps-te:/mnt/dgxc/pydeps-cudnn \
@@ -19,7 +19,7 @@ TORCHTITAN_FP32_MATMUL_PRECISION=tf32 TE_DENSE_RECIPE=delayed TE_REDUCE_AMAX=0 T
 TORCHTITAN_DSA_PERSISTENT_WORKSPACE=0 FSDP_PREFETCH_DEPTH=2 \
 MINIMAL_ASYNC_EP_COPY_BLOCK_M=16 MINIMAL_ASYNC_EP_COPY_WARPS=4 \
 MINIMAL_ASYNC_EP_POOL_FACTOR=1.25 MOE_PACKED_EXPERT_WEIGHTS=1 FSDP_DIRECT_GATHER=1 TE_MHC_BF16_GRAD_PHI=1 \
-TORCHTITAN_DSA_DETERMINISTIC=0 FSDP_DIRECT_REDUCE_SCATTER=1 CUBLAS_NEW=1 MINIMAL_ASYNC_EP_COPY_TMA=1 COMPRESSOR_BF16_GEMM=1 \
+TORCHTITAN_DSA_DETERMINISTIC=0 FSDP_DIRECT_REDUCE_SCATTER=1 CUBLAS_NEW=1 MINIMAL_ASYNC_EP_COPY_TMA=1 COMPRESSOR_BF16_GEMM=1 TORCHTITAN_MHC_GRAD_CHAIN=1 \
 CONFIG=deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_9x_balanced STEPS=20 TAG=best_balanced \
 /mnt/dgxc/sbatch_rack.sh --parsable --nodes=8 --time=00:50:00 gb300/dsv4_64xgb300.slurm
 ```
@@ -30,7 +30,11 @@ of a staged `chunk_cat` copy (723.6 -> 733.1). `CUBLAS_NEW=1` preloads cuBLAS
 EP dispatch/combine row copy to TMA bulk stores (738.3 -> 743.8; EP=2, bf16,
 columns % 256 only). `COMPRESSOR_BF16_GEMM=1` runs the compressor's wkv/wgate
 as bf16-in/fp32-out GEMMs instead of an fp32 autocast that cast x and the
-weights up on every call (+0.9%, -6 GiB; combined with TMA: 747.1). Needs branch commit
+weights up on every call (+0.9%, -6 GiB; combined with TMA: 747.1). `TORCHTITAN_MHC_GRAD_CHAIN=1` fuses
+the residual stream's gradient accumulation into TE's mHC backward kernels
+(pass-through residual + accumulate buffer; paired 40-step runs: 756.8 vs 753.9
+mean, losses equal to 3e-3). Megatron-LM's reference for this model is 748;
+the control without the chain also clears it on the same day (753.9). Needs branch commit
 `b8672e291` or later: the direct gather's first version waited on the compute
 stream and serialized every prefetched expert gather (685.7 -> 723.6 fixed). The last three knobs are the
 2026-09-22 additions: `MINIMAL_ASYNC_EP_POOL_FACTOR=1.25` bounds MinimalAsyncEP's
@@ -92,7 +96,10 @@ neutral-to-+0.3% and on in both runs.
 * Transformer Engine 2.19: `/mnt/dgxc/pydeps-te` -- **locally patched**:
   `transformer_engine/pytorch/triton/mhc.py`, `mHCProjectionOp.backward`, casts
   `grad_H` down to x's dtype instead of x up to fp32 when `TE_MHC_BF16_GRAD_PHI=1`
-  (default off = stock TE). Re-apply after any TE reinstall. Core from the aarch64
+  (default off = stock TE); and `fused_grad_x_acc_buffer` accepts bf16 buffers and
+  a holder object resolved at backward time (`_resolve_acc`/`_check_acc_buffer`,
+  used by `TORCHTITAN_MHC_GRAD_CHAIN`). Re-apply both after any TE reinstall.
+  Core from the aarch64
   `transformer-engine-cu13` wheel, torch extension built from sdist with
   `--no-build-isolation`, `CUDA_HOME=/mnt/dgxc/cuda13`, the torch wheel's
   cuDNN/NCCL headers on CPATH; needs `onnxscript`, `pydantic`, the

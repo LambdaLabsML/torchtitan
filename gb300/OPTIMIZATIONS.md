@@ -1,13 +1,13 @@
 # DeepSeek-V4-flash on 32x GB300: every optimization, labeled for PR splitting
 
-Branch `dsv4_te_mhc` (LambdaLabsML/torchtitan), 158 commits over upstream base
+Branch `dsv4_te_mhc` (LambdaLabsML/torchtitan), 160 commits over upstream base
 `6857b67b6` ("DSv4 Flash: Batched DSA Patched via Claude (#22)"). Numbers are
 TFLOP/s per GPU, 8 nodes x 4 GB300 in one NVL72 rack, seq 8192, 20-step runs;
 the regime (collapsed = raw router from random init, balanced = forced load
 balancing, Megatron's `--moe-router-force-load-balancing`) is stated on every
 number because they differ by ~14% on the same code (job 940 vs 1008). Full
 evidence: `gb300/FLASH_8K_RESULTS.md` on branch `dsv4_flash_64xgb300`.
-Exact reproduction command: `gb300/REPRODUCE_500.md`. Current best: 747.1 TFLOP/s (9x, balanced, job 1120).
+Exact reproduction command: `gb300/REPRODUCE_500.md`. Current best: 756.1 TFLOP/s at step 20 (job 1126) / 756.8 40-step mean (job 1129), 9x balanced; Megatron-LM reference 748.
 
 Status legend: **ON** = in the 685.7 recipe; **OFF** = merged, default off,
 measured neutral/negative or regime-specific; **CLOSED** = measured negative,
@@ -124,6 +124,11 @@ from this campaign.
 - Files: `torchtitan/models/deepseek_v4/compressor.py`, `torchtitan/models/common/linear.py`
 - Knob: `COMPRESSOR_BF16_GEMM=1`. The compressor ran its two projections inside `torch.autocast(float32)`, casting x [T, 4096] and both weights up to fp32 on every call (forward and FullAC recompute) -- the [T, 4096] `copy_` family in every profile. bf16 is exact in TF32, so a bf16 GEMM with fp32 accumulation/output (the router-gate Function) computes the same products.
 - Effect: 738.3 -> 744.0 alone (job 1118), -6 GiB; with the TMA copy **747.1** at 9x balanced (job 1120, plateau 747-753). Numerics: accumulation order (1e-5 on the debugmodel).
+
+### 16e. Residual-stream gradient chain through TE's mHC kernels  **ON (small)**
+- Commits: `acc062d1c`, `b73c16aca` (branch `dsv4_mhc_gradchain`, cherry-picked). Files: `torchtitan/models/deepseek_v4/mhc.py` (`_HcPreChain`, `_GradHolder`), `model.py` (pass-through residual). External TE patch (side-installed copy): `fused_grad_x_acc_buffer` may be bf16 and may be a holder resolved at backward.
+- Knob: `TORCHTITAN_MHC_GRAD_CHAIN=1`. x's two consumers (HcPre's TE projection+aggregate, HcPost's residual) become one: a wrapper Function returns a pass-through view of x for HcPost, so HcPost's residual gradient arrives as the pass-through's gradient and is the buffer TE's kernels read-modify-write into. Saves inputs only (FullAC-safe; the first version pinned every block's residual and OOMed) and rebuilds TE's small forward graph in backward.
+- Effect: paired 40-step 9x balanced: **756.8 vs 753.9** mean over steps 21-40 (job 1129 vs 1130), +0.4%; the 20-step A/B (1126: 756.1 vs 747.1) overstated it because the control itself ran ~1% faster that day. Numerics: debugmodel tracks within 7e-5 over 20 steps; 40-step losses 3.186 vs 3.188.
 
 ### 17. Optimizer-state offload (chunked Adam moments, plain and layer-wise)  **OFF**
 - Commits: `78f8a5794`, `b2bf7c07b`, `095ecf8a9`, `00a248724`, `83e17b9b6`, `95e826040`, `c904332aa`, `a74bcd0f7`, `afce197bc`, FIX `70476fdc9`
