@@ -3412,3 +3412,14 @@ in-flight gather staging buffers are gone. Loss 3.80 at step 20 (init is no
 longer bitwise with the reference: DTensor random init is keyed to the global
 shape, each region still gets its own std). 8x without any offload (1085)
 queued into the freed memory.
+
+## 607.2 TFLOP/s: 8x with no offload on the freed memory (job 1085) -- the 600 gate is passed
+
+8x balanced, no offload, pool factor 1.25, packed experts + direct gather:
+**607.2 TFLOP/s at step 20 (606.8-608.4 plateau), 233.9 GiB**, loss 3.61.
+The direct gather's 17 GiB made the 8th sequence fit without any offload,
+and that sequence is worth +2.6% (591.9 -> 607.2). From the 587.5 of this
+morning: pool factor +0.3%, direct gather +0.5%, 8x +2.6% = **+3.4%**, all
+under balanced routing, none of it a numerics change beyond the init draw.
+9x would need ~255 GiB reserved plus the pool/NCCL/cuDNN outside the
+allocator: over the device; the mHC residual fusion (~1-2%) is the next lever.
