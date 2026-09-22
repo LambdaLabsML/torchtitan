@@ -3577,3 +3577,12 @@ dense blocks stock). Merged into `dsv4_te_mhc`.
 
 **Prefetch depth 3 (1105): 734.4 (735.0-735.6) vs depth 2 733.1 (731.0-735.8), same
 243.2 GiB** -- neutral, slightly flatter plateau; depth 2 stays in the recipe.
+
+## cuBLAS 13.8 preload for the dense GEMMs: 738.3, new best (job 1106)
+
+`CUBLAS_NEW=1` (the launcher's LD_PRELOAD of `nvidia-cublas==13.8.0.4`, added
+for TE's grouped GEMM and never tried on the dense path) on the 733.1 stack:
+**738.3 at step 20 (737.8-739.9 plateau), 243.2 GiB** vs 733.1 (731.0-735.8):
++0.7%, plateaus disjoint. TE's fp8 dense GEMMs and torch's bmm/mm run on
+cuBLASLt; 13.8's sm_103 heuristics beat the torch-bundled 13.1's. Numerics:
+library version only. Adopted.
