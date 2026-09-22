@@ -7,7 +7,7 @@ the regime (collapsed = raw router from random init, balanced = forced load
 balancing, Megatron's `--moe-router-force-load-balancing`) is stated on every
 number because they differ by ~14% on the same code (job 940 vs 1008). Full
 evidence: `gb300/FLASH_8K_RESULTS.md` on branch `dsv4_flash_64xgb300`.
-Exact reproduction command: `gb300/REPRODUCE_500.md`. Current best: 733.1 TFLOP/s (9x, balanced, job 1104).
+Exact reproduction command: `gb300/REPRODUCE_500.md`. Current best: 738.3 TFLOP/s (9x, balanced, job 1106).
 
 Status legend: **ON** = in the 685.7 recipe; **OFF** = merged, default off,
 measured neutral/negative or regime-specific; **CLOSED** = measured negative,
@@ -109,6 +109,10 @@ from this campaign.
 - Commit: `e4c076165` (branch `dsv4_direct_rs`, merged). File: `torchtitan/distributed/fsdp_direct_reduce_scatter.py` (new), `parallelize.py` import hook
 - Knob: `FSDP_DIRECT_REDUCE_SCATTER=1`. Twin of unit 16: for a one-parameter dim-0 group with an unpadded contiguous gradient already in the reduce dtype, the gradient's flat view is the collective's input; the staging buffer (6.4 GB per expert layer) and the `chunk_cat` on the compute stream (173 ms of idle per two steps) disappear. Implemented as a proxy over the ReduceScatter comm's `allocate` plus a no-op copy-in when the input already is the gradient; stock path otherwise.
 - Effect: 723.6 -> **733.1** at 9x balanced (job 1104). Numerics: bitwise (debugmodel 1103).
+
+### 16c. cuBLAS 13.8 preload for the dense GEMMs  **ON**
+- Commit: `937de5bf4` (launcher `CUBLAS_NEW=1`, originally for TE grouped GEMMs). External: `/mnt/dgxc/cublas-new/nvidia/cu13/lib` (`nvidia-cublas==13.8.0.4`); LD_PRELOAD because torch loads its bundled 13.1 by absolute path.
+- Effect: 733.1 -> **738.3** at 9x balanced (job 1106), plateaus disjoint. Numerics: library version only.
 
 ### 17. Optimizer-state offload (chunked Adam moments, plain and layer-wise)  **OFF**
 - Commits: `78f8a5794`, `b2bf7c07b`, `095ecf8a9`, `00a248724`, `83e17b9b6`, `95e826040`, `c904332aa`, `a74bcd0f7`, `afce197bc`, FIX `70476fdc9`
