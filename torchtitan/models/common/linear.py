@@ -16,6 +16,7 @@
 from dataclasses import dataclass
 
 import spmd_types as spmd
+import logging
 import os
 import torch
 import torch.nn as nn
@@ -30,7 +31,9 @@ from torchtitan.protocols.module import Module
 #   T = num tokens, D = model dimension, E = num experts
 
 
+logger = logging.getLogger(__name__)
 _BF16_FP32OUT = os.environ.get("LINEAR_BF16_FP32OUT", "0") == "1"
+_bf16_logged = False
 
 
 class Linear(nn.Linear, Module):
@@ -80,6 +83,10 @@ class CastLinear(Linear):
             # bf16 values are exact in TF32, so the products are the same; only
             # the accumulation order differs. Removes a [T, in] fp32 copy per
             # call (the DSv4 compressor's wkv/wgate: ~1% of the step).
+            global _bf16_logged
+            if not _bf16_logged:
+                _bf16_logged = True
+                logger.info("Linear: bf16-in/fp32-out GEMM path active (LINEAR_BF16_FP32OUT=1), first module in=%d out=%d", self.in_features, self.out_features)
             lead = input.shape[:-1]
             out = _RouterGateLinearFunction.apply(input.reshape(-1, input.shape[-1]), self.weight)
             if self.bias is not None:
