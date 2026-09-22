@@ -3423,3 +3423,35 @@ morning: pool factor +0.3%, direct gather +0.5%, 8x +2.6% = **+3.4%**, all
 under balanced routing, none of it a numerics change beyond the init draw.
 9x would need ~255 GiB reserved plus the pool/NCCL/cuDNN outside the
 allocator: over the device; the mHC residual fusion (~1-2%) is the next lever.
+
+## mHC residual-stream elementwise: attributed by Python stack; one fix = 614.2, new best (jobs 1086-1091)
+
+A `with_stack` profile of the debugmodel on one GPU (`PROFILER_WITH_STACK=1`,
+`DEBUG_PROFILE=1`; same op sequence as the 8-node run at small shapes; kineto
+puts frames in `python_function` events, attributed by interval containment)
+mapped the 8-node hot spots (per two steps of the 587.5-era profile):
+
+| 8-node op | ms | source |
+|---|---:|---|
+| `add` [T,4096,4] x2/layer + `add_` [T,1,4096,4] x2/layer | 310 | autograd summing the residual stream's two gradient contributions (x feeds `hc_*_pre` and is `hc_post`'s residual); no Python frame |
+| `copy_` [T,16384] x4/layer | 146 | **TE `mHCProjectionOp.backward`: `x.to(grad_H.dtype)` -- the whole [T, n*C] activation cast to fp32 for a [nC x M] @ [M x 32] GEMM** |
+| `copy_` [T,4096] ~10/layer | 171 | compressor input `spmd_redistribute_per_axis` (3/layer, copies even at mesh size 1), Linear/RoPE casts |
+| `add`/`add_` [T,4096] ~7/layer | 126 | shared-expert add + autograd accumulation for `ffn_in` (router, dispatch, shared experts) |
+
+Aside: the first two attempts crashed with "Failed to initialize the TMA
+descriptor 710" -- CUDA 710 is a *device-side assert*, here from passing
+`MINIMAL_ASYNC_EP_POOL_FACTOR=1.25` to the unbalanced debugmodel (overflow
+asserts rather than corrupting). Not a profiler problem.
+
+**Fix (TE, side-installed copy `/mnt/dgxc/pydeps-te/transformer_engine/pytorch/triton/mhc.py`,
+knob `TE_MHC_BF16_GRAD_PHI=1`):** cast the [M, 32] `grad_H` down to x's dtype
+instead of x up to fp32; the GEMM still accumulates in fp32. Numerics: the
+mHC projection weight gradient sees bf16-rounded logit grads, the same
+rounding every bf16 linear's weight gradient has; debugmodel losses identical
+through step 2, 1e-5 from step 3. **8x balanced: 614.2 TFLOP/s at step 20
+(614.2-615.3 plateau), 233.9 GiB (job 1091) vs 607.2 (1085): +1.2%** -- the
+copies plus the fp32 GEMM they fed.
+
+Not fixed: the 310 ms of residual-gradient accumulation (1.75%) needs TE's
+aggregate backward kernel to take an accumulate-into buffer (vendored Triton
+surgery); the redistribution copies are ~0.2%.
