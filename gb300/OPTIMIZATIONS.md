@@ -7,7 +7,7 @@ the regime (collapsed = raw router from random init, balanced = forced load
 balancing, Megatron's `--moe-router-force-load-balancing`) is stated on every
 number because they differ by ~14% on the same code (job 940 vs 1008). Full
 evidence: `gb300/FLASH_8K_RESULTS.md` on branch `dsv4_flash_64xgb300`.
-Exact reproduction command: `gb300/REPRODUCE_500.md`. Current best: 738.3 TFLOP/s (9x, balanced, job 1106).
+Exact reproduction command: `gb300/REPRODUCE_500.md`. Current best: 743.8 TFLOP/s (9x, balanced, job 1112).
 
 Status legend: **ON** = in the 685.7 recipe; **OFF** = merged, default off,
 measured neutral/negative or regime-specific; **CLOSED** = measured negative,
@@ -92,6 +92,11 @@ from this campaign.
 - Knobs: `MINIMAL_ASYNC_EP_COPY_BLOCK_M=16 MINIMAL_ASYNC_EP_COPY_WARPS=4` (`_BLOCK_N` 2048). Microbench: 2.70 -> 2.24 ms per dispatch leg (`/mnt/dgxc/bench_ep_copy.py`).
 - Effect: 578.5 -> 587.5 (balanced 7x). Numerics: bitwise.
 
+### 14b. MinimalAsyncEP TMA-store row copy  **ON**
+- Commit: `04064469a` (branch `dsv4_tma_copy`, merged). File: `minimal_async_ep/kernels.py` (`_tma_copy_rows_to_peer_ptrs_kernel`)
+- Knob: `MINIMAL_ASYNC_EP_COPY_TMA=1`. Ordinary vectorized stores into peer memory saturate near 620 GB/s per direction; TMA bulk stores (Triton 3.8 device-side tensor descriptors, one per peer, each bf16 row as a [cols/256, 256] box because TMA boxes cap at 256 per dim) get closer to line rate. 2-GPU bench: 2.25 -> 2.00 ms per leg. EP=2, bf16, cols % 256 only; stock kernel otherwise. Needs `triton.set_allocator` (set lazily).
+- Effect: 738.3 -> **743.8** at 9x balanced (job 1112, plateau 745-747). Numerics: bitwise.
+
 ### 15. `MINIMAL_ASYNC_EP_POOL_FACTOR`  **ON (=1.25, balanced only)**
 - Commits: `73084a41b`, `987fa5996`. Files: `minimal_async_ep/api.py`, `torchtitan/models/common/token_dispatcher.py`
 - What: bounds the receive pool and the capacity-padded routed activation at factor x the expected receive instead of ep_size x. Required for EP>2 (90 GB/slot at EP=32 otherwise). Overflow trips a device-side assert.
@@ -169,4 +174,4 @@ from this campaign.
 - Cluster-side, not in repo: `/mnt/dgxc/attrib_trace.py`, `/mnt/dgxc/profiles/*/analyze_trace.py`, `exposed_comm.py`, `memcpy_stalls.py`, the `bench_*.py` microbenchmarks, the OOM-crawl guard script.
 
 ## Suggested PR order (by dependency)
-1. Unit 1 (recipe/launcher) -> 2. Units 2+4 (cuDNN DSA + fused RoPE, with the int64 fix) -> 3. Unit 7 (indexer) -> 4. Unit 8+9 (TE dense + amax) -> 5. Unit 10 (eager fusions) -> 6. Unit 11 (TE mHC; TE-side patch as a separate upstream PR) -> 7. Units 5+13 (FSDP policies) -> 8. Units 6+14+15 (MinimalAsyncEP: slots, geometry, pool factor) -> 9. Units 16+16b (packed experts + direct gather + direct reduce-scatter) -> 10. Unit 19 (DSA determinism knob) -> 11. Units 17+18 (offloads, default off) -> 12. Unit 12 configs -> 13. Part C as one "measured experiments" PR or dropped.
+1. Unit 1 (recipe/launcher) -> 2. Units 2+4 (cuDNN DSA + fused RoPE, with the int64 fix) -> 3. Unit 7 (indexer) -> 4. Unit 8+9 (TE dense + amax) -> 5. Unit 10 (eager fusions) -> 6. Unit 11 (TE mHC; TE-side patch as a separate upstream PR) -> 7. Units 5+13 (FSDP policies) -> 8. Units 6+14+14b+15 (MinimalAsyncEP: slots, geometry, TMA copy, pool factor) -> 9. Units 16+16b (packed experts + direct gather + direct reduce-scatter) -> 10. Unit 19 (DSA determinism knob) -> 11. Units 17+18 (offloads, default off) -> 12. Unit 12 configs -> 13. Part C as one "measured experiments" PR or dropped.
