@@ -3594,3 +3594,15 @@ delayed 738.3 (737.8-739.9), 243.2 GiB: -0.6%, +4 GiB.** Delayed scaling stays
 **Round summary (2026-09-22 morning):** 685.7 -> 723.6 (direct-gather ordering
 fix) -> 733.1 (direct reduce-scatter) -> 738.3 (cuBLAS 13.8 for dense GEMMs);
 pool factor 1.1, prefetch depth 3 and MXFP8 dense measured neutral/negative.
+
+## TMA-store EP row copy: 743.8, new best (jobs 1108-1112, branch `dsv4_tma_copy`)
+
+2-GPU bench (`/mnt/dgxc/bench_tma_copy.py`): the current SM-store kernel
+2.25 ms per 7x dispatch leg; a TMA-store kernel (Triton 3.8
+`make_tensor_descriptor`, one descriptor per peer, each 4096-col bf16 row a
+[16, 256] box since TMA boxes cap at 256/dim) 2.00 ms, bitwise on the checked
+rows, insensitive to rows-per-CTA and warps. Integrated as
+`MINIMAL_ASYNC_EP_COPY_TMA=1` (EP=2, bf16, cols % 256; gather rows, valid-row
+limit and -1 skips handled; stock kernel otherwise). Debugmodel bitwise (1110).
+**9x balanced: 743.8 at step 20 (745.3-747.4 plateau), 243.2 GiB, loss 3.70 vs
+738.3 (737.8-739.9): +1.0%.** Merged into `dsv4_te_mhc`.
