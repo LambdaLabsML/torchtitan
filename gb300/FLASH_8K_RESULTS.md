@@ -3644,3 +3644,9 @@ kernels), grad-norm all-reduce absorbing skew 1.1%, optimizer tail 0.9%,
 EP copy now ~8% and at TMA line rate, dense-block FSDP copy-outs (multi-param
 groups, stock path) ~0.5%. 10x does not fit (237 + 21 + ~35 outside the
 allocator).
+
+**EP copy ceiling (bench 1121/1122):** remote-only, both ranks pushing: SM
+stores 621 GB/s, TMA stores 707 GB/s, flat across 1-4 warps and 4-64 rows per
+CTA -- the link's effective rate for this pattern (nominal ~900/dir). The
+merged TMA kernel is at the ceiling; further gains on the copy need fewer bytes,
+not faster stores. Branch `dsv4_tma_copy` is complete as merged.
