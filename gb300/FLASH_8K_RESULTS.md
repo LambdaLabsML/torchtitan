@@ -3586,3 +3586,11 @@ for TE's grouped GEMM and never tried on the dense path) on the 733.1 stack:
 +0.7%, plateaus disjoint. TE's fp8 dense GEMMs and torch's bmm/mm run on
 cuBLASLt; 13.8's sm_103 heuristics beat the torch-bundled 13.1's. Numerics:
 library version only. Adopted.
+
+**TE dense recipe MXFP8 under cuBLAS 13.8 (1107): 733.6 (733.6-735.2), 247.1 GiB vs
+delayed 738.3 (737.8-739.9), 243.2 GiB: -0.6%, +4 GiB.** Delayed scaling stays
+(it keeps the FullAC recompute-amax caveat; MXFP8 is stateless but slower here).
+
+**Round summary (2026-09-22 morning):** 685.7 -> 723.6 (direct-gather ordering
+fix) -> 733.1 (direct reduce-scatter) -> 738.3 (cuBLAS 13.8 for dense GEMMs);
+pool factor 1.1, prefetch depth 3 and MXFP8 dense measured neutral/negative.
