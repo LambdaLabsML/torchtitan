@@ -158,6 +158,60 @@ class HcSplitSinkhorn(Module):
         )
 
 
+# TORCHTITAN_MHC_GRAD_CHAIN=1: fuse the residual stream's gradient accumulation.
+# The residual x feeds HcPre (TE: projection + aggregate, two internal grad_x
+# contributions) and HcPost (as the residual). Autograd sums all three with two
+# full [T, D, n] passes per half-block (~1.75% of the step). TE's kernels can
+# instead read-modify-write a provided buffer. This wrapper makes x's only
+# consumer the wrapper itself: it returns a pass-through view of x that HcPost
+# uses as the residual, so HcPost's residual gradient arrives here as the
+# pass-through's gradient and becomes the accumulate buffer for the inner TE
+# backward. bf16 buffer, fp32 math in-kernel (patched side-installed TE).
+_TE_GRAD_CHAIN = os.environ.get("TORCHTITAN_MHC_GRAD_CHAIN", "0") == "1"
+
+
+class _GradHolder:
+    __slots__ = ("tensor",)
+
+    def __init__(self):
+        self.tensor = None
+
+
+class _HcPreChain(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, phi, hc_scale, hc_base_row):
+        te = _te_mhc()
+        t, d, n = x.shape
+        holder = _GradHolder()
+        with torch.enable_grad():
+            x_d = x.detach().requires_grad_(x.requires_grad)
+            phi_d = phi.detach().requires_grad_(phi.requires_grad)
+            scale_d = hc_scale.detach().requires_grad_(hc_scale.requires_grad)
+            base_d = hc_base_row.detach().requires_grad_(hc_base_row.requires_grad)
+            out, h_post, h_res = te.mhc_generate_mix_and_aggregate(
+                x_d.view(t, 1, d, n), phi_d, scale_d, base_d, fused_grad_x_acc_buffer=holder
+            )
+        ctx.holder = holder
+        ctx.inner = (x_d, phi_d, scale_d, base_d, out, h_post, h_res)
+        return out.detach(), h_post.detach(), h_res.detach(), x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, g_out, g_post, g_res, g_xpass):
+        x_d, phi_d, scale_d, base_d, out, h_post, h_res = ctx.inner
+        if g_xpass is None:
+            g_xpass = torch.zeros_like(x_d)
+        elif not g_xpass.is_contiguous():
+            g_xpass = g_xpass.contiguous()
+        ctx.holder.tensor = g_xpass  # the residual gradient; TE accumulates into it
+        outs, grads = [], []
+        for o, g in ((out, g_out), (h_post, g_post), (h_res, g_res)):
+            if g is not None:
+                outs.append(o); grads.append(g.reshape(o.shape))
+        torch.autograd.backward(outs, grads, inputs=[t for t in (x_d, phi_d, scale_d, base_d) if t.requires_grad])
+        ctx.inner = None
+        return ctx.holder.tensor, phi_d.grad, scale_d.grad, base_d.grad
+
+
 class HcPre(Module):
     """Reduce HC branches before attention or FFN computation."""
 
@@ -199,6 +253,9 @@ class HcPre(Module):
             te = _te_mhc()
             t, d, n = x.shape  # TE layout [T, D, n]
             phi = self.hc_fn.view(-1, n, d).transpose(1, 2).reshape(-1, n * d)
+            if _TE_GRAD_CHAIN:
+                out, h_post, h_res, x_pass = _HcPreChain.apply(x, phi, self.hc_scale, self.hc_base.view(1, -1))
+                return out.view(t, d), h_post.view(t, n), h_res.view(t, n, n), x_pass
             out, h_post, h_res = te.mhc_generate_mix_and_aggregate(
                 x.view(t, 1, d, n), phi, self.hc_scale, self.hc_base.view(1, -1)
             )
