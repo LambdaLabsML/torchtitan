@@ -72,17 +72,6 @@ class GroupedExperts(Module):
         if self._packed:
             E, F, D = self._efd
             self.w_E3N = nn.Parameter(torch.empty(E, 3, F * D))
-            pi = self._param_init
-            if pi is not None and {"w1_EFD", "w2_EDF", "w3_EFD"} <= set(pi):
-                i1, i2, i3 = pi["w1_EFD"], pi["w2_EDF"], pi["w3_EFD"]
-
-                def packed_init(t, _i1=i1, _i2=i2, _i3=i3):
-                    # same RNG draw order as the three separate parameters
-                    _i1(t[:, 0])
-                    _i2(t[:, 1])
-                    _i3(t[:, 2])
-
-                self._param_init = {**pi, "w_E3N": packed_init}
         else:
             self.w1_EFD = nn.Parameter(
                 torch.empty(config.num_experts, config.hidden_dim, config.dim)
@@ -94,6 +83,28 @@ class GroupedExperts(Module):
                 torch.empty(config.num_experts, config.hidden_dim, config.dim)
             )
         self.activation_fn = config.activation_fn.build()
+
+    def _init_param(self, name, param):
+        # Config.build() attaches _param_init after __init__, so the packed
+        # initializer is synthesized here from the three per-weight entries,
+        # drawing in the same order (w1, w2, w3) as the separate parameters.
+        pi = self._param_init
+        if (
+            self.__dict__.get("_packed")
+            and name == "w_E3N"
+            and pi is not None
+            and "w_E3N" not in pi
+            and {"w1_EFD", "w2_EDF", "w3_EFD"} <= set(pi)
+        ):
+            i1, i2, i3 = pi["w1_EFD"], pi["w2_EDF"], pi["w3_EFD"]
+
+            def packed_init(t, _i1=i1, _i2=i2, _i3=i3):
+                _i1(t[:, 0])
+                _i2(t[:, 1])
+                _i3(t[:, 2])
+
+            self._param_init = {**pi, "w_E3N": packed_init}
+        return super()._init_param(name, param)
 
     def __getattr__(self, name):
         try:
