@@ -650,6 +650,12 @@ def deepseek_v4_debugmodel_asyncep_policy(
         assert _enable_cudnn_indexer(config) > 0
     if os.environ.get("FP8_DENSE", "0") == "1":
         _apply_fp8_dense(config)
+    if os.environ.get("DEBUG_PROFILE", "0") == "1":
+        # 1-GPU profile of the debugmodel (PROFILER_WITH_STACK=1 for python stacks): dumps after step 4
+        config.profiler.enable_profiling = True
+        config.profiler.profile_freq = 4
+        config.profiler.profiler_warmup = 1
+        config.profiler.profiler_active = 1
     if os.environ.get("DUAL_MB", "0") == "1" or os.environ.get("DEBUG_MB4", "0") == "1":
         # the two-microbatch schedule needs an even sequence count; DEBUG_MB4=1
         # gives the matching single-microbatch reference at the same 4 sequences
