@@ -1,13 +1,13 @@
 # DeepSeek-V4-flash on 32x GB300: every optimization, labeled for PR splitting
 
-Branch `dsv4_te_mhc` (LambdaLabsML/torchtitan), 147 commits over upstream base
+Branch `dsv4_te_mhc` (LambdaLabsML/torchtitan), 150 commits over upstream base
 `6857b67b6` ("DSv4 Flash: Batched DSA Patched via Claude (#22)"). Numbers are
 TFLOP/s per GPU, 8 nodes x 4 GB300 in one NVL72 rack, seq 8192, 20-step runs;
 the regime (collapsed = raw router from random init, balanced = forced load
 balancing, Megatron's `--moe-router-force-load-balancing`) is stated on every
 number because they differ by ~14% on the same code (job 940 vs 1008). Full
 evidence: `gb300/FLASH_8K_RESULTS.md` on branch `dsv4_flash_64xgb300`.
-Exact reproduction command: `gb300/REPRODUCE_500.md`.
+Exact reproduction command: `gb300/REPRODUCE_500.md`. Current best: 723.6 TFLOP/s (9x, balanced, job 1100).
 
 Status legend: **ON** = in the 685.7 recipe; **OFF** = merged, default off,
 measured neutral/negative or regime-specific; **CLOSED** = measured negative,
@@ -98,11 +98,11 @@ from this campaign.
 - Effect: 587.5 -> 589.1, -3.6 GiB (balanced). **Balanced-regime knob**: collapsed routing overflows it. The 3 hash-routed layers are not forced-balanced (25% headroom).
 
 ### 16. Packed expert weights + FSDP2 direct all-gather  **ON**
-- Commits: `2e1331d0f`, `56cbfc6b7`, `1f2dd2e05`, `222d24885`, `4902b9c54`
+- Commits: `2e1331d0f`, `56cbfc6b7`, `1f2dd2e05`, `222d24885`, `4902b9c54`, **`b8672e291`** (ordering fix: never wait on the compute stream before a prefetched gather; allocate the unsharded storage on the gather stream)
 - Files: `torchtitan/distributed/fsdp_direct_gather.py` (new; patches `_fsdp_collectives.foreach_all_gather` / `foreach_all_gather_copy_out`), `torchtitan/models/common/moe.py` (GroupedExperts packed layout), `torchtitan/models/deepseek_v4/sharding.py`, `torchtitan/models/deepseek_v3/parallelize.py` (import hook)
 - Knobs: `MOE_PACKED_EXPERT_WEIGHTS=1 FSDP_DIRECT_GATHER=1`
 - What: FSDP2 copies every all-gather out of a staging buffer on the compute stream (1.85% of the step for expert weights, ~17 GiB in-flight staging). A one-parameter group sharded on dim 0 gathers straight into its unsharded storage. Experts packed as [3E, F*D] dim-0 chunks (NOT [E,3,N]: batch-strided GEMM weight + three zero-filled select_backward passes = -9%, job 1080).
-- Effect: 589.1 -> 591.9 at 7x, -17 GiB; the memory fit 8x without offload: 607.2 (balanced). Numerics: init is no longer bitwise with the 3-parameter layout (DTensor random init keyed to the global shape; each region keeps its std); state-dict key changes (`w_3EN`).
+- Effect: 589.1 -> 591.9 at 7x, -17 GiB; the memory fit 8x without offload: 607.2 (balanced). With the ordering fix, 685.7 -> **723.6** at 9x (job 1100): the first version's compute-stream wait had turned prefetched expert gathers into just-in-time gathers (92% of all-gather time exposed). Numerics: init is no longer bitwise with the 3-parameter layout (DTensor random init keyed to the global shape; each region keeps its std); state-dict key changes (`w_3EN`).
 - PR notes: the FSDP patch is generic torch-internals monkeypatching; upstream FSDP2 could take the single-param fast path natively. Checkpoint adapters for the packed key are not written.
 
 ### 17. Optimizer-state offload (chunked Adam moments, plain and layer-wise)  **OFF**
