@@ -3384,3 +3384,31 @@ bounded at 1.25x the expected receive instead of 2x): **589.1 TFLOP/s at step
 +0.3%: the in-place add and the bounded SwiGLU over the padded activation
 shrink with the buffer. Balanced-regime knob only (the three hash-routed
 layers are not forced-balanced; 1.25 leaves them 25% headroom).
+
+## FSDP2 direct all-gather for the expert weights: 591.9, new balanced best, -17 GiB (jobs 1076-1084)
+
+FSDP2 gathers into a staging buffer and copies it out into each parameter's
+storage on the compute stream (`split_with_sizes_copy`, 1.85% of the step for
+the expert weights). New `torchtitan/distributed/fsdp_direct_gather.py`
+(`FSDP_DIRECT_GATHER=1`, patches `foreach_all_gather`/`..._copy_out`): for a
+group with one parameter, dim-0 sharding, no padding and no dtype cast, it
+allocates the parameter's unsharded storage on the compute stream, orders
+the gather stream after it, gathers straight into it and makes the copy-out a
+wait. The expert weights become one parameter to qualify
+(`MOE_PACKED_EXPERT_WEIGHTS=1`): first as [E, 3, F*D] (bitwise init, but a
+batch-strided GEMM weight, +4% per grouped GEMM, and three zero-filled
+`select_backward` passes per layer: **-9%, job 1080**), then as **[3E, F*D]
+dim-0 chunks** with one `split` per forward (contiguous weights, a single `cat`
+in the backward). The dense blocks (19-29 params per group) keep the stock path.
+
+| job | 7x balanced | TFLOP/s step 20 | steps 16-20 | peak |
+|---|---|---:|---|---:|
+| 1075 | pool 1.25 (control) | 589.1 | 589.1-589.5 | 234.9 GiB |
+| 1080 | + packed [E,3,N] + direct gather | 535.3 | 534.5-535.3 | 217.9 GiB |
+| 1084 | **+ packed [3E,N] + direct gather** | **591.9** | 591.9-592.4 | **217.9 GiB** |
+
++0.5% (the gradient cat gives back about half of the 1.85%) and -17 GiB: the
+in-flight gather staging buffers are gone. Loss 3.80 at step 20 (init is no
+longer bitwise with the reference: DTensor random init is keyed to the global
+shape, each region still gets its own std). 8x without any offload (1085)
+queued into the freed memory.
