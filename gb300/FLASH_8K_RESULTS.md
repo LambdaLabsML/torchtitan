@@ -3650,3 +3650,25 @@ stores 621 GB/s, TMA stores 707 GB/s, flat across 1-4 warps and 4-64 rows per
 CTA -- the link's effective rate for this pattern (nominal ~900/dir). The
 merged TMA kernel is at the ceiling; further gains on the copy need fewer bytes,
 not faster stores. Branch `dsv4_tma_copy` is complete as merged.
+
+## Residual-stream gradient chain through TE's mHC kernels (branch `dsv4_mhc_gradchain`, jobs 1123-1126) -- 756.1, numerics under check
+
+Design: x's two consumers (HcPre's TE projection+aggregate, HcPost's residual)
+became one -- a wrapper Function around HcPre returns a pass-through view of x
+that HcPost uses as the residual, so HcPost's residual gradient arrives at the
+wrapper as the pass-through's gradient and is handed to TE's kernels as the
+`fused_grad_x_acc_buffer` (read-modify-write, bf16 buffer with fp32 math; TE
+side patch: dtype assert relaxed, buffer resolved via a holder at backward
+time). Autograd's two [T,4096,4] accumulation passes per half-block disappear.
+First version kept the inner graph in ctx and pinned every block's residual
+(OOM, 1124); v2 saves inputs only (FullAC-safe) and rebuilds TE's small graph
+in backward (one extra mHC forward per half-block). Debugmodel: identical at
+step 1, ~1e-4 drift after (rounding order).
+
+**9x balanced (1126): 756.1 at step 20 (755.5-757.7 plateau), 238.2 GiB --
++1.2% over 747.1, above Megatron's 748 reference. Loss 4.87 at step 20 vs
+3.3-4.1 for every other balanced run:** falling steadily (6.70 -> 4.87 over
+steps 16-20) and step-1 losses already scatter +/-0.2 between runs, so this
+may be an unlucky spiky-phase trajectory -- or a numerics fault the 1-GPU
+debugmodel cannot show. Not adopted until a 20-step debugmodel pair and a
+40-step 9x pair (chain vs control) agree.
