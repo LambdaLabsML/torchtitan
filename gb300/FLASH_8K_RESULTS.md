@@ -3558,3 +3558,7 @@ branch `dsv4_direct_rs`), 107 ms elementwise, 48 ms optimizer. Per two steps:
 EP copy 1,367 ms (9.3%, closed), all-gather 2,482 busy / 339 exposed,
 reduce-scatter 1,718 busy / 278 exposed, grad-norm all-reduce 165 exposed.
 Kernel time 18.6 s: GEMMs 41.9%, other 26.6%, NCCL 23.5%, elementwise 8.1%.
+
+**Pool factor 1.1 vs 1.25 (1102 vs 1100, 9x balanced): 723.6 vs 723.6, 243.85 GiB
+both.** The padded-activation add shrinks by 12% of a 0.8% item and nothing
+else moves; 1.25 stays for the hash layers' headroom. Item 3 closed.
