@@ -44,7 +44,7 @@ if TYPE_CHECKING:
     )
 
 _GROUPED_EXPERTS_PARAM_LAYOUT: dict[str, spmd.PerMeshAxisSpmdType] = (
-    {"w_E3N": spmd.S(1)}  # packed [E, 3, F*D]; EP-only (no per-weight TP placement)
+    {"w_3EN": spmd.S(1)}  # packed [3E, F*D]; EP-only (no per-weight TP placement)
     if os.environ.get("MOE_PACKED_EXPERT_WEIGHTS", "0") == "1"
     else {
         "w1_EFD": spmd.S(1),
