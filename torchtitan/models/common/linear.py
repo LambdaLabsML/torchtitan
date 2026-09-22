@@ -74,17 +74,17 @@ class CastLinear(Linear):
             and input.device.type == "cuda"
             and input.dtype is torch.bfloat16
             and self.weight.dtype is torch.bfloat16
-            and input.dim() == 2
         ):
             # LINEAR_BF16_FP32OUT=1: bf16 tensor-core GEMM with fp32 accumulation
             # and output instead of casting input and weight up to fp32 first.
             # bf16 values are exact in TF32, so the products are the same; only
             # the accumulation order differs. Removes a [T, in] fp32 copy per
             # call (the DSv4 compressor's wkv/wgate: ~1% of the step).
-            out = _RouterGateLinearFunction.apply(input, self.weight)
+            lead = input.shape[:-1]
+            out = _RouterGateLinearFunction.apply(input.reshape(-1, input.shape[-1]), self.weight)
             if self.bias is not None:
                 out = out + self.bias.to(torch.float32)
-            return out
+            return out.reshape(*lead, out.shape[-1])
         # The optimizer updates the weight each step, so training cannot cache
         # the upcast copy. Inference may be able to cache it between syncs.
         bias = None if self.bias is None else self.bias.to(self.compute_dtype)
