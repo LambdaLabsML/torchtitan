@@ -3672,3 +3672,13 @@ steps 16-20) and step-1 losses already scatter +/-0.2 between runs, so this
 may be an unlucky spiky-phase trajectory -- or a numerics fault the 1-GPU
 debugmodel cannot show. Not adopted until a 20-step debugmodel pair and a
 40-step 9x pair (chain vs control) agree.
+
+**Verification (jobs 1127-1130).** Debugmodel 20-step pair (4 GPUs, FSDP 2 /
+EP 2): chain vs stock within 7e-5 relative at every step. 9x balanced 40-step
+pair, same day: **chain 756.8 mean over steps 21-40 (754.1-759.0), loss 3.186
+at step 40; control 753.9 (745.9-757.1), loss 3.188.** The 4.87 in 1126 was a
+trajectory artifact (1129 reads 3.46 at step 20). Net: **+0.4%**, numerically
+equivalent, +0.3 GiB; the 20-step A/B overstated it because the control ran
+~1% faster today than 1120 did. Adopted (default-off knob). Both runs exceed
+Megatron-LM's 748 reference; headline 756.1 at step 20 (1126) / 756.8 (40-step).
+Chain merged into `dsv4_te_mhc`.
