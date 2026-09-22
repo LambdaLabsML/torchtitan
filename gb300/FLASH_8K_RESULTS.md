@@ -3455,3 +3455,21 @@ copies plus the fp32 GEMM they fed.
 Not fixed: the 310 ms of residual-gradient accumulation (1.75%) needs TE's
 aggregate backward kernel to take an accumulate-into buffer (vendored Triton
 surgery); the redistribution copies are ~0.2%.
+
+## MXFP8 expert GEMMs, gate measured and closed (job 1093)
+
+One GPU, the production `MXFP8GroupedExperts._grouped_mm` (torchao
+`_quantize_then_scaled_grouped_mm`, quantization included) vs bf16
+`_grouped_mm`, 8x balanced shapes (128 experts x 3072 rows, K=4096, N=2048):
+
+| | bf16 | MXFP8 | ratio |
+|---|---:|---:|---:|
+| gate GEMM fwd | 3.94 ms | 3.88 ms | 1.02x |
+| gate GEMM fwd+bwd | 12.56 ms | 11.07 ms | 1.13x |
+| full expert MLP fwd+bwd | 41.93 ms | 38.19 ms | 1.10x |
+
+Forward is quantization-bound (no gain), and under FullAC the forward runs
+twice, so only the backward's ~4 ms/layer is recoverable: ~1.7% of the step
+at the ceiling, for a 3.8% relative error per GEMM output and a converter
+that swaps the token dispatcher (the likely source of the -7.5% measured at
+scale earlier). Below the 1.2x bar; not built. `/mnt/dgxc/bench_mxfp8_experts.py`.
