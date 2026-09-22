@@ -1,4 +1,4 @@
-# DeepSeek-V4-flash, 8k seq, 32x GB300: 614.2 TFLOP/s balanced routing (job 1091) / 519.1 collapsed (job 1006)
+# DeepSeek-V4-flash, 8k seq, 32x GB300: 685.7 TFLOP/s balanced routing (job 1097) / 519.1 collapsed (job 1006)
 
 Branch `dsv4_te_mhc` = the full stack. Everything below default-off is a knob.
 
@@ -11,7 +11,7 @@ vanishes and the same kernels run +14% faster. Balanced is the proxy for
 trained routing; collapsed is what step 20 from scratch really does. Name the
 regime with every number.
 
-## The balanced run (614.2, job 1091)
+## The balanced run (685.7, job 1097)
 ```
 RACK=r02 WORKTREE=<this checkout> \
 EXTRA_PYTHONPATH=/mnt/dgxc/pydeps-te:/mnt/dgxc/pydeps-cudnn \
@@ -19,10 +19,11 @@ TORCHTITAN_FP32_MATMUL_PRECISION=tf32 TE_DENSE_RECIPE=delayed TE_REDUCE_AMAX=0 T
 TORCHTITAN_DSA_PERSISTENT_WORKSPACE=0 FSDP_PREFETCH_DEPTH=2 \
 MINIMAL_ASYNC_EP_COPY_BLOCK_M=16 MINIMAL_ASYNC_EP_COPY_WARPS=4 \
 MINIMAL_ASYNC_EP_POOL_FACTOR=1.25 MOE_PACKED_EXPERT_WEIGHTS=1 FSDP_DIRECT_GATHER=1 TE_MHC_BF16_GRAD_PHI=1 \
-CONFIG=deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_8x_balanced STEPS=20 TAG=best_balanced \
+TORCHTITAN_DSA_DETERMINISTIC=0 \
+CONFIG=deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_9x_balanced STEPS=20 TAG=best_balanced \
 /mnt/dgxc/sbatch_rack.sh --parsable --nodes=8 --time=00:50:00 gb300/dsv4_64xgb300.slurm
 ```
-8 sequences per rank with no offload (233.9 GiB). The last three knobs are the
+9 sequences per rank with no offload (239.8 GiB). The last three knobs are the
 2026-09-22 additions: `MINIMAL_ASYNC_EP_POOL_FACTOR=1.25` bounds MinimalAsyncEP's
 receive pool and capacity-padded routed activation at 1.25x the expected
 receive instead of ep_size x (balanced regime only: imbalanced routing beyond
@@ -31,7 +32,12 @@ it overflows; 589.1 at 7x, +0.3%); `MOE_PACKED_EXPERT_WEIGHTS=1` +
 it straight into its unsharded storage, skipping FSDP2's copy-out (591.9 at 7x,
 +0.5%, -17 GiB); the freed memory fits the 8th sequence (+2.6%); `TE_MHC_BF16_GRAD_PHI=1`
 (607.2 -> 614.2, +1.2%) is a one-line patch in the side-installed TE copy (see
-below), not in this repo. In the
+below), not in this repo. `TORCHTITAN_DSA_DETERMINISTIC=0` runs the cuDNN
+sparse-attention backward with fp32-atomic dK/dV accumulation instead of the
+deterministic per-CTA shards + fold: 614.2 -> 677.9 at 8x (+10.4%) and 20 GiB
+less scratch, which fits 9x (685.7). Gradients then vary run to run in
+summation order only, like any flash-attention backward; set it to 1 for
+bitwise reproducibility at -10%. In the
 balanced regime the offload variants lose: 7x no offload beat 10x+offload
 (572.3) and 13x+offload (549.7). `MINIMAL_ASYNC_EP_COPY_BLOCK_M=16 MINIMAL_ASYNC_EP_COPY_WARPS=4` is the
 EP row-copy launch geometry (16 rows per CTA instead of 4, 4 warps instead of
