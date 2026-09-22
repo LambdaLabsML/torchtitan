@@ -3574,3 +3574,6 @@ staging buffer, no `chunk_cat` on the compute stream. Debugmodel bitwise (1103).
 **9x balanced: 733.1 at step 20 (731.0-735.8), 243.2 GiB, loss 3.36 -- vs 723.6
 (1100): +1.3%.** 67 direct / 63 stock groups at the log point (experts direct,
 dense blocks stock). Merged into `dsv4_te_mhc`.
+
+**Prefetch depth 3 (1105): 734.4 (735.0-735.6) vs depth 2 733.1 (731.0-735.8), same
+243.2 GiB** -- neutral, slightly flatter plateau; depth 2 stays in the recipe.
