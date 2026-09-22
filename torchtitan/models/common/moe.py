@@ -63,7 +63,7 @@ class GroupedExperts(Module):
         super().__init__()
         self.num_experts = config.num_experts
         self._efd = (config.num_experts, config.hidden_dim, config.dim)
-        # MOE_PACKED_EXPERT_WEIGHTS=1: one parameter [E, 3, F*D] holding w1, w2,
+        # MOE_PACKED_EXPERT_WEIGHTS=1: one parameter [3E, F*D] holding w1, w2,
         # w3 (served as views by __getattr__). A one-parameter FSDP group lets
         # the all-gather land directly in the unsharded storage
         # (torchtitan/distributed/fsdp_direct_gather.py) instead of paying the
@@ -71,7 +71,12 @@ class GroupedExperts(Module):
         self._packed = _PACKED_EXPERT_WEIGHTS
         if self._packed:
             E, F, D = self._efd
-            self.w_E3N = nn.Parameter(torch.empty(E, 3, F * D))
+            # [3E, F*D]: w1 = rows [0,E), w2 = rows [E,2E), w3 = rows [2E,3E). Chunks
+            # along dim 0 keep each weight contiguous (a batch-strided view costs 4%
+            # on the grouped GEMM) and one split per forward means the backward
+            # assembles the packed gradient with a single cat, not three
+            # zero-filled select_backward passes (job 1080: -9%).
+            self.w_3EN = nn.Parameter(torch.empty(3 * E, F * D))
         else:
             self.w1_EFD = nn.Parameter(
                 torch.empty(config.num_experts, config.hidden_dim, config.dim)
@@ -91,34 +96,40 @@ class GroupedExperts(Module):
         pi = self._param_init
         if (
             self.__dict__.get("_packed")
-            and name == "w_E3N"
+            and name == "w_3EN"
             and pi is not None
-            and "w_E3N" not in pi
+            and "w_3EN" not in pi
             and {"w1_EFD", "w2_EDF", "w3_EFD"} <= set(pi)
         ):
             i1, i2, i3 = pi["w1_EFD"], pi["w2_EDF"], pi["w3_EFD"]
 
-            def packed_init(t, _i1=i1, _i2=i2, _i3=i3):
-                _i1(t[:, 0])
-                _i2(t[:, 1])
-                _i3(t[:, 2])
+            E, F, D = self._efd
 
-            self._param_init = {**pi, "w_E3N": packed_init}
+            def packed_init(t, _i1=i1, _i2=i2, _i3=i3, _E=E, _F=F, _D=D):
+                _i1(t[:_E].view(_E, _F, _D))
+                _i2(t[_E : 2 * _E].view(_E, _D, _F))
+                _i3(t[2 * _E :].view(_E, _F, _D))
+
+            self._param_init = {**pi, "w_3EN": packed_init}
         return super()._init_param(name, param)
+
+    def _packed_weights(self):
+        """(w1_EFD, w2_EDF, w3_EFD) as contiguous views of the packed parameter
+        (local expert count from the tensor: after EP/FSDP sharding, not the
+        config's E). One split per call -> one cat in the backward."""
+        _, F, D = self.__dict__["_efd"]
+        w = super().__getattr__("w_3EN")
+        E = w.shape[0] // 3
+        a, b, c = torch.split(w, E, dim=0)
+        return a.view(E, F, D), b.view(E, D, F), c.view(E, F, D)
 
     def __getattr__(self, name):
         try:
             return super().__getattr__(name)
         except AttributeError:
             if self.__dict__.get("_packed") and name in ("w1_EFD", "w2_EDF", "w3_EFD"):
-                _, F, D = self.__dict__["_efd"]
-                w = super().__getattr__("w_E3N")
-                E = w.shape[0]  # local experts after EP/FSDP sharding, not the config's E
-                if name == "w1_EFD":
-                    return w[:, 0].view(E, F, D)
-                if name == "w3_EFD":
-                    return w[:, 2].view(E, F, D)
-                return w[:, 1].view(E, D, F)
+                w1, w2, w3 = self._packed_weights()
+                return {"w1_EFD": w1, "w2_EDF": w2, "w3_EFD": w3}[name]
             raise
 
     def forward(
@@ -143,16 +154,20 @@ class GroupedExperts(Module):
                 # TODO(pianpwk): likely relax this in spmd_types.
                 spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
 
+        if self._packed:
+            w1_EFD, w2_EDF, w3_EFD = self._packed_weights()  # one split -> one cat in backward
+        else:
+            w1_EFD, w2_EDF, w3_EFD = self.w1_EFD, self.w2_EDF, self.w3_EFD
         gate_RF = self._grouped_mm(
-            A=x_RD.bfloat16(), weight_EOI=self.w1_EFD, offs=offsets_E
+            A=x_RD.bfloat16(), weight_EOI=w1_EFD, offs=offsets_E
         )
         up_RF = self._grouped_mm(
-            A=x_RD.bfloat16(), weight_EOI=self.w3_EFD, offs=offsets_E
+            A=x_RD.bfloat16(), weight_EOI=w3_EFD, offs=offsets_E
         )
         # Rows at or past the last offset were not written by the GEMMs and are
         # not read by the next one; the activation may skip them (swiglu_bounded).
         h_RF = self.activation_fn(gate_RF, up_RF, num_valid_rows=offsets_E[-1:])
-        return self._grouped_mm(A=h_RF, weight_EOI=self.w2_EDF, offs=offsets_E).type_as(
+        return self._grouped_mm(A=h_RF, weight_EOI=w2_EDF, offs=offsets_E).type_as(
             x_RD
         )
 
