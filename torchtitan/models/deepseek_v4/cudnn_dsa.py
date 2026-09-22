@@ -56,6 +56,9 @@ _HEAD_ALIGN_SM90 = 64
 _BWD_WORKSPACE: torch.Tensor | None = None
 
 
+_DETERMINISTIC = os.environ.get("TORCHTITAN_DSA_DETERMINISTIC", "1") == "1"
+
+
 def _backward_workspace(q_THD: torch.Tensor, kv_ND: torch.Tensor) -> torch.Tensor | None:
     """Persistent scratch for the SM100 deterministic backward (grow-only).
 
@@ -244,12 +247,14 @@ class _CudnnDsaBackward(torch.autograd.Function):
             topk_idxs,
             softmax_scale=ctx.softmax_scale,
             topk_length=topk_length,
-            # Bitwise-reproducible gradients: this model's MoE router flips on
-            # near-ties, and a non-deterministic backward would reintroduce the
-            # forward-vs-recompute mismatch that activation checkpointing
-            # rejects.
-            deterministic=True,
-            workspace=_backward_workspace(q, kv),
+            # Deterministic dKV (per-CTA shards + fold) needs a 20 GiB scratch
+            # at 8x and a fold kernel (~2% of the step); the fp32-atomic path
+            # needs 0.19 GiB and no fold, at the price of run-to-run summation
+            # order (like every flash-attention backward). Backward determinism
+            # does not touch the forward-vs-recompute match the router needs.
+            # TORCHTITAN_DSA_DETERMINISTIC=0 selects the atomic path.
+            deterministic=_DETERMINISTIC,
+            workspace=_backward_workspace(q, kv) if _DETERMINISTIC else None,
         )
         dq = result["dq"].to(q.dtype)
         dkv = result["dkv"].to(kv.dtype)
