@@ -3484,3 +3484,21 @@ previous op's grad_output (5.6 GB): ~13 GB. TE's kernels take grad_output as
 an ordinary tensor, so the fp32 buffer cannot be chained through the stack the
 way Megatron's fused mHC does; without that the fusion is byte-neutral.
 Not built.
+
+## DSA backward off deterministic mode: 677.9 TFLOP/s, +10.4% (jobs 1094-1095)
+
+`cudnn_dsa.py` ran the sparse-attention backward with `deterministic=True`
+(comment: router near-ties and the forward-vs-recompute match -- which
+backward determinism cannot affect). The deterministic sm100 kernel is the
+generic M64 variant with bounded-wave per-CTA dKV shards plus a fold: 20.0 GiB
+of scratch at 8x (0.19 GiB for the atomic path) and the `fold_dKV_shards`
+kernel (2% of the step). New knob `TORCHTITAN_DSA_DETERMINISTIC=0` selects the
+fp32-atomic dKV accumulation (summation order varies run to run, as in every
+flash-attention backward). Debugmodel losses match the deterministic
+reference at printed precision (1094).
+
+**8x balanced (1095): 677.9 TFLOP/s at step 20 (676.6-678.2 plateau), 221.2 GiB,
+loss 3.76 -- vs 614.2 at 233.9 (1091): +10.4%, -12.7 GiB.** Far more than the
+fold kernel: the shard-bounded deterministic backward kernel itself was ~2x
+slower than the atomic one (DSA bwd was 8.3% of kernel time). 9x (1096)
+running into the freed memory.
