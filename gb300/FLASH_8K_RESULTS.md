@@ -3546,3 +3546,15 @@ loss 3.60 -- vs 685.7 (1097): +5.5%.** (+4 GiB: the unsharded expert storage
 now lives in the gather stream's pool.) This also means the direct gather's
 earlier +0.5% (1084) was the copy-out saving minus the serialization it
 introduced; the 8x/9x gains were partly masking it.
+
+## Profile of the 723.6 stack (job 1101, 7x balanced: 700.5 profiled)
+
+`/mnt/dgxc/profiles/best723_7x_iter10_traces/`. Window 14.7 s per two steps
+(7.35 s/step); compute busy **96.6%** (85.9% before the ordering fix), NCCL
+93.9% overlapped (1.8% exposed), main idle 3.3% (489 ms) of which 173 ms is the
+wait before the reduce-scatter's `chunk_cat` (the staging copy of the packed
+expert gradient on the compute stream -- target of the direct reduce-scatter,
+branch `dsv4_direct_rs`), 107 ms elementwise, 48 ms optimizer. Per two steps:
+EP copy 1,367 ms (9.3%, closed), all-gather 2,482 busy / 339 exposed,
+reduce-scatter 1,718 busy / 278 exposed, grad-norm all-reduce 165 exposed.
+Kernel time 18.6 s: GEMMs 41.9%, other 26.6%, NCCL 23.5%, elementwise 8.1%.
