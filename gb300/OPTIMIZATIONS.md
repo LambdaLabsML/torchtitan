@@ -186,3 +186,57 @@ from this campaign.
 
 ## Suggested PR order (by dependency)
 1. Unit 1 (recipe/launcher) -> 2. Units 2+4 (cuDNN DSA + fused RoPE, with the int64 fix) -> 3. Unit 7 (indexer) -> 4. Unit 8+9 (TE dense + amax) -> 5. Unit 10 (eager fusions) -> 6. Unit 11 (TE mHC; TE-side patch as a separate upstream PR) -> 7. Units 5+13 (FSDP policies) -> 8. Units 6+14+14b+15 (MinimalAsyncEP: slots, geometry, TMA copy, pool factor) -> 9. Units 16+16b (packed experts + direct gather + direct reduce-scatter) -> 10. Unit 19 (DSA determinism knob) -> 11. Units 17+18 (offloads, default off) -> 12. Unit 12 configs -> 13. Part C as one "measured experiments" PR or dropped.
+
+---
+
+## This session's optimizations, in order, with config / branch / TFLOP/s
+
+All configs are functions in `torchtitan/models/deepseek_v4/config_registry.py`
+with the prefix `deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense`
+(written `…tedense` below); the optimizations themselves are env knobs, so the
+config only sets microbatch (`_Nx`), routing regime (`_balanced`) and EP degree.
+"Branch" is where the change was developed; everything marked merged is also
+on `dsv4_te_mhc`. Numbers are step-20 TFLOP/s per GPU, 8 nodes x 4 GB300,
+seq 8192, before -> after, same day and rack unless noted. The regime switch
+(collapsed -> balanced routing) is a measurement change, not an optimization,
+and is listed where it happened.
+
+| # | optimization (knob) | config | branch | TFLOP/s | job |
+|---|---|---|---|---:|---|
+| 1 | TE fp8 dense linears, delayed scaling (`TE_DENSE=1 TE_DENSE_RECIPE=delayed`) | `…tedense` (6x) | `dsv4_te_experts` -> `dsv4_te_mhc` | 450.8 -> 457.6 | 840 |
+| 2 | eager fusions: strided-bmm low-rank projection, in-place indexer RoPE | `…tedense` | `dsv4_eager_fusions` | 457.6 -> 471.0 | 852 |
+| 3 | 7x microbatch | `…tedense_7x` | `dsv4_eager_fusions` | 471.0 -> 482.8 | 853 |
+| 4 | TE fused mHC kernels (`TORCHTITAN_TE_MHC=1`) | `…tedense_7x` | `dsv4_te_mhc` | 482.8 -> 500.3 | 880 |
+| 5 | fused-RoPE int64 fix (9x+ NaN) (FIX) | `…tedense_9x` | `dsv4_te_mhc` | enables 9x+ | 923/924 |
+| 6 | `TE_REDUCE_AMAX=0` | `…tedense_7x` | `dsv4_te_mhc` | 500.3 -> 506.1 | 940 |
+| 7 | block-input offload (`TORCHTITAN_BLOCK_INPUT_OFFLOAD=1`) + 12x | `…tedense_12x` | `dsv4_te_mhc` | 506.1 -> 513.9 (collapsed) | 942 |
+| 8 | 13x on the merged branch | `…tedense_13x` | `dsv4_te_mhc` | 513.9 -> 517.6 (collapsed) | 996 |
+| — | **regime: forced balanced routing** (`_balanced` configs; Megatron's benchmark mode); EP barrier 8% -> 0 | `…tedense_7x_balanced` | `dsv4_te_mhc` | 506.1 -> 578.5 (7x, no offload) | 1008 |
+| 9 | `FSDP_PREFETCH_DEPTH=2` | `…tedense_13x` | `dsv4_te_mhc` | 517.6 -> 519.1 (neutral, kept) | 1006 |
+| 10 | MinimalAsyncEP copy geometry (`…COPY_BLOCK_M=16 …COPY_WARPS=4`) | `…tedense_7x_balanced` | `dsv4_te_mhc` | 578.5 -> 587.5 | 1015 |
+| 11 | `MINIMAL_ASYNC_EP_POOL_FACTOR=1.25` | `…tedense_7x_balanced` | `dsv4_te_mhc` | 587.5 -> 589.1 | 1075 |
+| 12 | packed expert weights + FSDP direct all-gather (`MOE_PACKED_EXPERT_WEIGHTS=1 FSDP_DIRECT_GATHER=1`) | `…tedense_7x_balanced` | `dsv4_te_mhc` | 589.1 -> 591.9, -17 GiB | 1084 |
+| 13 | 8x on the freed memory | `…tedense_8x_balanced` | `dsv4_te_mhc` | 591.9 -> 607.2 | 1085 |
+| 14 | TE grad_phi down-cast (`TE_MHC_BF16_GRAD_PHI=1`, TE side patch) | `…tedense_8x_balanced` | `dsv4_te_mhc` + `/mnt/dgxc/pydeps-te` | 607.2 -> 614.2 | 1091 |
+| 15 | DSA backward atomic dKV (`TORCHTITAN_DSA_DETERMINISTIC=0`) | `…tedense_8x_balanced` | `dsv4_te_mhc` | 614.2 -> 677.9, -13 GiB | 1095 |
+| 16 | 9x on the freed memory | `…tedense_9x_balanced` | `dsv4_te_mhc` | 677.9 -> 685.7 | 1097 |
+| 17 | direct-gather ordering fix (no compute-stream wait) (FIX) | `…tedense_9x_balanced` | `dsv4_te_mhc` | 685.7 -> 723.6 | 1100 |
+| 18 | FSDP direct reduce-scatter (`FSDP_DIRECT_REDUCE_SCATTER=1`) | `…tedense_9x_balanced` | `dsv4_direct_rs` (merged) | 723.6 -> 733.1 | 1104 |
+| 19 | cuBLAS 13.8 preload for dense GEMMs (`CUBLAS_NEW=1`) | `…tedense_9x_balanced` | `dsv4_te_mhc` (launcher) | 733.1 -> 738.3 | 1106 |
+| 20 | TMA-store EP row copy (`MINIMAL_ASYNC_EP_COPY_TMA=1`) | `…tedense_9x_balanced` | `dsv4_tma_copy` (merged) | 738.3 -> 743.8 | 1112 |
+| 21 | compressor bf16-in/fp32-out GEMMs (`COMPRESSOR_BF16_GEMM=1`) | `…tedense_9x_balanced` | `dsv4_linear_bf16out` (merged) | 738.3 -> 744.0 alone; with 20: 747.1 | 1118 / 1120 |
+| 22 | mHC residual-gradient chain (`TORCHTITAN_MHC_GRAD_CHAIN=1`, TE side patch) | `…tedense_9x_balanced` | `dsv4_mhc_gradchain` (merged) | 747.1 -> 756.1 (20-step); 753.9 -> 756.8 paired 40-step | 1126 / 1129 vs 1130 |
+
+Measured and closed this session (code kept where it documents the measurement):
+fp8 expert all-gather (-0.9%, `dsv4_fused_output_rope`), TE MXFP8 grouped experts
+(OOM at 6x), DeepEP (-5.6%), NVFP4/MXFP8 dense (449), optimizer-state offload
+plain/layer-wise (-5.6% / -4.1% balanced), selective AC (slower at every batch),
+EP=1 (365.7), dual-microbatch overlap (-6% / -20% balanced, `dsv4_dual_microbatch`),
+shared-expert overlap both placements (0, `dsv4_shared_expert_overlap`,
+`dsv4_dispatch_overlap`), FP8 dispatch (~0.3%), copy engines (772 GB/s ceiling),
+EP=8/32 (537.7 / ~523), MXFP8 expert GEMMs (1.10x), pool factor 1.1 (0),
+prefetch depth 3 (0), MXFP8 dense under cuBLAS 13.8 (-0.6%), 14x (OOM), 10x (OOM).
+
+Collapsed-regime headline for reference: 519.1 (13x + block-input offload,
+job 1006). Balanced headline: 756.1 (job 1126) / 756.8 40-step mean (job 1129);
+Megatron-LM's reference for this model is 748.
