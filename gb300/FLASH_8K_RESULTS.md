@@ -3336,3 +3336,42 @@ copy kernel contend for the same SMs, so running them concurrently hides
 nothing -- the same reason the dual-microbatch schedule and the copy-engine
 idea failed: this dispatcher's copy is not a passive transfer that compute
 can run under. Closed. Nothing in 4.2 improves FSDP for this stack.
+
+## Profile of the 587.5 configuration (job 1074, 7x balanced, all knobs): where the step goes
+
+Trace `/mnt/dgxc/profiles/best_bal_7x_iter10_traces/` (585.9 profiled). Two
+steps = 17.7 s window, 8.85 s/step; compute busy 96.4% of the window, NCCL
+93.5% overlapped (2.1% exposed), EP barrier 0.3%. Per step:
+
+| item | s/step | share | notes |
+|---|---:|---:|---|
+| GEMMs (TE fp8 dense ~3.0, bf16 expert grouped ~2.0) | 5.05 | 57% | |
+| cuDNN DSA fwd+bwd+fold | 1.5 | 17% | |
+| EP dispatch/combine copy (SM kernel) | 0.68 | 7.7% | all avenues measured; closed |
+| elementwise + copies | 0.87 | 9.8% | see below |
+| other (sorts, sums, mHC, norms, optimizer) | 0.45 | 5% | |
+| idle (tail skew at grad-norm all-reduce, RS tail) | 0.32 | 3.6% | |
+
+The elementwise/copy bucket is the only large *and* exposed item left, and it
+decomposes into named ops (per 2 steps):
+- FSDP2 expert-weight staging: `split_with_sizes_copy` [16, 201M] -> 3 params
+  328 ms (copy-out, main stream, exposed), `_chunk_cat` 3 params -> [16, 201M]
+  275 ms (copy-in, all-gather stream), `_foreach_copy_` 41 ms. **The copy-out
+  alone is 1.85% of the step**; an all-gather extension that aliases the
+  gathered buffer as the unsharded expert weights (the fp8-gather subclass
+  pattern, bf16 identity) removes it.
+- Residual-stream adds/copies around mHC: `add` [T,4096,4] 156, `add_`
+  [T,1,4096,4] 154, `copy_` [T,16384] 146 (4/layer/step layout permutes),
+  `copy_` [T,4096] 171 (834 calls, ~10/layer/step: contiguous()/casts, e.g.
+  the cuDNN indexer wrapper's three `.contiguous().to(bf16)`), `add_`/`add`
+  [T,4096] 126: **~750 ms = 4.2% of the step**, maybe half fusable into the TE
+  mHC kernels / removed by keeping layouts.
+- `add_` [688128, 4096] 203 ms: an in-place add over the capacity-padded
+  routed activation (2x the actual rows at EP=2). `MINIMAL_ASYNC_EP_POOL_FACTOR`
+  at EP=2 under balance halves it (~0.6%) and shrinks that buffer's memory.
+- DSA glue: sorts [T,640]/[T,192] 158, sums over [7,10240,64,512] 79, cats
+  ~120: ~2%.
+
+587.5 -> 600 is +2.1% = 0.19 s/step. Candidates that add up to it: FSDP
+copy-out aliasing (1.85%) + POOL_FACTOR at EP=2 (0.6%) + mHC residual fusion
+(1-2%). Expert GEMMs in MXFP8 (~1.4%, big) and the DSA glue (~1%) are next.
