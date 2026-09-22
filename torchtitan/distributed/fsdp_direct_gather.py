@@ -69,18 +69,21 @@ def foreach_all_gather(fsdp_params, group, async_op, all_gather_copy_in_stream, 
     dh = _get_device_handle(device.type)
     inp = p.all_gather_inputs[0]
     numels, dtypes = [inp.numel()], [inp.dtype]
-    # the unsharded storage, allocated on the compute stream exactly as the
-    # stock copy-out would allocate it
-    p.init_all_gather_outputs(numels, dtypes, world_size, device)
-    p.alloc_all_gather_outputs()
-    out = p.all_gather_outputs[0]
-    out._fsdp_direct = True
-    # the gather writes into memory the compute stream freed and re-allocated:
-    # order it after the compute stream, then after the copy-in stream (which
-    # unshard() already made wait on the compute stream's event)
-    all_gather_stream.wait_stream(dh.current_stream())
+    # Ordering: unshard() already made the copy-in stream wait on the previous
+    # reshard's event (the point where this storage was freed and its last
+    # readers had been issued), so waiting on the copy-in stream is the whole
+    # dependency -- the same one stock FSDP2 uses. Do NOT wait on the compute
+    # stream itself: under FullAC the CPU is a block ahead, that wait made every
+    # prefetched gather start only after the current block's attention had run
+    # (job 1098 profile: 92% of all-gather time exposed, -11% of the step).
     all_gather_stream.wait_stream(all_gather_copy_in_stream)
     with dh.stream(all_gather_stream):
+        # allocate the unsharded storage on the stream that writes it, so the
+        # caching allocator's per-stream pool ordering covers its reuse
+        p.init_all_gather_outputs(numels, dtypes, world_size, device)
+        p.alloc_all_gather_outputs()
+        out = p.all_gather_outputs[0]
+        out._fsdp_direct = True
         work = all_gather_comm(output_tensor=out, input_tensor=inp, group=group, async_op=async_op)
         event = all_gather_stream.record_event()
     STATS["direct"] += 1
