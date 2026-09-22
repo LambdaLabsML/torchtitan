@@ -1,4 +1,4 @@
-# DeepSeek-V4-flash, 8k seq, 32x GB300: 607.2 TFLOP/s balanced routing (job 1085) / 519.1 collapsed (job 1006)
+# DeepSeek-V4-flash, 8k seq, 32x GB300: 614.2 TFLOP/s balanced routing (job 1091) / 519.1 collapsed (job 1006)
 
 Branch `dsv4_te_mhc` = the full stack. Everything below default-off is a knob.
 
@@ -11,14 +11,14 @@ vanishes and the same kernels run +14% faster. Balanced is the proxy for
 trained routing; collapsed is what step 20 from scratch really does. Name the
 regime with every number.
 
-## The balanced run (607.2, job 1085)
+## The balanced run (614.2, job 1091)
 ```
 RACK=r02 WORKTREE=<this checkout> \
 EXTRA_PYTHONPATH=/mnt/dgxc/pydeps-te:/mnt/dgxc/pydeps-cudnn \
 TORCHTITAN_FP32_MATMUL_PRECISION=tf32 TE_DENSE_RECIPE=delayed TE_REDUCE_AMAX=0 TORCHTITAN_TE_MHC=1 \
 TORCHTITAN_DSA_PERSISTENT_WORKSPACE=0 FSDP_PREFETCH_DEPTH=2 \
 MINIMAL_ASYNC_EP_COPY_BLOCK_M=16 MINIMAL_ASYNC_EP_COPY_WARPS=4 \
-MINIMAL_ASYNC_EP_POOL_FACTOR=1.25 MOE_PACKED_EXPERT_WEIGHTS=1 FSDP_DIRECT_GATHER=1 \
+MINIMAL_ASYNC_EP_POOL_FACTOR=1.25 MOE_PACKED_EXPERT_WEIGHTS=1 FSDP_DIRECT_GATHER=1 TE_MHC_BF16_GRAD_PHI=1 \
 CONFIG=deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_8x_balanced STEPS=20 TAG=best_balanced \
 /mnt/dgxc/sbatch_rack.sh --parsable --nodes=8 --time=00:50:00 gb300/dsv4_64xgb300.slurm
 ```
@@ -29,7 +29,9 @@ receive instead of ep_size x (balanced regime only: imbalanced routing beyond
 it overflows; 589.1 at 7x, +0.3%); `MOE_PACKED_EXPERT_WEIGHTS=1` +
 `FSDP_DIRECT_GATHER=1` pack w1/w2/w3 into one [3E, F*D] parameter and gather
 it straight into its unsharded storage, skipping FSDP2's copy-out (591.9 at 7x,
-+0.5%, -17 GiB); the freed memory fits the 8th sequence (+2.6%). In the
++0.5%, -17 GiB); the freed memory fits the 8th sequence (+2.6%); `TE_MHC_BF16_GRAD_PHI=1`
+(607.2 -> 614.2, +1.2%) is a one-line patch in the side-installed TE copy (see
+below), not in this repo. In the
 balanced regime the offload variants lose: 7x no offload beat 10x+offload
 (572.3) and 13x+offload (549.7). `MINIMAL_ASYNC_EP_COPY_BLOCK_M=16 MINIMAL_ASYNC_EP_COPY_WARPS=4` is the
 EP row-copy launch geometry (16 rows per CTA instead of 4, 4 warps instead of
@@ -72,7 +74,10 @@ neutral-to-+0.3% and on in both runs.
 ## External pieces not in this repo (paths on the yqb01 cluster)
 * venv: `/mnt/dgxc/venvs/dsv4n` (torch 2.15 nightly cu130, aarch64).
 * cuDNN frontend with DSA + indexer wrappers: `/mnt/dgxc/pydeps-cudnn`.
-* Transformer Engine 2.19: `/mnt/dgxc/pydeps-te` -- core from the aarch64
+* Transformer Engine 2.19: `/mnt/dgxc/pydeps-te` -- **locally patched**:
+  `transformer_engine/pytorch/triton/mhc.py`, `mHCProjectionOp.backward`, casts
+  `grad_H` down to x's dtype instead of x up to fp32 when `TE_MHC_BF16_GRAD_PHI=1`
+  (default off = stock TE). Re-apply after any TE reinstall. Core from the aarch64
   `transformer-engine-cu13` wheel, torch extension built from sdist with
   `--no-build-isolation`, `CUDA_HOME=/mnt/dgxc/cuda13`, the torch wheel's
   cuDNN/NCCL headers on CPATH; needs `onnxscript`, `pydantic`, the
