@@ -3606,3 +3606,25 @@ rows, insensitive to rows-per-CTA and warps. Integrated as
 limit and -1 skips handled; stock kernel otherwise). Debugmodel bitwise (1110).
 **9x balanced: 743.8 at step 20 (745.3-747.4 plateau), 243.2 GiB, loss 3.70 vs
 738.3 (737.8-739.9): +1.0%.** Merged into `dsv4_te_mhc`.
+
+## Compressor wkv/wgate as bf16-in/fp32-out GEMMs: +0.9%, -6 GiB (jobs 1113-1118, branch `dsv4_linear_bf16out`)
+
+The compressor ran `wkv`/`wgate` (plain `Linear`, kept out of TE on purpose)
+inside a `torch.autocast(float32)` block, so every call -- forward and FullAC
+recompute -- cast x [T, 4096] and both weights up to fp32 (the [T, 4096]
+`copy_` family in every profile, ~1% of the step) and ran TF32 GEMMs. bf16
+values are exact in TF32, so a bf16 tensor-core GEMM with fp32 accumulation
+and output computes the same products; torchtitan's router-gate Function
+already does exactly that. `COMPRESSOR_BF16_GEMM=1` uses it for both
+projections. (A first attempt patched `CastLinear.forward` behind
+`LINEAR_BF16_FP32OUT`; the compressor's linears are the base class, so that
+knob is inert here and kept only as a general option.) Debugmodel: 1e-5 drift
+from step 1 (accumulation order), path-active log confirmed (1117).
+
+| job | 9x balanced | TFLOP/s step 20 | steps 16-20 | peak |
+|---|---|---:|---|---:|
+| 1106 | control (cuBLAS 13.8 stack) | 738.3 | 737.8-739.9 | 243.2 GiB |
+| 1114 | same, repeat (inert knob) | 735.9 | 735.9-738.3 | 243.2 GiB |
+| 1118 | + `COMPRESSOR_BF16_GEMM=1` | **744.0** | 743.0-746.6 | **237.2 GiB** |
+
+Combined with the TMA copy (743.8) in the next run.
