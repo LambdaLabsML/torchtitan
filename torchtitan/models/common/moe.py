@@ -111,8 +111,9 @@ class GroupedExperts(Module):
             return super().__getattr__(name)
         except AttributeError:
             if self.__dict__.get("_packed") and name in ("w1_EFD", "w2_EDF", "w3_EFD"):
-                E, F, D = self.__dict__["_efd"]
+                _, F, D = self.__dict__["_efd"]
                 w = super().__getattr__("w_E3N")
+                E = w.shape[0]  # local experts after EP/FSDP sharding, not the config's E
                 if name == "w1_EFD":
                     return w[:, 0].view(E, F, D)
                 if name == "w3_EFD":
