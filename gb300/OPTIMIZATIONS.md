@@ -1,13 +1,13 @@
 # DeepSeek-V4-flash on 32x GB300: every optimization, labeled for PR splitting
 
-Branch `dsv4_te_mhc` (LambdaLabsML/torchtitan), 150 commits over upstream base
+Branch `dsv4_te_mhc` (LambdaLabsML/torchtitan), 152 commits over upstream base
 `6857b67b6` ("DSv4 Flash: Batched DSA Patched via Claude (#22)"). Numbers are
 TFLOP/s per GPU, 8 nodes x 4 GB300 in one NVL72 rack, seq 8192, 20-step runs;
 the regime (collapsed = raw router from random init, balanced = forced load
 balancing, Megatron's `--moe-router-force-load-balancing`) is stated on every
 number because they differ by ~14% on the same code (job 940 vs 1008). Full
 evidence: `gb300/FLASH_8K_RESULTS.md` on branch `dsv4_flash_64xgb300`.
-Exact reproduction command: `gb300/REPRODUCE_500.md`. Current best: 723.6 TFLOP/s (9x, balanced, job 1100).
+Exact reproduction command: `gb300/REPRODUCE_500.md`. Current best: 733.1 TFLOP/s (9x, balanced, job 1104).
 
 Status legend: **ON** = in the 685.7 recipe; **OFF** = merged, default off,
 measured neutral/negative or regime-specific; **CLOSED** = measured negative,
@@ -105,6 +105,11 @@ from this campaign.
 - Effect: 589.1 -> 591.9 at 7x, -17 GiB; the memory fit 8x without offload: 607.2 (balanced). With the ordering fix, 685.7 -> **723.6** at 9x (job 1100): the first version's compute-stream wait had turned prefetched expert gathers into just-in-time gathers (92% of all-gather time exposed). Numerics: init is no longer bitwise with the 3-parameter layout (DTensor random init keyed to the global shape; each region keeps its std); state-dict key changes (`w_3EN`).
 - PR notes: the FSDP patch is generic torch-internals monkeypatching; upstream FSDP2 could take the single-param fast path natively. Checkpoint adapters for the packed key are not written.
 
+### 16b. FSDP2 direct reduce-scatter  **ON**
+- Commit: `e4c076165` (branch `dsv4_direct_rs`, merged). File: `torchtitan/distributed/fsdp_direct_reduce_scatter.py` (new), `parallelize.py` import hook
+- Knob: `FSDP_DIRECT_REDUCE_SCATTER=1`. Twin of unit 16: for a one-parameter dim-0 group with an unpadded contiguous gradient already in the reduce dtype, the gradient's flat view is the collective's input; the staging buffer (6.4 GB per expert layer) and the `chunk_cat` on the compute stream (173 ms of idle per two steps) disappear. Implemented as a proxy over the ReduceScatter comm's `allocate` plus a no-op copy-in when the input already is the gradient; stock path otherwise.
+- Effect: 723.6 -> **733.1** at 9x balanced (job 1104). Numerics: bitwise (debugmodel 1103).
+
 ### 17. Optimizer-state offload (chunked Adam moments, plain and layer-wise)  **OFF**
 - Commits: `78f8a5794`, `b2bf7c07b`, `095ecf8a9`, `00a248724`, `83e17b9b6`, `95e826040`, `c904332aa`, `a74bcd0f7`, `afce197bc`, FIX `70476fdc9`
 - Files: `torchtitan/components/optimizer/state_offload.py` (new), `optimizer.py`
@@ -160,4 +165,4 @@ from this campaign.
 - Cluster-side, not in repo: `/mnt/dgxc/attrib_trace.py`, `/mnt/dgxc/profiles/*/analyze_trace.py`, `exposed_comm.py`, `memcpy_stalls.py`, the `bench_*.py` microbenchmarks, the OOM-crawl guard script.
 
 ## Suggested PR order (by dependency)
-1. Unit 1 (recipe/launcher) -> 2. Units 2+4 (cuDNN DSA + fused RoPE, with the int64 fix) -> 3. Unit 7 (indexer) -> 4. Unit 8+9 (TE dense + amax) -> 5. Unit 10 (eager fusions) -> 6. Unit 11 (TE mHC; TE-side patch as a separate upstream PR) -> 7. Units 5+13 (FSDP policies) -> 8. Units 6+14+15 (MinimalAsyncEP: slots, geometry, pool factor) -> 9. Unit 16 (packed experts + direct gather) -> 10. Unit 19 (DSA determinism knob) -> 11. Units 17+18 (offloads, default off) -> 12. Unit 12 configs -> 13. Part C as one "measured experiments" PR or dropped.
+1. Unit 1 (recipe/launcher) -> 2. Units 2+4 (cuDNN DSA + fused RoPE, with the int64 fix) -> 3. Unit 7 (indexer) -> 4. Unit 8+9 (TE dense + amax) -> 5. Unit 10 (eager fusions) -> 6. Unit 11 (TE mHC; TE-side patch as a separate upstream PR) -> 7. Units 5+13 (FSDP policies) -> 8. Units 6+14+15 (MinimalAsyncEP: slots, geometry, pool factor) -> 9. Units 16+16b (packed experts + direct gather + direct reduce-scatter) -> 10. Unit 19 (DSA determinism knob) -> 11. Units 17+18 (offloads, default off) -> 12. Unit 12 configs -> 13. Part C as one "measured experiments" PR or dropped.
