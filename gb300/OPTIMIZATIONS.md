@@ -1,13 +1,13 @@
 # DeepSeek-V4-flash on 32x GB300: every optimization, labeled for PR splitting
 
-Branch `dsv4_te_mhc` (LambdaLabsML/torchtitan), 152 commits over upstream base
+Branch `dsv4_te_mhc` (LambdaLabsML/torchtitan), 158 commits over upstream base
 `6857b67b6` ("DSv4 Flash: Batched DSA Patched via Claude (#22)"). Numbers are
 TFLOP/s per GPU, 8 nodes x 4 GB300 in one NVL72 rack, seq 8192, 20-step runs;
 the regime (collapsed = raw router from random init, balanced = forced load
 balancing, Megatron's `--moe-router-force-load-balancing`) is stated on every
 number because they differ by ~14% on the same code (job 940 vs 1008). Full
 evidence: `gb300/FLASH_8K_RESULTS.md` on branch `dsv4_flash_64xgb300`.
-Exact reproduction command: `gb300/REPRODUCE_500.md`. Current best: 743.8 TFLOP/s (9x, balanced, job 1112).
+Exact reproduction command: `gb300/REPRODUCE_500.md`. Current best: 747.1 TFLOP/s (9x, balanced, job 1120).
 
 Status legend: **ON** = in the 685.7 recipe; **OFF** = merged, default off,
 measured neutral/negative or regime-specific; **CLOSED** = measured negative,
@@ -118,6 +118,12 @@ from this campaign.
 ### 16c. cuBLAS 13.8 preload for the dense GEMMs  **ON**
 - Commit: `937de5bf4` (launcher `CUBLAS_NEW=1`, originally for TE grouped GEMMs). External: `/mnt/dgxc/cublas-new/nvidia/cu13/lib` (`nvidia-cublas==13.8.0.4`); LD_PRELOAD because torch loads its bundled 13.1 by absolute path.
 - Effect: 733.1 -> **738.3** at 9x balanced (job 1106), plateaus disjoint. Numerics: library version only.
+
+### 16d. Compressor wkv/wgate as bf16-in/fp32-out GEMMs  **ON**
+- Commits: `2b870a0cc` (+ `2e8cfcebb`, `e50ce267d`, `ffa577140`: the same idea in `CastLinear.forward` behind `LINEAR_BF16_FP32OUT`, inert for this model since the compressor uses the base `Linear`; kept as a general option). Branch `dsv4_linear_bf16out`, cherry-picked.
+- Files: `torchtitan/models/deepseek_v4/compressor.py`, `torchtitan/models/common/linear.py`
+- Knob: `COMPRESSOR_BF16_GEMM=1`. The compressor ran its two projections inside `torch.autocast(float32)`, casting x [T, 4096] and both weights up to fp32 on every call (forward and FullAC recompute) -- the [T, 4096] `copy_` family in every profile. bf16 is exact in TF32, so a bf16 GEMM with fp32 accumulation/output (the router-gate Function) computes the same products.
+- Effect: 738.3 -> 744.0 alone (job 1118), -6 GiB; with the TMA copy **747.1** at 9x balanced (job 1120, plateau 747-753). Numerics: accumulation order (1e-5 on the debugmodel).
 
 ### 17. Optimizer-state offload (chunked Adam moments, plain and layer-wise)  **OFF**
 - Commits: `78f8a5794`, `b2bf7c07b`, `095ecf8a9`, `00a248724`, `83e17b9b6`, `95e826040`, `c904332aa`, `a74bcd0f7`, `afce197bc`, FIX `70476fdc9`
