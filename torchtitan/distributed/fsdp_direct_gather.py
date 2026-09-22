@@ -31,23 +31,32 @@ STATS = {"direct": 0, "fallback": 0}
 _orig_gather = _C.foreach_all_gather
 _orig_copy_out = _C.foreach_all_gather_copy_out
 _logged = False
+_logged_fallback = False
+
+
+_reasons: dict[str, int] = {}
+
+
+def _reject(why: str) -> bool:
+    _reasons[why] = _reasons.get(why, 0) + 1
+    return False
 
 
 def _eligible(fsdp_params, world_size: int) -> bool:
     if len(fsdp_params) != 1:
-        return False
+        return _reject(f"{len(fsdp_params)} params in group")
     p = fsdp_params[0]
     if hasattr(p._sharded_local_tensor, "fsdp_pre_all_gather"):
-        return False
+        return _reject("extension param")
     if p.fsdp_placement.dim != 0:
-        return False
+        return _reject("placement dim != 0")
     if p.param_dtype is not None and p.param_dtype != p.orig_dtype:
-        return False  # the cast happens in the copy-in
+        return _reject(f"dtype cast {p.orig_dtype}->{p.param_dtype}")
     inputs = p.all_gather_inputs
     if len(inputs) != 1 or not inputs[0].is_contiguous():
-        return False
+        return _reject("non-contiguous/multi input")
     if inputs[0].numel() * world_size != p._orig_size.numel():
-        return False  # padded shard
+        return _reject("padded shard")
     return True
 
 
@@ -91,6 +100,10 @@ def foreach_all_gather_copy_out(all_gather_result, fsdp_params, group):
             _logged = True
             logger.info("FSDP direct all-gather active (%d direct so far, %d stock)", STATS["direct"], STATS["fallback"])
         return
+    global _logged_fallback
+    if not _logged_fallback and STATS["fallback"] >= 50:
+        _logged_fallback = True
+        logger.info("FSDP direct all-gather: %d direct, %d stock; stock reasons %s", STATS["direct"], STATS["fallback"], _reasons)
     return _orig_copy_out(all_gather_result, fsdp_params, group)
 
 
