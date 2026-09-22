@@ -178,38 +178,57 @@ class _GradHolder:
 
 
 class _HcPreChain(torch.autograd.Function):
+    """Forward: TE's mHC pre-mix without a graph, plus a pass-through view of x.
+    Only the inputs are saved (through save_for_backward, so FullAC's saved-
+    tensor hooks free them in the forward and restore them at recompute --
+    keeping the inner graph in ctx pinned every block's residual and OOMed,
+    job 1124). Backward: rebuild TE's small forward graph, set the holder to
+    the pass-through gradient (HcPost's residual gradient) and replay TE's
+    backward, whose kernels accumulate into it. One extra mHC forward per
+    half-block (~0.5 ms) against two fewer full [T, D, n] passes."""
+
     @staticmethod
     def forward(ctx, x, phi, hc_scale, hc_base_row):
         te = _te_mhc()
         t, d, n = x.shape
-        holder = _GradHolder()
-        with torch.enable_grad():
-            x_d = x.detach().requires_grad_(x.requires_grad)
-            phi_d = phi.detach().requires_grad_(phi.requires_grad)
-            scale_d = hc_scale.detach().requires_grad_(hc_scale.requires_grad)
-            base_d = hc_base_row.detach().requires_grad_(hc_base_row.requires_grad)
-            out, h_post, h_res = te.mhc_generate_mix_and_aggregate(
-                x_d.view(t, 1, d, n), phi_d, scale_d, base_d, fused_grad_x_acc_buffer=holder
-            )
-        ctx.holder = holder
-        ctx.inner = (x_d, phi_d, scale_d, base_d, out, h_post, h_res)
-        return out.detach(), h_post.detach(), h_res.detach(), x.view_as(x)
+        out, h_post, h_res = te.mhc_generate_mix_and_aggregate(
+            x.view(t, 1, d, n), phi, hc_scale, hc_base_row
+        )
+        ctx.save_for_backward(x, phi, hc_scale, hc_base_row)
+        return out, h_post, h_res, x.view_as(x)
 
     @staticmethod
     def backward(ctx, g_out, g_post, g_res, g_xpass):
-        x_d, phi_d, scale_d, base_d, out, h_post, h_res = ctx.inner
-        if g_xpass is None:
-            g_xpass = torch.zeros_like(x_d)
-        elif not g_xpass.is_contiguous():
-            g_xpass = g_xpass.contiguous()
-        ctx.holder.tensor = g_xpass  # the residual gradient; TE accumulates into it
-        outs, grads = [], []
-        for o, g in ((out, g_out), (h_post, g_post), (h_res, g_res)):
-            if g is not None:
-                outs.append(o); grads.append(g.reshape(o.shape))
-        torch.autograd.backward(outs, grads, inputs=[t for t in (x_d, phi_d, scale_d, base_d) if t.requires_grad])
-        ctx.inner = None
-        return ctx.holder.tensor, phi_d.grad, scale_d.grad, base_d.grad
+        te = _te_mhc()
+        x, phi, hc_scale, hc_base_row = ctx.saved_tensors
+        t, d, n = x.shape
+        holder = _GradHolder()
+        with torch.enable_grad():
+            x_d = x.detach().requires_grad_(True)
+            phi_d = phi.detach().requires_grad_(ctx.needs_input_grad[1])
+            scale_d = hc_scale.detach().requires_grad_(ctx.needs_input_grad[2])
+            base_d = hc_base_row.detach().requires_grad_(ctx.needs_input_grad[3])
+            out, h_post, h_res = te.mhc_generate_mix_and_aggregate(
+                x_d.view(t, 1, d, n), phi_d, scale_d, base_d, fused_grad_x_acc_buffer=holder
+            )
+            if g_xpass is None:
+                g_xpass = torch.zeros_like(x)
+            elif not g_xpass.is_contiguous():
+                g_xpass = g_xpass.contiguous()
+            holder.tensor = g_xpass  # HcPost's residual gradient; TE accumulates into it
+            outs, grads = [], []
+            for o, g in ((out, g_out), (h_post, g_post), (h_res, g_res)):
+                if g is not None:
+                    outs.append(o)
+                    grads.append(g.reshape(o.shape))
+            leaves = [t_ for t_ in (x_d, phi_d, scale_d, base_d) if t_.requires_grad]
+            torch.autograd.backward(outs, grads, inputs=leaves)
+        return (
+            holder.tensor,
+            phi_d.grad if ctx.needs_input_grad[1] else None,
+            scale_d.grad if ctx.needs_input_grad[2] else None,
+            base_d.grad if ctx.needs_input_grad[3] else None,
+        )
 
 
 class HcPre(Module):
