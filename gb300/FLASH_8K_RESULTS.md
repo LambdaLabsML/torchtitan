@@ -3375,3 +3375,12 @@ decomposes into named ops (per 2 steps):
 587.5 -> 600 is +2.1% = 0.19 s/step. Candidates that add up to it: FSDP
 copy-out aliasing (1.85%) + POOL_FACTOR at EP=2 (0.6%) + mHC residual fusion
 (1-2%). Expert GEMMs in MXFP8 (~1.4%, big) and the DSA glue (~1%) are next.
+
+## `MINIMAL_ASYNC_EP_POOL_FACTOR=1.25` at EP=2: 589.1, new balanced best (job 1075)
+
+7x balanced, all knobs + pool factor 1.25 (receive pool and routed activation
+bounded at 1.25x the expected receive instead of 2x): **589.1 TFLOP/s at step
+20 (589.1-589.5 plateau), 234.9 GiB** (-3.6 GiB), loss 3.54, vs 587.5 at 238.5.
++0.3%: the in-place add and the bounded SwiGLU over the padded activation
+shrink with the buffer. Balanced-regime knob only (the three hash-routed
+layers are not forced-balanced; 1.25 leaves them 25% headroom).
