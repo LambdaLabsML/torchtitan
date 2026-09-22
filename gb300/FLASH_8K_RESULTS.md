@@ -3502,3 +3502,20 @@ loss 3.76 -- vs 614.2 at 233.9 (1091): +10.4%, -12.7 GiB.** Far more than the
 fold kernel: the shard-bounded deterministic backward kernel itself was ~2x
 slower than the atomic one (DSA bwd was 8.3% of kernel time). 9x (1096)
 running into the freed memory.
+
+## 9x on the freed memory: 685.7 TFLOP/s, new best (job 1097)
+
+9x balanced, atomic DSA backward, all knobs: **685.7 TFLOP/s at step 20
+(685.7-687.7 plateau), 239.8 GiB, loss 3.38** -- +1.1% over 8x (677.9). 10x
+would need ~261 GiB reserved plus the pool/NCCL/cuDNN outside the allocator:
+over the device. (1096 was a config-name typo, no 9x balanced variant
+existed; added.)
+
+**Day summary (2026-09-22, all 8 nodes / 32 GPUs, balanced routing):**
+587.5 -> 589.1 (pool factor) -> 591.9 (FSDP direct gather, -17 GiB) -> 607.2
+(8x on the freed memory) -> 614.2 (TE grad_phi cast) -> 677.9 (DSA atomic dKV,
+-13 GiB) -> **685.7 (9x)**: +16.7%. Numerics changes along the way: DTensor
+init draw (packed weights), bf16-rounded grad_H in the mHC projection wgrad,
+and run-to-run summation order in the attention backward; everything else is
+scheduling. Overnight items 1 (residual-grad fusion) and 3 (MXFP8 experts)
+closed on measurement; item 2 turned into the DSA determinism finding.
