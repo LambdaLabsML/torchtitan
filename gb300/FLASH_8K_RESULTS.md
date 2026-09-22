@@ -3473,3 +3473,14 @@ twice, so only the backward's ~4 ms/layer is recoverable: ~1.7% of the step
 at the ceiling, for a 3.8% relative error per GEMM output and a converter
 that swaps the token dispatcher (the likely source of the -7.5% measured at
 scale earlier). Below the 1.2x bar; not built. `/mnt/dgxc/bench_mxfp8_experts.py`.
+
+## Item 1 (fused residual-gradient accumulation) closed on the byte count
+
+TE's mHC ops already accept `fused_grad_x_acc_buffer` (fp32, accumulate-into,
+x's grad then returned as None). Per half-block today: two bf16 [T,4096,4]
+accumulations, ~11 GB of HBM traffic. With the buffer: an fp32 memset (3.8 GB),
+fp32 instead of bf16 kernel writes (+3.8 GB) and a bf16 handoff cast to the
+previous op's grad_output (5.6 GB): ~13 GB. TE's kernels take grad_output as
+an ordinary tensor, so the fp32 buffer cannot be chained through the stack the
+way Megatron's fused mHC does; without that the fusion is byte-neutral.
+Not built.
