@@ -3562,3 +3562,15 @@ Kernel time 18.6 s: GEMMs 41.9%, other 26.6%, NCCL 23.5%, elementwise 8.1%.
 **Pool factor 1.1 vs 1.25 (1102 vs 1100, 9x balanced): 723.6 vs 723.6, 243.85 GiB
 both.** The padded-activation add shrinks by 12% of a 0.8% item and nothing
 else moves; 1.25 stays for the hash layers' headroom. Item 3 closed.
+
+## Direct reduce-scatter: 733.1 TFLOP/s, new best (jobs 1103-1104, branch `dsv4_direct_rs`)
+
+`torchtitan/distributed/fsdp_direct_reduce_scatter.py` (`FSDP_DIRECT_REDUCE_SCATTER=1`):
+for a one-parameter dim-0 group whose gradient is contiguous, unpadded and
+already in the reduce dtype, the gradient's flat view is handed to the
+reduce-scatter as its input (a proxy over the comm's `allocate` serves it; the
+copy-in becomes a no-op when input and gradient share storage). No 6.4 GB
+staging buffer, no `chunk_cat` on the compute stream. Debugmodel bitwise (1103).
+**9x balanced: 733.1 at step 20 (731.0-735.8), 243.2 GiB, loss 3.36 -- vs 723.6
+(1100): +1.3%.** 67 direct / 63 stock groups at the log point (experts direct,
+dense blocks stock). Merged into `dsv4_te_mhc`.
