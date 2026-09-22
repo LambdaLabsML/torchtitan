@@ -3628,3 +3628,19 @@ from step 1 (accumulation order), path-active log confirmed (1117).
 | 1118 | + `COMPRESSOR_BF16_GEMM=1` | **744.0** | 743.0-746.6 | **237.2 GiB** |
 
 Combined with the TMA copy (743.8) in the next run.
+
+## Combined: TMA copy + compressor bf16 GEMMs = 747.1 TFLOP/s, new best (job 1120)
+
+9x balanced, everything on: **747.1 at step 20, plateau 747.4-753.1 (mean ~750),
+237.2 GiB, loss 3.36.** The two items add (743.8 and 744.0 alone). 1119 was
+launched before the cherry-pick had actually landed (a stale cherry-pick state
+in the worktree swallowed it silently) and was cancelled.
+
+**Round 3 summary (2026-09-22, 08:00-09:20):** 738.3 -> 743.8 (TMA-store EP
+copy) -> 747.1 (+ compressor bf16 GEMMs). Since 2026-09-21 morning:
+587.5 -> 747.1, **+27.2%**. Still on the table, all small: residual-stream
+gradient accumulation 1.75% (needs a chained fp32 buffer through TE's
+kernels), grad-norm all-reduce absorbing skew 1.1%, optimizer tail 0.9%,
+EP copy now ~8% and at TMA line rate, dense-block FSDP copy-outs (multi-param
+groups, stock path) ~0.5%. 10x does not fit (237 + 21 + ~35 outside the
+allocator).
