@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 
 import spmd_types as spmd
 
+import os
 import torch
 import torch.nn.functional as F
 import torch_remat as remat
@@ -47,6 +48,9 @@ from .token_dispatcher import LocalTokenDispatcher
 #        for the up/gate projections and (E, D, F) for the down one)
 
 
+_PACKED_EXPERT_WEIGHTS = os.environ.get("MOE_PACKED_EXPERT_WEIGHTS", "0") == "1"
+
+
 class GroupedExperts(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -58,16 +62,52 @@ class GroupedExperts(Module):
     def __init__(self, config: Config):
         super().__init__()
         self.num_experts = config.num_experts
-        self.w1_EFD = nn.Parameter(
-            torch.empty(config.num_experts, config.hidden_dim, config.dim)
-        )
-        self.w2_EDF = nn.Parameter(
-            torch.empty(config.num_experts, config.dim, config.hidden_dim)
-        )
-        self.w3_EFD = nn.Parameter(
-            torch.empty(config.num_experts, config.hidden_dim, config.dim)
-        )
+        self._efd = (config.num_experts, config.hidden_dim, config.dim)
+        # MOE_PACKED_EXPERT_WEIGHTS=1: one parameter [E, 3, F*D] holding w1, w2,
+        # w3 (served as views by __getattr__). A one-parameter FSDP group lets
+        # the all-gather land directly in the unsharded storage
+        # (torchtitan/distributed/fsdp_direct_gather.py) instead of paying the
+        # split_with_sizes_copy copy-out, 1.85% of the DSv4-flash step.
+        self._packed = _PACKED_EXPERT_WEIGHTS
+        if self._packed:
+            E, F, D = self._efd
+            self.w_E3N = nn.Parameter(torch.empty(E, 3, F * D))
+            pi = self._param_init
+            if pi is not None and {"w1_EFD", "w2_EDF", "w3_EFD"} <= set(pi):
+                i1, i2, i3 = pi["w1_EFD"], pi["w2_EDF"], pi["w3_EFD"]
+
+                def packed_init(t, _i1=i1, _i2=i2, _i3=i3):
+                    # same RNG draw order as the three separate parameters
+                    _i1(t[:, 0])
+                    _i2(t[:, 1])
+                    _i3(t[:, 2])
+
+                self._param_init = {**pi, "w_E3N": packed_init}
+        else:
+            self.w1_EFD = nn.Parameter(
+                torch.empty(config.num_experts, config.hidden_dim, config.dim)
+            )
+            self.w2_EDF = nn.Parameter(
+                torch.empty(config.num_experts, config.dim, config.hidden_dim)
+            )
+            self.w3_EFD = nn.Parameter(
+                torch.empty(config.num_experts, config.hidden_dim, config.dim)
+            )
         self.activation_fn = config.activation_fn.build()
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            if self.__dict__.get("_packed") and name in ("w1_EFD", "w2_EDF", "w3_EFD"):
+                E, F, D = self.__dict__["_efd"]
+                w = super().__getattr__("w_E3N")
+                if name == "w1_EFD":
+                    return w[:, 0].view(E, F, D)
+                if name == "w3_EFD":
+                    return w[:, 2].view(E, F, D)
+                return w[:, 1].view(E, D, F)
+            raise
 
     def forward(
         self,
