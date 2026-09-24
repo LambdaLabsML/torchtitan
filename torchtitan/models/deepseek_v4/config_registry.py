@@ -224,6 +224,10 @@ def _pin_gb300_flex_tiles(config: Trainer.Config, block_size: int = 32) -> None:
         if isinstance(inner, FlexInnerAttention.Config):
             inner.kernel_options = dict(_GB300_FLEX_KERNEL_OPTIONS)
             inner.block_size = block_size
+            # With the tiles pinned, autotune can only re-benchmark the pin
+            # against variants that do not fit: throughput-neutral and ~228 s
+            # of startup per distinct shape.
+            inner.max_autotune = False
 
 
 def deepseek_v4_flash_8k_gb300(seq_len: int | None = 8192) -> Trainer.Config:
@@ -240,13 +244,13 @@ def deepseek_v4_flash_8k_gb300(seq_len: int | None = 8192) -> Trainer.Config:
     - ``mixed_precision_reduce = bfloat16`` (+3.7%).
     - the leaf compiles in this branch, worth +34% on top.
 
-    MoE dispatch: the measurements behind this branch used
-    ``moe_comm_backend="minimal_async_ep"`` (+4.9% over standard all-to-all,
-    and +15% once the leaf compiles made compute cheaper), but that dispatcher
-    was deprecated upstream in #4627 and is no longer in the tree. Of what
-    remains, ``deepep`` measured 7.4% above ``standard`` on this hardware and
-    needs a source build (DeepEP v2, arch 10.3a); ``standard`` is the default
-    here because it needs nothing.
+    MoE dispatch: ``minimal_async_ep``, worth +4.9% over the standard
+    all-to-all on the pre-compile recipe and ~+15% once the leaf compiles made
+    compute cheaper. Upstream deprecated that dispatcher in #4627 as
+    unmaintained; this fork restores it because nothing available replaces it
+    on this hardware (DeepEP measured 7.4% above standard and needs a source
+    build; HybridEP 2.9% below MinimalAsyncEP). It also forces CUDA graphs
+    off, since its dispatch has a host sync.
 
     Run with ``TORCHTITAN_LEAF_COMPILE=all`` (the default) and, for a numerics
     reference, ``TORCHTITAN_LEAF_COMPILE=0``.
@@ -254,7 +258,10 @@ def deepseek_v4_flash_8k_gb300(seq_len: int | None = 8192) -> Trainer.Config:
     from torchtitan.distributed.activation_checkpoint import FullAC
 
     config = deepseek_v4_flash(seq_len)
-    config.model_spec = model_registry("deepseek_v4_flash", seq_len=seq_len)
+    config.model_spec = model_registry(
+        "deepseek_v4_flash", seq_len=seq_len, moe_comm_backend="minimal_async_ep"
+    )
+    config.training.disable_cuda_graphs = True
     _pin_gb300_flex_tiles(config)
     config.parallelism = ParallelismConfig(
         data_parallel_shard_degree=-1,
