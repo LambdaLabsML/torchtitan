@@ -224,6 +224,10 @@ def _pin_gb300_flex_tiles(config: Trainer.Config, block_size: int = 32) -> None:
         if isinstance(inner, FlexInnerAttention.Config):
             inner.kernel_options = dict(_GB300_FLEX_KERNEL_OPTIONS)
             inner.block_size = block_size
+            # With the tiles pinned, autotune can only re-benchmark the pin
+            # against variants that do not fit: throughput-neutral and ~228 s
+            # of startup per distinct shape.
+            inner.max_autotune = False
 
 
 def deepseek_v4_flash_8k_gb300(seq_len: int | None = 8192) -> Trainer.Config:
