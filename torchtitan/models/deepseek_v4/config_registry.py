@@ -1112,6 +1112,7 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_10x_ba
     """The 10x recipe with forced load-balanced routing (needs the block-input offload)."""
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(10, seq_len)
     config.debug.moe_force_load_balance = True
+    return config
 
 def _force_balanced_routing(config: Trainer.Config) -> int:
     """Benchmark aid: round-robin expert assignment on every MoE block.
