@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 
 import spmd_types as spmd
 
+import os
 import torch
 import torch.nn.functional as F
 import torch_remat as remat
@@ -47,6 +48,9 @@ from .token_dispatcher import LocalTokenDispatcher
 #        for the up/gate projections and (E, D, F) for the down one)
 
 
+_PACKED_EXPERT_WEIGHTS = os.environ.get("MOE_PACKED_EXPERT_WEIGHTS", "0") == "1"
+
+
 class GroupedExperts(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -58,16 +62,75 @@ class GroupedExperts(Module):
     def __init__(self, config: Config):
         super().__init__()
         self.num_experts = config.num_experts
-        self.w1_EFD = nn.Parameter(
-            torch.empty(config.num_experts, config.hidden_dim, config.dim)
-        )
-        self.w2_EDF = nn.Parameter(
-            torch.empty(config.num_experts, config.dim, config.hidden_dim)
-        )
-        self.w3_EFD = nn.Parameter(
-            torch.empty(config.num_experts, config.hidden_dim, config.dim)
-        )
+        self._efd = (config.num_experts, config.hidden_dim, config.dim)
+        # MOE_PACKED_EXPERT_WEIGHTS=1: one parameter [3E, F*D] holding w1, w2,
+        # w3 (served as views by __getattr__). A one-parameter FSDP group lets
+        # the all-gather land directly in the unsharded storage
+        # (torchtitan/distributed/fsdp_direct_gather.py) instead of paying the
+        # split_with_sizes_copy copy-out, 1.85% of the DSv4-flash step.
+        self._packed = _PACKED_EXPERT_WEIGHTS
+        if self._packed:
+            E, F, D = self._efd
+            # [3E, F*D]: w1 = rows [0,E), w2 = rows [E,2E), w3 = rows [2E,3E). Chunks
+            # along dim 0 keep each weight contiguous (a batch-strided view costs 4%
+            # on the grouped GEMM) and one split per forward means the backward
+            # assembles the packed gradient with a single cat, not three
+            # zero-filled select_backward passes (job 1080: -9%).
+            self.w_3EN = nn.Parameter(torch.empty(3 * E, F * D))
+        else:
+            self.w1_EFD = nn.Parameter(
+                torch.empty(config.num_experts, config.hidden_dim, config.dim)
+            )
+            self.w2_EDF = nn.Parameter(
+                torch.empty(config.num_experts, config.dim, config.hidden_dim)
+            )
+            self.w3_EFD = nn.Parameter(
+                torch.empty(config.num_experts, config.hidden_dim, config.dim)
+            )
         self.activation_fn = config.activation_fn.build()
+
+    def _init_param(self, name, param):
+        # Config.build() attaches _param_init after __init__, so the packed
+        # initializer is synthesized here from the three per-weight entries,
+        # drawing in the same order (w1, w2, w3) as the separate parameters.
+        pi = self._param_init
+        if (
+            self.__dict__.get("_packed")
+            and name == "w_3EN"
+            and pi is not None
+            and "w_3EN" not in pi
+            and {"w1_EFD", "w2_EDF", "w3_EFD"} <= set(pi)
+        ):
+            i1, i2, i3 = pi["w1_EFD"], pi["w2_EDF"], pi["w3_EFD"]
+
+            E, F, D = self._efd
+
+            def packed_init(t, _i1=i1, _i2=i2, _i3=i3, _E=E, _F=F, _D=D):
+                _i1(t[:_E].view(_E, _F, _D))
+                _i2(t[_E : 2 * _E].view(_E, _D, _F))
+                _i3(t[2 * _E :].view(_E, _F, _D))
+
+            self._param_init = {**pi, "w_3EN": packed_init}
+        return super()._init_param(name, param)
+
+    def _packed_weights(self):
+        """(w1_EFD, w2_EDF, w3_EFD) as contiguous views of the packed parameter
+        (local expert count from the tensor: after EP/FSDP sharding, not the
+        config's E). One split per call -> one cat in the backward."""
+        _, F, D = self.__dict__["_efd"]
+        w = super().__getattr__("w_3EN")
+        E = w.shape[0] // 3
+        a, b, c = torch.split(w, E, dim=0)
+        return a.view(E, F, D), b.view(E, D, F), c.view(E, F, D)
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            if self.__dict__.get("_packed") and name in ("w1_EFD", "w2_EDF", "w3_EFD"):
+                w1, w2, w3 = self._packed_weights()
+                return {"w1_EFD": w1, "w2_EDF": w2, "w3_EFD": w3}[name]
+            raise
 
     def forward(
         self,
@@ -91,14 +154,20 @@ class GroupedExperts(Module):
                 # TODO(pianpwk): likely relax this in spmd_types.
                 spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
 
+        if self._packed:
+            w1_EFD, w2_EDF, w3_EFD = self._packed_weights()  # one split -> one cat in backward
+        else:
+            w1_EFD, w2_EDF, w3_EFD = self.w1_EFD, self.w2_EDF, self.w3_EFD
         gate_RF = self._grouped_mm(
-            A=x_RD.bfloat16(), weight_EOI=self.w1_EFD, offs=offsets_E
+            A=x_RD.bfloat16(), weight_EOI=w1_EFD, offs=offsets_E
         )
         up_RF = self._grouped_mm(
-            A=x_RD.bfloat16(), weight_EOI=self.w3_EFD, offs=offsets_E
+            A=x_RD.bfloat16(), weight_EOI=w3_EFD, offs=offsets_E
         )
-        h_RF = self.activation_fn(gate_RF, up_RF)
-        return self._grouped_mm(A=h_RF, weight_EOI=self.w2_EDF, offs=offsets_E).type_as(
+        # Rows at or past the last offset were not written by the GEMMs and are
+        # not read by the next one; the activation may skip them (swiglu_bounded).
+        h_RF = self.activation_fn(gate_RF, up_RF, num_valid_rows=offsets_E[-1:])
+        return self._grouped_mm(A=h_RF, weight_EOI=w2_EDF, offs=offsets_E).type_as(
             x_RD
         )
 
