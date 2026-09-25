@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from typing import TYPE_CHECKING
 
 import spmd_types as spmd
@@ -42,11 +43,15 @@ if TYPE_CHECKING:
         DeepSeekV4TransformerBlock,
     )
 
-_GROUPED_EXPERTS_PARAM_LAYOUT: dict[str, spmd.PerMeshAxisSpmdType] = {
-    "w1_EFD": spmd.S(1),
-    "w2_EDF": spmd.S(2),
-    "w3_EFD": spmd.S(1),
-}
+_GROUPED_EXPERTS_PARAM_LAYOUT: dict[str, spmd.PerMeshAxisSpmdType] = (
+    {"w_3EN": spmd.S(1)}  # packed [3E, F*D]; EP-only (no per-weight TP placement)
+    if os.environ.get("MOE_PACKED_EXPERT_WEIGHTS", "0") == "1"
+    else {
+        "w1_EFD": spmd.S(1),
+        "w2_EDF": spmd.S(2),
+        "w3_EFD": spmd.S(1),
+    }
+)
 
 _replicate_weight = ShardingConfig(
     state_shardings={"weight": _dense_param_rep},
