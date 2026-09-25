@@ -20,6 +20,9 @@ from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.tools.leaf_compile import leaf_compile
 
+from .cudnn_dsa import flatten_batched_indices, fused_dsa_attention
+from .cudnn_indexer import cudnn_indexer_select
+
 from .compressor import Compressor, Indexer
 
 
@@ -107,6 +110,20 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
         compress_ratio: int
         softmax_scale: float
         index_topk: int
+        fused_dsa_backward: bool = False
+        fused_dsa_forward: bool = False
+        """Compute the DSA gradients with cuDNN's fused kernel instead of the
+        FlexAttention backward. The forward is unchanged. The flex backward is
+        ~40 % of kernel time on GB300 at head_dim=512 -- a generic Triton
+        template whose tiles are capped by the sparse block size -- while
+        cuDNN ships a CuTe-DSL kernel written for this exact shape. Needs
+        ``nvidia-cudnn-frontend[cutedsl]`` and SM90+."""
+
+        cudnn_indexer: bool = False
+        """Select the CSA top-k with cuDNN's fused indexer kernel instead of
+        the eager einsum + stable sort (see ``cudnn_indexer.py``). Forward
+        only; the indexer has no gradient path in torchtitan."""
+
         seq_len: int = 0
         """Length of one packed sequence. 0 (the original behaviour) treats the
         whole per-rank token stream as a single sequence, which makes the DSA
@@ -126,9 +143,23 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
         self.softmax_scale = config.softmax_scale
         self.index_topk = config.index_topk
         self.seq_len = config.seq_len
+        self.fused_dsa_backward = config.fused_dsa_backward
+        self.fused_dsa_forward = config.fused_dsa_forward
+        self.cudnn_indexer = config.cudnn_indexer
         self.block_size = config.block_size
 
-    def get_window_topk_idxs(
+    def get_window_topk_idxs(self, *, bsz, seqlen, device):
+        """Cached: the index build depends only on (seqlen, window), yet ran
+        86 times a step (eager clamp_min + arange, 1.2% of GPU time)."""
+        cache = self.__dict__.setdefault("_window_idx_cache", {})
+        key = (seqlen, str(device))
+        if key not in cache:
+            cache[key] = self._get_window_topk_idxs_uncached(
+                bsz=1, seqlen=seqlen, device=device
+            )[0]
+        return cache[key].unsqueeze(0).expand(bsz, -1, -1)
+
+    def _get_window_topk_idxs_uncached(
         self,
         *,
         bsz: int,
@@ -245,6 +276,55 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
             seq_lengths=(seqlen, kv_len),
         )
 
+    @torch.no_grad()
+    def selected_kv_indices(
+        self, *, bsz, seqlen, n_cmp, idx_q, idx_k, idx_w, device
+    ) -> torch.Tensor:
+        """The KV positions each query attends, ``[B, L, K]``, -1 padded.
+
+        Window positions live in ``[0, L)`` and compressed ones are offset by
+        ``L``, so the indices address the concatenated per-sequence KV stream
+        directly. Exposed as a method because the block mask, the fused
+        backward and the tests all need exactly this selection.
+        """
+        selected_indices = [
+            self.get_window_topk_idxs(bsz=bsz, seqlen=seqlen, device=device)
+        ]
+        if self.compress_ratio == 4:
+            if idx_q is None or idx_k is None or idx_w is None:
+                raise ValueError(
+                    "DSV4FlexInnerAttention requires idx_q, idx_k, "
+                    "and idx_w when compress_ratio=4"
+                )
+            select = cudnn_indexer_select if self.cudnn_indexer else Indexer.select
+            cmp_topk = select(
+                idx_q,
+                idx_k,
+                idx_w,
+                seqlen=seqlen,
+                ratio=self.compress_ratio,
+                topk=self.index_topk,
+            )
+            if cmp_topk.ndim == 2:  # folded layout -> add the batch dim
+                cmp_topk = cmp_topk.unsqueeze(0)
+            causal_limit = (
+                torch.arange(1, seqlen + 1, device=device).unsqueeze(1)
+                // self.compress_ratio
+            )
+            # The cuDNN path pads invalid slots with -1; the eager path never
+            # produces negatives, so the extra test is free for it.
+            valid = (cmp_topk >= 0) & (cmp_topk < causal_limit.unsqueeze(0))
+            cmp_topk = torch.where(valid, seqlen + cmp_topk, -1)
+            selected_indices.append(cmp_topk)
+        elif self.compress_ratio > 1:
+            selected_indices.append(
+                self.get_compress_topk_idxs(
+                    bsz=bsz, seqlen=seqlen, n_cmp=n_cmp, device=device
+                )
+            )
+        selected_indices = torch.cat(selected_indices, dim=-1)
+        return selected_indices
+
     def _forward_impl(
         self,
         q,
@@ -256,6 +336,7 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
         idx_k=None,
         idx_w=None,
         attention_masks=None,
+        out_rope=None,
     ) -> torch.Tensor:
         """Run DSV4 sparse attention over a folded token stream."""
         if attention_masks is not None:
@@ -293,47 +374,36 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
                 idx_w = idx_w.view(bsz, seqlen, idx_w.size(1))
 
         with spmd.no_typecheck():
-            selected_indices = [
-                self.get_window_topk_idxs(bsz=bsz, seqlen=seqlen, device=q.device)
-            ]
-            if self.compress_ratio == 4:
-                if idx_q is None or idx_k is None or idx_w is None:
-                    raise ValueError(
-                        "DSV4FlexInnerAttention requires idx_q, idx_k, "
-                        "and idx_w when compress_ratio=4"
-                    )
-                cmp_topk = Indexer.select(
-                    idx_q,
-                    idx_k,
-                    idx_w,
-                    seqlen=seqlen,
-                    ratio=self.compress_ratio,
-                    topk=self.index_topk,
-                )
-                if cmp_topk.ndim == 2:  # folded layout -> add the batch dim
-                    cmp_topk = cmp_topk.unsqueeze(0)
-                causal_limit = (
-                    torch.arange(1, seqlen + 1, device=q.device).unsqueeze(1)
-                    // self.compress_ratio
-                )
-                cmp_topk = torch.where(
-                    cmp_topk < causal_limit.unsqueeze(0), seqlen + cmp_topk, -1
-                )
-                selected_indices.append(cmp_topk)
-            elif self.compress_ratio > 1:
-                selected_indices.append(
-                    self.get_compress_topk_idxs(
-                        bsz=bsz, seqlen=seqlen, n_cmp=n_cmp, device=q.device
-                    )
-                )
-            selected_indices = torch.cat(selected_indices, dim=-1)
+            selected_indices = self.selected_kv_indices(
+                bsz=bsz,
+                seqlen=seqlen,
+                n_cmp=n_cmp,
+                idx_q=idx_q,
+                idx_k=idx_k,
+                idx_w=idx_w,
+                device=q.device,
+            )
 
-            block_mask = self._build_block_mask(
-                bsz, seqlen, kv_len, selected_indices, q.device
+            # The block mask exists only to drive a flex kernel. With both
+            # halves of the attention on cuDNN nothing reads it, and building
+            # it is a dense [B, n_q_blocks, n_kv_blocks] scatter per layer.
+            block_mask = (
+                None
+                if self.fused_dsa_forward
+                else self._build_block_mask(
+                    bsz, seqlen, kv_len, selected_indices, q.device
+                )
             )
 
             def apply_sink(out_THV, lse_TH):
                 return apply_attention_sink_rescale(out_THV, lse_TH, attn_sink)
+
+            if self.fused_dsa_backward:
+                return self._fused_dsa(
+                    q_in, kv, attn_sink, selected_indices, block_mask, bsz, kv_len,
+                    out_rope=out_rope,
+                )
+            assert out_rope is None, "output RoPE fusion needs fused_dsa_backward"
 
             return super().forward(
                 q_in,
@@ -343,6 +413,63 @@ class DSV4FlexInnerAttention(FlexInnerAttention):
                 scale=self.softmax_scale,
                 out_transform=apply_sink,
             )
+
+    def _fused_dsa(
+        self, q_in, kv, attn_sink, selected_indices, block_mask, bsz, kv_len, *, out_rope=None
+    ):
+        """cuDNN backward (and optionally forward) over the flat layout.
+
+        The kernel takes one KV stream and global indices, so a batched
+        ``[B, L, ...]`` input is flattened and each sequence's indices are
+        offset into its own slice -- which is exactly the isolation the
+        batched path already guarantees.
+        """
+
+        def flex_fwd(q_flat, kv_flat):
+            del q_flat, kv_flat  # the flex kernel wants the original layout
+            out, lse = None, None
+
+            def capture(out_THV, lse_TH):
+                nonlocal out, lse
+                out, lse = out_THV, lse_TH
+                return out_THV
+
+            super(DSV4FlexInnerAttention, self).forward(
+                q_in,
+                kv,
+                kv,
+                attention_masks=block_mask,
+                scale=self.softmax_scale,
+                out_transform=capture,
+            )
+            return out, lse
+
+        # [B, L, H, D] -> [B*L, H, D] and [B, N, H, D] -> [B*N, D]. All query
+        # heads share one KV stream, so head 0 is the whole stream and dropping
+        # the head axis is a view. Batched kv is [B, N, H, D] against
+        # [N, H, D] unbatched, so ndim tells the two layouts apart.
+        if q_in.ndim == 4:
+            q_flat = q_in.flatten(0, 1)
+            kv_flat = kv[..., 0, :].flatten(0, 1)
+        else:
+            q_flat = q_in
+            kv_flat = kv[:, 0, :]
+        kv_flat = kv_flat.contiguous()
+        assert kv_flat.shape[0] == bsz * kv_len, (
+            f"kv_flat has {kv_flat.shape[0]} rows, expected {bsz * kv_len}"
+        )
+        idx_flat = flatten_batched_indices(selected_indices, kv_len)
+        # Both kernels return the flat [B*L, H, V] stream, which is also what
+        # FlexInnerAttention.forward hands back, so no reshape is needed here.
+        return fused_dsa_attention(
+            q_flat,
+            kv_flat,
+            attn_sink,
+            idx_flat,
+            softmax_scale=self.softmax_scale,
+            flex_fwd=None if self.fused_dsa_forward else flex_fwd,
+            out_rope=out_rope,
+        )
 
     def _batch_shape(self, num_tokens: int) -> tuple[int, int]:
         """Split the per-rank token stream into ``(bsz, seq_len)``.
@@ -372,12 +499,14 @@ class SlidingWindowAttention(DSV4FlexInnerAttention):
         attn_sink,
         *,
         attention_masks=None,
+        out_rope=None,
     ) -> torch.Tensor:
         return self._forward_impl(
             q,
             swa_k,
             attn_sink,
             attention_masks=attention_masks,
+            out_rope=out_rope,
         )
 
 
@@ -394,6 +523,7 @@ class HeavilyCompressedAttention(DSV4FlexInnerAttention):
         attn_sink,
         *,
         attention_masks=None,
+        out_rope=None,
     ) -> torch.Tensor:
         return self._forward_impl(
             q,
@@ -401,6 +531,7 @@ class HeavilyCompressedAttention(DSV4FlexInnerAttention):
             attn_sink,
             cmp_k=cmp_k,
             attention_masks=attention_masks,
+            out_rope=out_rope,
         )
 
 
@@ -420,6 +551,7 @@ class CompressedSparseAttention(DSV4FlexInnerAttention):
         attn_sink,
         *,
         attention_masks=None,
+        out_rope=None,
     ) -> torch.Tensor:
         return self._forward_impl(
             q,
@@ -430,7 +562,37 @@ class CompressedSparseAttention(DSV4FlexInnerAttention):
             idx_k=idx_k,
             idx_w=idx_w,
             attention_masks=attention_masks,
+            out_rope=out_rope,
         )
+
+
+class _GroupedLowRankProj(torch.autograd.Function):
+    """``einsum("tgd,grd->tgr", o, w)`` as strided bmm with no permute copies.
+
+    Forward writes ``[T, G, R]`` directly through a transposed view; backward
+    does the same for ``d_o``. The weight gradient is a plain bmm.
+    """
+
+    @staticmethod
+    def forward(ctx, o, w):
+        ctx.save_for_backward(o, w)
+        t, g, _ = o.shape
+        r = w.shape[1]
+        out = torch.empty(t, g, r, device=o.device, dtype=o.dtype)
+        torch.bmm(o.transpose(0, 1), w.transpose(1, 2), out=out.transpose(0, 1))
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        o, w = ctx.saved_tensors
+        g3 = grad.transpose(0, 1)  # [G, T, R] view
+        d_o = d_w = None
+        if ctx.needs_input_grad[0]:
+            d_o = torch.empty_like(o)
+            torch.bmm(g3, w, out=d_o.transpose(0, 1))
+        if ctx.needs_input_grad[1]:
+            d_w = torch.bmm(g3.transpose(1, 2), o.transpose(0, 1))
+        return d_o, d_w
 
 
 class Attention(BaseAttention):
@@ -544,6 +706,10 @@ class Attention(BaseAttention):
             cmp_k = self.compressor_128(x, positions=positions)
 
         attn_sink_param = self.attn_sink.weight.squeeze(-1)
+        # With the DSA backward on cuDNN the sparse-attention Function applies
+        # the output inverse RoPE itself, in place on the output it owns.
+        fuse_out_rope = bool(getattr(self.inner_attention, "fused_dsa_backward", False))
+        out_rope = (rope_cache_ri.contiguous(), rd) if fuse_out_rope else None
         if self.compress_ratio == 4:
             o = self.inner_attention(
                 q,
@@ -554,6 +720,7 @@ class Attention(BaseAttention):
                 idx_w,
                 attn_sink_param,
                 attention_masks=attention_masks,
+                out_rope=out_rope,
             )
         elif self.compress_ratio > 1:
             o = self.inner_attention(
@@ -562,6 +729,7 @@ class Attention(BaseAttention):
                 cmp_k,
                 attn_sink_param,
                 attention_masks=attention_masks,
+                out_rope=out_rope,
             )
         else:
             o = self.inner_attention(
@@ -569,9 +737,11 @@ class Attention(BaseAttention):
                 kv,
                 attn_sink_param,
                 attention_masks=attention_masks,
+                out_rope=out_rope,
             )
 
-        o = _o_rope_inverse(o, rope_cache_ri, rd=rd)
+        if not fuse_out_rope:
+            o = _o_rope_inverse(o, rope_cache_ri, rd=rd)
 
         with spmd.local():
             n_local_heads = o.shape[1]
@@ -584,7 +754,13 @@ class Attention(BaseAttention):
                     wo_a,
                     {"dp": spmd.R, "cp": spmd.R, "tp": spmd.S(0)},
                 )
-        o = torch.einsum("tgd,grd->tgr", o, wo_a)
+        # Grouped low-rank projection without the einsum's permute copies: the
+        # einsum copied ``o`` ([T, G, D], 3.2 GiB at 8k/6x) into batch-major
+        # layout and copied its output back to token-major -- ~4.5 ms per
+        # layer-step of pure copies in the job 680 trace. Strided bmm reads
+        # ``o`` in place and writes straight into a token-major buffer
+        # (probe 848: 15.21 -> 11.75 ms fwd+bwd, bitwise identical).
+        o = _GroupedLowRankProj.apply(o, wo_a)
         with spmd.local():
             o = o.reshape(num_tokens, -1)
             _assert_spmd_attention_type(o, tp=spmd.S(1))
