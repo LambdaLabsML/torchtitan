@@ -6,6 +6,8 @@
 
 from dataclasses import dataclass
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -91,6 +93,30 @@ def _hc_head_math(x, hc_fn, hc_scale, hc_base, *, norm_eps, eps):
     return y.to(dtype)
 
 
+# --- Transformer Engine fused mHC (TORCHTITAN_TE_MHC=1) -----------------------
+# TE 2.19 ships the DeepSeek mHC Triton kernels (projection+RMS, scale,
+# log-space sinkhorn, aggregate, expand+combine) with autograd. They want the
+# stream axis innermost: x is (s, b, C, n). With the knob on, the decoder keeps
+# its residual stream as [T, D, hc_mult] (see model.py) and HcPre/HcPost call
+# TE; HcHead permutes back once per step. Column order of the projection
+# weight differs (TE flattens (C, n), torchtitan flattens (n, D)), so hc_fn is
+# re-laid-out per call (a 1.5 MB copy). Semantics: TE's post step is the
+# paper's residual mixing sum_j H_res[i, j] x_j; torchtitan's eager HcPost
+# reduces to (sum_j comb[i, j]) x_i (no mixing) -- see the ledger.
+_TE_MHC = os.environ.get("TORCHTITAN_TE_MHC", "0") == "1"
+
+
+def te_mhc_enabled() -> bool:
+    return _TE_MHC
+
+
+def _te_mhc():
+    import transformer_engine.pytorch  # noqa: F401
+    from transformer_engine.pytorch.triton import mhc as te_mhc
+
+    return te_mhc
+
+
 _hc_pre = leaf_compile(_hc_pre_math, group="hc")
 _hc_post = leaf_compile(_hc_post_math, group="hc")
 _hc_head = leaf_compile(_hc_head_math, group="hc")
@@ -169,6 +195,14 @@ class HcPre(Module):
             Tuple ``(y, post, comb)`` where ``y`` has shape ``[T, D]`` and
             ``post``/``comb`` are consumed by ``HcPost``.
         """
+        if _TE_MHC and x.is_cuda:
+            te = _te_mhc()
+            t, d, n = x.shape  # TE layout [T, D, n]
+            phi = self.hc_fn.view(-1, n, d).transpose(1, 2).reshape(-1, n * d)
+            out, h_post, h_res = te.mhc_generate_mix_and_aggregate(
+                x.view(t, 1, d, n), phi, self.hc_scale, self.hc_base.view(1, -1)
+            )
+            return out.view(t, d), h_post.view(t, n), h_res.view(t, n, n)
         return _hc_pre(
             x, self.hc_fn, self.hc_scale, self.hc_base,
             hc_mult=self.hc_mult,
@@ -200,6 +234,14 @@ class HcPost(Module):
         Returns:
             Hidden states of shape ``[T, hc_mult, D]``.
         """
+        if _TE_MHC and x.is_cuda:
+            te = _te_mhc()
+            t, d, n = residual.shape  # TE layout [T, D, n]
+            out = te.mhc_fused_expand_combine(
+                x.view(t, 1, d), None, post.view(t, 1, n),
+                residual.view(t, 1, d, n), comb.view(t, 1, n, n), n,
+            )
+            return out.view(t, d, n)
         return _hc_post(x, residual, post, comb)
 
 
@@ -233,6 +275,8 @@ class HcHead(Module):
         Returns:
             Hidden states of shape ``[T, D]``.
         """
+        if _TE_MHC and x.is_cuda:
+            x = x.transpose(1, 2).contiguous()  # [T, D, n] -> [T, n, D], once per step
         return _hc_head(
             x, self.hc_fn, self.hc_scale, self.hc_base,
             norm_eps=self.norm_eps, eps=self.eps,
