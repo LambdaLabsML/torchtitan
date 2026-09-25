@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -26,6 +27,19 @@ logger = logging.getLogger(__name__)
 
 IGNORE_INDEX = -100
 
+# QUACK_CE=1 routes the non-TP cross-entropy through QuacK's fused CuTe-DSL
+# kernel (Dao-AILab/quack, needs quack-kernels on PYTHONPATH -- staged in
+# /mnt/dgxc/pydeps-quack). bf16 logits stay bf16 end to end: the [T, V] fp32
+# materialization of `pred.float()` disappears (log-sum-exp is fp32 inside the
+# kernel; the returned loss is fp32, dlogits come back in the logits dtype,
+# written in place of the logits chunk, which nothing else reads).
+# Measured on GB300 at [73728, 129280]: fwd+bwd 10.0 ms vs 58.1 ms eager,
+# loss rel err 0.0, max dlogits err 2.9e-4 vs the fp32 reference (bf16
+# rounding). TP>1 keeps the loss-parallel path below. QUACK_CE_INPLACE=0
+# turns off the in-place backward if a debug session needs the logits kept.
+_QUACK_CE = os.environ.get("QUACK_CE", "0") == "1"
+_QUACK_CE_INPLACE = os.environ.get("QUACK_CE_INPLACE", "1") == "1"
+
 LossFunction: TypeAlias = Callable[..., torch.Tensor]
 
 
@@ -42,6 +56,17 @@ def cross_entropy_loss(
             labels,
             current_spmd_mesh().get_group("tp"),  # pyrefly: ignore[missing-attribute]
             global_vocab_size,
+        )
+
+    if _QUACK_CE and pred.is_cuda:
+        from quack import cross_entropy as quack_cross_entropy
+
+        return quack_cross_entropy(
+            pred,
+            labels,
+            ignore_index=IGNORE_INDEX,
+            reduction="sum",
+            inplace_backward=_QUACK_CE_INPLACE,
         )
 
     return torch.nn.functional.cross_entropy(
