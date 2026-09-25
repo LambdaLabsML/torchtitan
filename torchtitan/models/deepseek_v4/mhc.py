@@ -6,6 +6,8 @@
 
 from dataclasses import dataclass
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -91,6 +93,30 @@ def _hc_head_math(x, hc_fn, hc_scale, hc_base, *, norm_eps, eps):
     return y.to(dtype)
 
 
+# --- Transformer Engine fused mHC (TORCHTITAN_TE_MHC=1) -----------------------
+# TE 2.19 ships the DeepSeek mHC Triton kernels (projection+RMS, scale,
+# log-space sinkhorn, aggregate, expand+combine) with autograd. They want the
+# stream axis innermost: x is (s, b, C, n). With the knob on, the decoder keeps
+# its residual stream as [T, D, hc_mult] (see model.py) and HcPre/HcPost call
+# TE; HcHead permutes back once per step. Column order of the projection
+# weight differs (TE flattens (C, n), torchtitan flattens (n, D)), so hc_fn is
+# re-laid-out per call (a 1.5 MB copy). Semantics: TE's post step is the
+# paper's residual mixing sum_j H_res[i, j] x_j; torchtitan's eager HcPost
+# reduces to (sum_j comb[i, j]) x_i (no mixing) -- see the ledger.
+_TE_MHC = os.environ.get("TORCHTITAN_TE_MHC", "0") == "1"
+
+
+def te_mhc_enabled() -> bool:
+    return _TE_MHC
+
+
+def _te_mhc():
+    import transformer_engine.pytorch  # noqa: F401
+    from transformer_engine.pytorch.triton import mhc as te_mhc
+
+    return te_mhc
+
+
 _hc_pre = leaf_compile(_hc_pre_math, group="hc")
 _hc_post = leaf_compile(_hc_post_math, group="hc")
 _hc_head = leaf_compile(_hc_head_math, group="hc")
@@ -132,6 +158,79 @@ class HcSplitSinkhorn(Module):
         )
 
 
+# TORCHTITAN_MHC_GRAD_CHAIN=1: fuse the residual stream's gradient accumulation.
+# The residual x feeds HcPre (TE: projection + aggregate, two internal grad_x
+# contributions) and HcPost (as the residual). Autograd sums all three with two
+# full [T, D, n] passes per half-block (~1.75% of the step). TE's kernels can
+# instead read-modify-write a provided buffer. This wrapper makes x's only
+# consumer the wrapper itself: it returns a pass-through view of x that HcPost
+# uses as the residual, so HcPost's residual gradient arrives here as the
+# pass-through's gradient and becomes the accumulate buffer for the inner TE
+# backward. bf16 buffer, fp32 math in-kernel (patched side-installed TE).
+_TE_GRAD_CHAIN = os.environ.get("TORCHTITAN_MHC_GRAD_CHAIN", "0") == "1"
+
+
+class _GradHolder:
+    __slots__ = ("tensor",)
+
+    def __init__(self):
+        self.tensor = None
+
+
+class _HcPreChain(torch.autograd.Function):
+    """Forward: TE's mHC pre-mix without a graph, plus a pass-through view of x.
+    Only the inputs are saved (through save_for_backward, so FullAC's saved-
+    tensor hooks free them in the forward and restore them at recompute --
+    keeping the inner graph in ctx pinned every block's residual and OOMed,
+    job 1124). Backward: rebuild TE's small forward graph, set the holder to
+    the pass-through gradient (HcPost's residual gradient) and replay TE's
+    backward, whose kernels accumulate into it. One extra mHC forward per
+    half-block (~0.5 ms) against two fewer full [T, D, n] passes."""
+
+    @staticmethod
+    def forward(ctx, x, phi, hc_scale, hc_base_row):
+        te = _te_mhc()
+        t, d, n = x.shape
+        out, h_post, h_res = te.mhc_generate_mix_and_aggregate(
+            x.view(t, 1, d, n), phi, hc_scale, hc_base_row
+        )
+        ctx.save_for_backward(x, phi, hc_scale, hc_base_row)
+        return out, h_post, h_res, x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, g_out, g_post, g_res, g_xpass):
+        te = _te_mhc()
+        x, phi, hc_scale, hc_base_row = ctx.saved_tensors
+        t, d, n = x.shape
+        holder = _GradHolder()
+        with torch.enable_grad():
+            x_d = x.detach().requires_grad_(True)
+            phi_d = phi.detach().requires_grad_(ctx.needs_input_grad[1])
+            scale_d = hc_scale.detach().requires_grad_(ctx.needs_input_grad[2])
+            base_d = hc_base_row.detach().requires_grad_(ctx.needs_input_grad[3])
+            out, h_post, h_res = te.mhc_generate_mix_and_aggregate(
+                x_d.view(t, 1, d, n), phi_d, scale_d, base_d, fused_grad_x_acc_buffer=holder
+            )
+            if g_xpass is None:
+                g_xpass = torch.zeros_like(x)
+            elif not g_xpass.is_contiguous():
+                g_xpass = g_xpass.contiguous()
+            holder.tensor = g_xpass  # HcPost's residual gradient; TE accumulates into it
+            outs, grads = [], []
+            for o, g in ((out, g_out), (h_post, g_post), (h_res, g_res)):
+                if g is not None:
+                    outs.append(o)
+                    grads.append(g.reshape(o.shape))
+            leaves = [t_ for t_ in (x_d, phi_d, scale_d, base_d) if t_.requires_grad]
+            torch.autograd.backward(outs, grads, inputs=leaves)
+        return (
+            holder.tensor,
+            phi_d.grad if ctx.needs_input_grad[1] else None,
+            scale_d.grad if ctx.needs_input_grad[2] else None,
+            base_d.grad if ctx.needs_input_grad[3] else None,
+        )
+
+
 class HcPre(Module):
     """Reduce HC branches before attention or FFN computation."""
 
@@ -169,6 +268,17 @@ class HcPre(Module):
             Tuple ``(y, post, comb)`` where ``y`` has shape ``[T, D]`` and
             ``post``/``comb`` are consumed by ``HcPost``.
         """
+        if _TE_MHC and x.is_cuda:
+            te = _te_mhc()
+            t, d, n = x.shape  # TE layout [T, D, n]
+            phi = self.hc_fn.view(-1, n, d).transpose(1, 2).reshape(-1, n * d)
+            if _TE_GRAD_CHAIN:
+                out, h_post, h_res, x_pass = _HcPreChain.apply(x, phi, self.hc_scale, self.hc_base.view(1, -1))
+                return out.view(t, d), h_post.view(t, n), h_res.view(t, n, n), x_pass
+            out, h_post, h_res = te.mhc_generate_mix_and_aggregate(
+                x.view(t, 1, d, n), phi, self.hc_scale, self.hc_base.view(1, -1)
+            )
+            return out.view(t, d), h_post.view(t, n), h_res.view(t, n, n)
         return _hc_pre(
             x, self.hc_fn, self.hc_scale, self.hc_base,
             hc_mult=self.hc_mult,
@@ -200,6 +310,14 @@ class HcPost(Module):
         Returns:
             Hidden states of shape ``[T, hc_mult, D]``.
         """
+        if _TE_MHC and x.is_cuda:
+            te = _te_mhc()
+            t, d, n = residual.shape  # TE layout [T, D, n]
+            out = te.mhc_fused_expand_combine(
+                x.view(t, 1, d), None, post.view(t, 1, n),
+                residual.view(t, 1, d, n), comb.view(t, 1, n, n), n,
+            )
+            return out.view(t, d, n)
         return _hc_post(x, residual, post, comb)
 
 
@@ -233,6 +351,8 @@ class HcHead(Module):
         Returns:
             Hidden states of shape ``[T, D]``.
         """
+        if _TE_MHC and x.is_cuda:
+            x = x.transpose(1, 2).contiguous()  # [T, D, n] -> [T, n, D], once per step
         return _hc_head(
             x, self.hc_fn, self.hc_scale, self.hc_base,
             norm_eps=self.norm_eps, eps=self.eps,
