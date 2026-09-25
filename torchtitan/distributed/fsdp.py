@@ -116,7 +116,7 @@ def get_fsdp_reshard_after_forward_policy(
     """Resolve fsdp_reshard_after_forward policy string to a boolean.
 
     Args:
-        reshard_after_forward_policy: One of "always", "never", or "default".
+        reshard_after_forward_policy: One of "always", "never", "dense-never", or "default".
         pp_enabled: Whether pipeline parallelism is enabled.
 
     Returns:
@@ -125,7 +125,12 @@ def get_fsdp_reshard_after_forward_policy(
     match reshard_after_forward_policy:
         case "always":
             return True
-        case "never":
+        case "never" | "dense-never":
+            # "dense-never" keeps the DENSE parameters unsharded between forward
+            # and backward (skipping their backward all-gather) while the
+            # routed experts still reshard. Under EP the experts are hundreds
+            # of GiB unsharded per rank -- 258 GiB for dsv4_flash at EP=2 --
+            # so a plain "never" cannot run; the dense set is 13.6 GiB.
             return False
         case "default":
             # For PP, by default do not reshard after forward to avoid per-microbatch
@@ -362,12 +367,41 @@ def apply_fsdp_to_decoder(
                             placement=Shard(0), mesh_info=_dp_mesh_info
                         )
 
-                fully_shard(
-                    transformer_block,
-                    **fsdp_config,
-                    reshard_after_forward=reshard_after_forward,
-                    shard_placement_fn=_shard_placement_fn,
-                )
+                if reshard_after_forward_policy == "dense-never":
+                    logger.info(
+                        "fsdp dense-never: layer %s experts sharded separately "
+                        "(reshard=True), dense params kept unsharded (reshard=False)",
+                        layer_id,
+                    )
+                    # Experts as their own FSDP unit on the sparse mesh, still
+                    # resharding after forward; the enclosing block then owns
+                    # only the dense parameters and keeps them unsharded.
+                    expert_config: dict[str, Any] = {
+                        "mesh": edp_mesh,
+                        "mp_policy": fsdp_config["mp_policy"],
+                    }
+                    if edp_mesh_dims is not None:
+                        expert_config["dp_mesh_dims"] = edp_mesh_dims
+                    if "offload_policy" in fsdp_config:
+                        expert_config["offload_policy"] = fsdp_config["offload_policy"]
+                    fully_shard(
+                        experts,
+                        **expert_config,
+                        reshard_after_forward=True,
+                        shard_placement_fn=lambda param, _p=expert_shard_placement: _p,
+                    )
+                    fully_shard(
+                        transformer_block,
+                        **fsdp_config,
+                        reshard_after_forward=False,
+                    )
+                else:
+                    fully_shard(
+                        transformer_block,
+                        **fsdp_config,
+                        reshard_after_forward=reshard_after_forward,
+                        shard_placement_fn=_shard_placement_fn,
+                    )
         else:
             fully_shard(
                 transformer_block,
