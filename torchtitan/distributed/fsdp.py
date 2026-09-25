@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 import logging
 from typing import Any, TYPE_CHECKING
 
@@ -116,7 +117,7 @@ def get_fsdp_reshard_after_forward_policy(
     """Resolve fsdp_reshard_after_forward policy string to a boolean.
 
     Args:
-        reshard_after_forward_policy: One of "always", "never", or "default".
+        reshard_after_forward_policy: One of "always", "never", "dense-never", or "default".
         pp_enabled: Whether pipeline parallelism is enabled.
 
     Returns:
@@ -125,7 +126,12 @@ def get_fsdp_reshard_after_forward_policy(
     match reshard_after_forward_policy:
         case "always":
             return True
-        case "never":
+        case "never" | "dense-never":
+            # "dense-never" keeps the DENSE parameters unsharded between forward
+            # and backward (skipping their backward all-gather) while the
+            # routed experts still reshard. Under EP the experts are hundreds
+            # of GiB unsharded per rank -- 258 GiB for dsv4_flash at EP=2 --
+            # so a plain "never" cannot run; the dense set is 13.6 GiB.
             return False
         case "default":
             # For PP, by default do not reshard after forward to avoid per-microbatch
@@ -362,12 +368,41 @@ def apply_fsdp_to_decoder(
                             placement=Shard(0), mesh_info=_dp_mesh_info
                         )
 
-                fully_shard(
-                    transformer_block,
-                    **fsdp_config,
-                    reshard_after_forward=reshard_after_forward,
-                    shard_placement_fn=_shard_placement_fn,
-                )
+                if reshard_after_forward_policy == "dense-never":
+                    logger.info(
+                        "fsdp dense-never: layer %s experts sharded separately "
+                        "(reshard=True), dense params kept unsharded (reshard=False)",
+                        layer_id,
+                    )
+                    # Experts as their own FSDP unit on the sparse mesh, still
+                    # resharding after forward; the enclosing block then owns
+                    # only the dense parameters and keeps them unsharded.
+                    expert_config: dict[str, Any] = {
+                        "mesh": edp_mesh,
+                        "mp_policy": fsdp_config["mp_policy"],
+                    }
+                    if edp_mesh_dims is not None:
+                        expert_config["dp_mesh_dims"] = edp_mesh_dims
+                    if "offload_policy" in fsdp_config:
+                        expert_config["offload_policy"] = fsdp_config["offload_policy"]
+                    fully_shard(
+                        experts,
+                        **expert_config,
+                        reshard_after_forward=True,
+                        shard_placement_fn=lambda param, _p=expert_shard_placement: _p,
+                    )
+                    fully_shard(
+                        transformer_block,
+                        **fsdp_config,
+                        reshard_after_forward=False,
+                    )
+                else:
+                    fully_shard(
+                        transformer_block,
+                        **fsdp_config,
+                        reshard_after_forward=reshard_after_forward,
+                        shard_placement_fn=_shard_placement_fn,
+                    )
         else:
             fully_shard(
                 transformer_block,
@@ -395,39 +430,39 @@ def apply_fsdp_to_decoder(
     if ep_degree == 1:
         return
 
-    # set up explicit prefetching when EP is enabled for forward
+    # set up explicit prefetching when EP is enabled for forward.
+    # FSDP_PREFETCH_DEPTH (default 1): how many blocks ahead each block's
+    # all-gather is issued. At depth 1 the 7x profile still shows 2.7% of the
+    # step as exposed all-gather; each extra level costs one more block of
+    # gathered parameters resident (~2 GiB here).
+    depth = max(1, int(os.environ.get("FSDP_PREFETCH_DEPTH", "1")))
     transformer_blocks = list(model.layers.values())
-    next_transformer_blocks = transformer_blocks[1:] + [None]
+    n_blocks = len(transformer_blocks)
 
-    if model.tok_embeddings is not None and len(model.layers) > 0:
-        model.tok_embeddings.set_modules_to_forward_prefetch([transformer_blocks[0]])
+    if model.tok_embeddings is not None and n_blocks > 0:
+        model.tok_embeddings.set_modules_to_forward_prefetch(transformer_blocks[:depth])
 
-    for transformer_block, next_transformer_block in zip(
-        transformer_blocks, next_transformer_blocks
-    ):
-        if next_transformer_block is not None:
+    for i, transformer_block in enumerate(transformer_blocks):
+        targets = transformer_blocks[i + 1 : i + 1 + depth]
+        if len(targets) < depth and model.norm is not None and model.lm_head is not None:
+            targets = targets + [model.norm, model.lm_head]
+        if targets:
             # pyrefly: ignore [not-callable]
-            transformer_block.set_modules_to_forward_prefetch([next_transformer_block])
-        elif model.norm is not None and model.lm_head is not None:
-            # pyrefly: ignore [not-callable]
-            transformer_block.set_modules_to_forward_prefetch(
-                [model.norm, model.lm_head]
-            )
+            transformer_block.set_modules_to_forward_prefetch(targets)
+    if depth > 1:
+        logger.info(f"FSDP explicit prefetch depth {depth} (forward and backward)")
 
     # set up explicit prefetching when EP is enabled for backward
     # pyrefly: ignore [no-matching-overload]
     reversed_transformer_blocks = list(reversed(model.layers.values()))
-    prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
 
-    if model.norm is not None and model.lm_head is not None and len(model.layers) > 0:
-        model.lm_head.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
+    if model.norm is not None and model.lm_head is not None and n_blocks > 0:
+        model.lm_head.set_modules_to_backward_prefetch(reversed_transformer_blocks[:depth])
 
-    for transformer_block, prev_transformer_block in zip(
-        reversed_transformer_blocks, prev_transformer_blocks
-    ):
-        if prev_transformer_block is not None:
+    for i, transformer_block in enumerate(reversed_transformer_blocks):
+        targets = reversed_transformer_blocks[i + 1 : i + 1 + depth]
+        if len(targets) < depth and model.tok_embeddings is not None:
+            targets = targets + [model.tok_embeddings]
+        if targets:
             # pyrefly: ignore [missing-attribute]
-            transformer_block.set_modules_to_backward_prefetch([prev_transformer_block])
-        elif model.tok_embeddings is not None:
-            # pyrefly: ignore [missing-attribute]
-            transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])
+            transformer_block.set_modules_to_backward_prefetch(targets)
