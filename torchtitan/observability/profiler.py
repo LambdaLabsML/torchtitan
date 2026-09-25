@@ -369,6 +369,7 @@ class Profiler(Configurable):
             ),
             on_trace_ready=trace_handler,
             record_shapes=True,
+            with_stack=os.environ.get("PROFILER_WITH_STACK", "0") == "1",  # python stacks per op (debug attribution)
         )
         torch_profiler.__enter__()
         torch_profiler.step_num = global_step

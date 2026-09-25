@@ -7,6 +7,8 @@
 from dataclasses import dataclass
 from functools import cache
 
+import logging
+import os
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -26,6 +28,13 @@ def _hadamard(dim: int, dtype: torch.dtype, device: torch.device) -> torch.Tenso
     while h.shape[0] < dim:
         h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
     return h
+
+
+from torchtitan.models.common.linear import _RouterGateLinearFunction
+
+_BF16_GEMM = os.environ.get("COMPRESSOR_BF16_GEMM", "0") == "1"
+_bf16_logged = False
+logger = logging.getLogger(__name__)
 
 
 class Compressor(Module):
@@ -123,9 +132,23 @@ class Compressor(Module):
         rd = self.rope_head_dim
         ratio = self.compress_ratio
         dtype = x.dtype
-        with torch.autocast(device_type=x.device.type, dtype=torch.float32):
-            kv = self.wkv(x)
-            score = self.wgate(x)
+        if _BF16_GEMM and x.is_cuda and x.dtype is torch.bfloat16 and self.wkv.weight.dtype is torch.bfloat16 and self.wkv.bias is None and self.wgate.bias is None:
+            # COMPRESSOR_BF16_GEMM=1: the fp32 autocast below casts x [T, D] and
+            # both weights up to fp32 on every call (fwd + FullAC recompute).
+            # bf16 values are exact in TF32, so a bf16 tensor-core GEMM with
+            # fp32 accumulation/output computes the same products; only the
+            # accumulation order differs. Same Function the router gate uses.
+            global _bf16_logged
+            if not _bf16_logged:
+                _bf16_logged = True
+                logger.info("Compressor: bf16-in/fp32-out GEMMs active (COMPRESSOR_BF16_GEMM=1)")
+            x2 = x.reshape(-1, x.shape[-1])
+            kv = _RouterGateLinearFunction.apply(x2, self.wkv.weight).reshape(*x.shape[:-1], -1)
+            score = _RouterGateLinearFunction.apply(x2, self.wgate.weight).reshape(*x.shape[:-1], -1)
+        else:
+            with torch.autocast(device_type=x.device.type, dtype=torch.float32):
+                kv = self.wkv(x)
+                score = self.wgate(x)
         if seqlen % ratio != 0:
             raise ValueError(
                 f"seqlen ({seqlen}) must be divisible by compress_ratio ({ratio})"
@@ -195,9 +218,23 @@ class Indexer(Module):
         rd = self.rope_head_dim
         q = self.wq_b(qr)
         q = q.view(seqlen, self.num_index_heads, self.head_dim)
-        q_nope, q_rope = torch.split(q, [self.head_dim - rd, rd], dim=-1)
-        q_rope = self.rope(q_rope, positions=positions)
-        q = torch.cat([q_nope, q_rope], dim=-1)
+        if q.is_cuda and q.stride(-1) == 1 and rd & (rd - 1) == 0:
+            # The indexer runs on detached inputs with its auxiliary loss
+            # dropped (see Attention.forward), so no autograd is needed here:
+            # rotate the rope tail in place with the fused Triton kernel
+            # instead of split -> complex rope -> cat, which materialised the
+            # [T, H_idx, 128] tensor three times (~250 ms/step in the job 847
+            # profile: aten::cat, copy_, mul on [49152, 64, 64]).
+            from torchtitan.models.deepseek_v4.fused_rope import rotate_tail_
+
+            cache_ri = torch.view_as_real(
+                self.rope._reshape_cache(q[..., -rd:], positions)
+            )
+            q = rotate_tail_(q, cache_ri, rd=rd, inverse=False)
+        else:
+            q_nope, q_rope = torch.split(q, [self.head_dim - rd, rd], dim=-1)
+            q_rope = self.rope(q_rope, positions=positions)
+            q = torch.cat([q_nope, q_rope], dim=-1)
         q = self._rotate_activation(q)
         k = self.compressor(x, positions=positions)
         k = self._rotate_activation(k)
@@ -243,8 +280,19 @@ class Indexer(Module):
         )
         if batched:
             compress_causal_mask = compress_causal_mask.unsqueeze(0)
-        index_score = index_score + torch.where(
-            compress_causal_mask, torch.finfo(idx_q.dtype).min, 0
+        index_score = index_score.masked_fill(
+            compress_causal_mask, torch.finfo(index_score.dtype).min
         )
-        _, topk_indices = index_score.topk(min(topk, seqlen // ratio), dim=-1)
-        return topk_indices
+        # Deterministic selection. bf16 index scores are quantised (~0.1 apart
+        # near their top), so the k-th boundary is frequently a tie, and
+        # torch.topk's order among tied values is arbitrary -- and on the code
+        # path taken for wide fp32 rows, not even stable call to call. That
+        # made the FORWARD non-deterministic: the same inputs selected
+        # different keys on a re-run, which breaks the activation-checkpoint
+        # recompute (the MoE routed-token counts then differ) and makes any
+        # A/B comparison of two backward kernels meaningless. A stable
+        # descending sort breaks ties toward the lower key index; where there
+        # is no boundary tie the selection is identical to topk's.
+        k = min(topk, seqlen // ratio)
+        order = torch.sort(index_score, dim=-1, descending=True, stable=True).indices
+        return order[..., :k]
