@@ -19,7 +19,7 @@ from torchtitan.models.utils import (
 )
 from torchtitan.protocols.module import ModuleList
 
-from .mhc import HcHead, HcPost, HcPre
+from .mhc import HcHead, HcPost, HcPre, te_mhc_enabled
 
 if TYPE_CHECKING:
     from .attention import Attention
@@ -248,7 +248,13 @@ class DeepSeekV4Model(Decoder):
 
         input_ids_T = tokens.detach().long()
         h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
-        h = h.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        if te_mhc_enabled():
+            # TE fused mHC keeps the residual stream as [T, D, hc_mult].
+            if len(self.mtp_layers) > 0:
+                raise ValueError("TORCHTITAN_TE_MHC=1 does not support MTP layers yet")
+            h = h.unsqueeze(-1).expand(-1, -1, self.hc_mult).contiguous()
+        else:
+            h = h.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
         for i in range(self.n_main_layers):
             layer = self.layers[str(i)]

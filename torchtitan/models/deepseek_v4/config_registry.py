@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
@@ -20,7 +21,6 @@ from torchtitan.trainer import Trainer
 
 from . import model_registry
 from .mtp import MTPLoss
-
 
 def deepseek_v4_debugmodel(
     seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
@@ -66,7 +66,6 @@ def deepseek_v4_debugmodel(
         ),
     )
 
-
 def deepseek_v4_mtp_debugmodel(
     seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
 ) -> Trainer.Config:
@@ -108,7 +107,6 @@ def deepseek_v4_mtp_debugmodel(
             interval=100,
         ),
     )
-
 
 def deepseek_v4_flash(seq_len: int | None = None) -> Trainer.Config:
     model_spec = model_registry("deepseek_v4_flash", seq_len=seq_len)
@@ -152,7 +150,6 @@ def deepseek_v4_flash(seq_len: int | None = None) -> Trainer.Config:
         ),
     )
 
-
 def deepseek_v4_pro(seq_len: int | None = None) -> Trainer.Config:
     model_spec = model_registry("deepseek_v4_pro", seq_len=seq_len)
     return Trainer.Config(
@@ -195,7 +192,6 @@ def deepseek_v4_pro(seq_len: int | None = None) -> Trainer.Config:
         ),
     )
 
-
 # GB300 (sm_103) requires these FlexAttention tiles at head_dim=512. Without
 # them the first forward dies with "No valid triton configs ... Required:
 # 294912, Hardware limit: 232448", and without the backward tiles specifically
@@ -208,12 +204,18 @@ _GB300_FLEX_KERNEL_OPTIONS = {
     "BLOCK_N": 32,
     "num_stages": 1,
     "num_warps": 4,
+    # All 16, not the 16/32/32/16 pinned when this workaround was first
+    # written. Letting Inductor autotune the backward freely (job 545) picked
+    # 16 across the board and ran 11.6% faster end to end -- 181.53 vs 162.62
+    # TFLOP/s -- at identical memory. Smaller tiles mean less shared memory
+    # per block, so more blocks stay resident; at head_dim=512 occupancy
+    # matters more than tile size. The original 16/32/32/16 was chosen to
+    # stop a launch failure, never benchmarked against alternatives.
     "BLOCK_M1": 16,
-    "BLOCK_N1": 32,
-    "BLOCK_M2": 32,
+    "BLOCK_N1": 16,
+    "BLOCK_M2": 16,
     "BLOCK_N2": 16,
 }
-
 
 def _pin_gb300_flex_tiles(config: Trainer.Config, block_size: int = 32) -> None:
     """Pin the flex tiles and sparse block size on every flex layer."""
@@ -224,7 +226,10 @@ def _pin_gb300_flex_tiles(config: Trainer.Config, block_size: int = 32) -> None:
         if isinstance(inner, FlexInnerAttention.Config):
             inner.kernel_options = dict(_GB300_FLEX_KERNEL_OPTIONS)
             inner.block_size = block_size
-
+            # With the tiles pinned, autotune can only re-benchmark the pin
+            # against variants that do not fit: throughput-neutral and ~228 s
+            # of startup per distinct shape.
+            inner.max_autotune = False
 
 def deepseek_v4_flash_8k_gb300(seq_len: int | None = 8192) -> Trainer.Config:
     """DeepSeek-V4 flash at seq_len 8192 on 64x GB300 (16 nodes x 4 GPUs).
@@ -232,6 +237,15 @@ def deepseek_v4_flash_8k_gb300(seq_len: int | None = 8192) -> Trainer.Config:
     The tuned recipe behind the leaf-compile measurements in this branch.
     Levers, each measured against the one before it:
 
+    - ``optimizer.implementation = "fused_opt_states_bf16"`` -- fused AdamW
+      with bf16 moment buffers, halving optimizer state again on top of the
+      bf16 training dtype.
+    - ``training.dtype = "bfloat16"`` -- full bf16 training: parameters,
+      gradients and optimizer states, with no fp32 master copy. This is the
+      lever that makes the model fit at all; torchtitan's ``float32`` default
+      costs ~80 GiB per rank here (measured: 178 GiB peak with it, 260 GiB
+      without, which on a 277 GiB card means allocator pressure and ~4% lost
+      throughput).
     - ``expert_parallel_degree=4`` -- one node's NVLink group per expert
       group; the stock 64 scored 18.29 TFLOP/s against 21.2 here.
     - ``block_size=32`` on the DSA block mask (+15.8%), plus the GB300 tile
@@ -240,13 +254,13 @@ def deepseek_v4_flash_8k_gb300(seq_len: int | None = 8192) -> Trainer.Config:
     - ``mixed_precision_reduce = bfloat16`` (+3.7%).
     - the leaf compiles in this branch, worth +34% on top.
 
-    MoE dispatch: the measurements behind this branch used
-    ``moe_comm_backend="minimal_async_ep"`` (+4.9% over standard all-to-all,
-    and +15% once the leaf compiles made compute cheaper), but that dispatcher
-    was deprecated upstream in #4627 and is no longer in the tree. Of what
-    remains, ``deepep`` measured 7.4% above ``standard`` on this hardware and
-    needs a source build (DeepEP v2, arch 10.3a); ``standard`` is the default
-    here because it needs nothing.
+    MoE dispatch: ``minimal_async_ep``, worth +4.9% over the standard
+    all-to-all on the pre-compile recipe and ~+15% once the leaf compiles made
+    compute cheaper. Upstream deprecated that dispatcher in #4627 as
+    unmaintained; this fork restores it because nothing available replaces it
+    on this hardware (DeepEP measured 7.4% above standard and needs a source
+    build; HybridEP 2.9% below MinimalAsyncEP). It also forces CUDA graphs
+    off, since its dispatch has a host sync.
 
     Run with ``TORCHTITAN_LEAF_COMPILE=all`` (the default) and, for a numerics
     reference, ``TORCHTITAN_LEAF_COMPILE=0``.
@@ -254,19 +268,25 @@ def deepseek_v4_flash_8k_gb300(seq_len: int | None = 8192) -> Trainer.Config:
     from torchtitan.distributed.activation_checkpoint import FullAC
 
     config = deepseek_v4_flash(seq_len)
-    config.model_spec = model_registry("deepseek_v4_flash", seq_len=seq_len)
+    config.model_spec = model_registry(
+        "deepseek_v4_flash", seq_len=seq_len, moe_comm_backend="minimal_async_ep"
+    )
+    config.training.disable_cuda_graphs = True
     _pin_gb300_flex_tiles(config)
     config.parallelism = ParallelismConfig(
         data_parallel_shard_degree=-1,
         expert_parallel_degree=4,
     )
     config.activation_checkpoint = FullAC.Config()
+    optimizer = default_adamw(lr=8e-4)
+    optimizer.implementation = "fused_opt_states_bf16"
+    config.optimizer = optimizer
+    config.training.dtype = "bfloat16"
     config.training.mixed_precision_reduce = "bfloat16"
     config.training.num_tokens_per_microbatch_per_dp_rank = seq_len or 8192
     config.training.max_context_length = seq_len or 8192
     config.training.steps = 30
     return config
-
 
 def deepseek_v4_flash_8k_gb300_batched(
     microbatch: int = 4, seq_len: int | None = 8192
@@ -286,7 +306,6 @@ def deepseek_v4_flash_8k_gb300_batched(
     config = deepseek_v4_flash_8k_gb300(seq_len)
     config.training.num_tokens_per_microbatch_per_dp_rank = microbatch * (seq_len or 8192)
     return config
-
 
 def deepseek_v4_flash_8k_gb300_batched_stages2(
     microbatch: int = 6, seq_len: int | None = 8192
@@ -320,7 +339,6 @@ def deepseek_v4_flash_8k_gb300_batched_stages2(
             inner.kernel_options = opts
     return config
 
-
 def deepseek_v4_flash_8k_gb300_batched_stages2_profile(
     microbatch: int = 6, seq_len: int | None = 8192
 ) -> Trainer.Config:
@@ -336,3 +354,677 @@ def deepseek_v4_flash_8k_gb300_batched_stages2_profile(
     config.profiler.profiler_warmup = 3
     config.profiler.profiler_active = 2
     return config
+
+def deepseek_v4_flash_8k_gb300_free_bwd_tiles(
+    microbatch: int = 4, seq_len: int | None = 8192, autotune: bool = True
+) -> Trainer.Config:
+    """The GB300 recipe with the BACKWARD flex tiles unpinned.
+
+    ``BLOCK_M1/N1/M2/N2`` were pinned because at head_dim=512 the backward
+    otherwise died with "CUDA error: unspecified launch failure", and the pin
+    also caps those tiles at ``block_size`` (32), which is why the backward
+    kernel has been the single largest cost in every profile (40%+ of kernel
+    time). If a newer Inductor can pick valid backward tiles on its own, they
+    may be larger than 32 and the backward may get cheaper. Autotune defaults
+    back ON here, since with nothing pinned Inductor has to search for a
+    configuration that fits in 232,448 B of shared memory.
+
+    The forward tiles stay pinned: those were needed for the forward to
+    compile at all.
+    """
+    from torchtitan.models.common.attention import FlexInnerAttention
+
+    config = deepseek_v4_flash_8k_gb300_batched(microbatch, seq_len)
+    for layer in config.model_spec.model.layers:
+        inner = getattr(getattr(layer, "attention", None), "inner_attention", None)
+        if isinstance(inner, FlexInnerAttention.Config):
+            inner.kernel_options = {
+                k: v
+                for k, v in _GB300_FLEX_KERNEL_OPTIONS.items()
+                if not k.startswith(("BLOCK_M1", "BLOCK_N1", "BLOCK_M2", "BLOCK_N2"))
+            }
+            inner.max_autotune = autotune
+    return config
+
+def deepseek_v4_flash_8k_gb300_fp32_params(
+    microbatch: int = 4, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """fp32 parameters with bf16 optimizer states -- the configuration
+    ``fused_opt_states_bf16`` is actually for.
+
+    On top of ``training.dtype="bfloat16"`` the flag is a no-op: full bf16
+    training already puts parameters, gradients AND optimizer states in bf16,
+    so there is nothing left for it to halve (measured: 192.71 GiB either
+    way, 162.62 vs 162.68 TFLOP/s). Its real use is the other trade -- keep
+    fp32 master weights for convergence safety and pay for them with bf16
+    moments instead of fp32 ones. This config measures what that costs.
+    """
+    config = deepseek_v4_flash_8k_gb300_batched(microbatch, seq_len)
+    config.training.dtype = "float32"
+    return config
+
+def deepseek_v4_flash_8k_gb300_fastdata(
+    microbatch: int = 4, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The GB300 recipe with the input pipeline widened.
+
+    This tree uses Grain, not the PyTorch DataLoader, so the familiar
+    ``num_workers`` / ``prefetch_factor`` / ``persistent_workers`` /
+    ``pin_memory`` knobs do not exist. The equivalents are:
+
+    - ``read_options.num_threads`` (default 16) -- Grain's reader threads,
+      the analogue of ``num_workers``;
+    - ``read_options.prefetch_buffer_size`` (default 500) -- records read
+      ahead, the analogue of ``prefetch_factor``;
+    - ``num_prefetch_batches`` (default 2) -- assembled batches held ready.
+
+    Grain's workers are persistent and its output is already pinned, so those
+    two flags have no counterpart to set. ``resize_fn`` / ``max_patches`` are
+    vision knobs and do not apply to a text model.
+
+    Expectation: little or nothing. The 4x profile has the GPU idle 1.2% of
+    the step, which bounds anything the input pipeline can win -- a starved
+    loader would show up as idle gaps. Measured here so the question is
+    settled rather than assumed.
+    """
+    config = deepseek_v4_flash_8k_gb300_batched(microbatch, seq_len)
+    import grain
+
+    config.dataloader.read_options = grain.ReadOptions(
+        num_threads=32, prefetch_buffer_size=2000
+    )
+    config.dataloader.num_prefetch_batches = 8
+    return config
+
+def deepseek_v4_flash_8k_gb300_sac(
+    microbatch: int = 1, ep: int = 2, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The GB300 recipe with per-op selective AC instead of FullAC.
+
+    FullAC recomputes the whole block, so every kernel in the forward runs
+    twice. SelectiveAC keeps the expensive outputs (matmuls, attention,
+    comms) and recomputes only the cheap elementwise work, trading memory for
+    that second forward. The trade has to be paid for out of the microbatch
+    or the parallelism, which is what this sweep varies.
+
+    Prior evidence, all superseded but worth stating: on the pre-batched
+    recipe at 1x, stock SelectiveAC measured 96.96 TFLOP/s against FullAC's
+    99.50 and cost +118 GiB, i.e. it lost on both counts. Two things have
+    changed since -- the backward is ~12% cheaper (retuned flex tiles), which
+    raises the relative cost of the recomputed forward, and full bf16
+    training freed ~67 GiB of headroom to spend.
+
+    Requires the out-of-place relu in ``Indexer.select``; with the in-place
+    version every SAC run died on "Tensor cached during selective activation
+    checkpoint has been mutated".
+    """
+    from torchtitan.distributed.activation_checkpoint import SelectiveAC
+
+    config = deepseek_v4_flash_8k_gb300_batched(microbatch, seq_len)
+    config.parallelism.expert_parallel_degree = ep
+    # The default FQN list expects an nn.Linear named moe.router.gate; this
+    # model routes differently, so the list is emptied rather than matched.
+    config.activation_checkpoint = SelectiveAC.Config(
+        force_recompute_mm_shapes_by_fqns=[]
+    )
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_dsa(
+    microbatch: int = 4, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The batched GB300 recipe with the DSA backward on cuDNN's kernel.
+
+    The flex backward is the single largest kernel in the step (~72% of
+    backward time). cuDNN ships a fused sparse-attention backward for exactly
+    this pattern; routing to it leaves the forward on flex, so the forward is
+    bitwise unchanged and only the backward differs.
+
+    Microbenchmarked at the production shape (T=8192, H=64, D=512, topk=512):
+    3.62x faster fwd+bwd, 79.4 -> 22.0 ms. Gradients land at 2.4e-3 relative
+    to an fp64 reference for both dq and d_sink, against 3.4e-3 for the flex
+    backward it replaces.
+    """
+    from torchtitan.models.deepseek_v4.attention import DSV4FlexInnerAttention
+
+    config = deepseek_v4_flash_8k_gb300_batched(microbatch, seq_len)
+    for layer in config.model_spec.model.layers:
+        inner = getattr(getattr(layer, "attention", None), "inner_attention", None)
+        if isinstance(inner, DSV4FlexInnerAttention.Config):
+            inner.fused_dsa_backward = True
+    return config
+
+def _set_flex_num_stages(config: Trainer.Config, num_stages: int) -> None:
+    """Override the pinned ``num_stages`` on every flex layer."""
+    from torchtitan.models.common.attention import FlexInnerAttention
+
+    for layer in config.model_spec.model.layers:
+        inner = getattr(getattr(layer, "attention", None), "inner_attention", None)
+        if isinstance(inner, FlexInnerAttention.Config):
+            opts = dict(inner.kernel_options or {})
+            opts["num_stages"] = num_stages
+            inner.kernel_options = opts
+
+def deepseek_v4_flash_8k_gb300_cudnn_dsa_ep2(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The cuDNN DSA backward at the 6x/EP=2 operating point, stages still 1.
+
+    The control that separates ``num_stages=2`` from the cuDNN backward: both
+    were measured against different baselines, and with the DSA backward off
+    flex, ``num_stages`` now reaches only the forward template.
+    """
+    config = deepseek_v4_flash_8k_gb300_cudnn_dsa(microbatch, seq_len)
+    config.parallelism.expert_parallel_degree = 2
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_dsa_stages2(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """Both wins together: cuDNN DSA backward + ``num_stages=2``, 6x/EP=2.
+
+    They target different kernels -- cuDNN replaces the flex backward outright,
+    while ``num_stages`` pipelines what flex still runs -- so they should stack,
+    but only the forward is left for pipelining to help.
+    """
+    config = deepseek_v4_flash_8k_gb300_cudnn_dsa_ep2(microbatch, seq_len)
+    _set_flex_num_stages(config, 2)
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full(
+    microbatch: int = 4, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """Both halves of DSA on cuDNN: sparse-attention forward and backward.
+
+    The backward alone was worth +48.5% (170.5 -> 253.2 TFLOP/s). This also
+    retires the flex forward and, with it, the block mask -- a dense
+    [B, n_q_blocks, n_kv_blocks] scatter built per layer per step purely to
+    drive a flex kernel that no longer runs.
+
+    Note that ``num_stages`` becomes irrelevant here: every DSA layer is off
+    flex, so there is no Triton template left for it to pipeline.
+
+    cuDNN's forward is closer to an fp64 reference than the flex forward it
+    replaces (out 2.1e-3 vs 2.7e-3), gradients likewise.
+    """
+    from torchtitan.models.deepseek_v4.attention import DSV4FlexInnerAttention
+
+    config = deepseek_v4_flash_8k_gb300_cudnn_dsa(microbatch, seq_len)
+    for layer in config.model_spec.model.layers:
+        inner = getattr(getattr(layer, "attention", None), "inner_attention", None)
+        if isinstance(inner, DSV4FlexInnerAttention.Config):
+            inner.fused_dsa_forward = True
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """``_cudnn_full`` at the 6x/EP=2 operating point, to compare with stages2."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full(microbatch, seq_len)
+    config.parallelism.expert_parallel_degree = 2
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_5x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """Plain 5x control, so the overlap's gain at 5x can be separated from batch.
+
+    The batch curve on this recipe is 4x 307.3 -> 6x 367.7, and the overlap is
+    worth +13.1% at 4x (347.6 vs 307.3). Without a 5x point, a 5x+overlap
+    number cannot be attributed between the two.
+    """
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2(5, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_profile(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The best recipe with the profiler on for two steps (warmup 3, active 2,
+    at step 10), so kernel buckets are comparable with job 610's trace."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2(microbatch, seq_len)
+    config.profiler.enable_profiling = True
+    config.profiler.profile_freq = 10
+    config.profiler.profiler_warmup = 3
+    config.profiler.profiler_active = 2
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The best recipe with the dense parameters never resharded after forward.
+
+    The job-665 profile put the step near its communication floor (exposed
+    comm 14.1% of wall, FSDP all-gather 10.3% of kernel time). A plain
+    ``fsdp_reshard_after_forward="never"`` cannot run here: in the EP>1 path one
+    ``fully_shard`` covers experts and dense params alike, and the experts are
+    258 GiB per rank unsharded. ``dense-never`` splits them: experts keep
+    resharding, the 13.6 GiB of dense params stay resident so backward does
+    not re-gather them.
+
+    Expectation stated up front: dense params are ~5% of all-gather bytes, so
+    this removes ~2.5% of all-gather traffic, ~0.25% of GPU time. The lever
+    that would matter is gather BYTES (lower-precision parameter all-gather),
+    not gather count.
+    """
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2(microbatch, seq_len)
+    config.parallelism.fsdp_reshard_after_forward = "dense-never"
+    return config
+
+def deepseek_v4_debugmodel_asyncep_densenever(
+    seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
+) -> Trainer.Config:
+    """One-node EP=2 smoke test of the dense-never FSDP grouping."""
+    from torchtitan.distributed.activation_checkpoint import FullAC
+
+    config = deepseek_v4_debugmodel(seq_len)
+    config.model_spec = model_registry(
+        "debugmodel", seq_len=seq_len, moe_comm_backend="minimal_async_ep"
+    )
+    config.activation_checkpoint = FullAC.Config()
+    config.parallelism.expert_parallel_degree = 2
+    config.parallelism.fsdp_reshard_after_forward = "dense-never"
+    config.training.disable_cuda_graphs = True
+    config.training.steps = 2
+    return config
+
+def deepseek_v4_debugmodel_asyncep_policy(
+    seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
+) -> Trainer.Config:
+    """One-node EP=2 pair: FSDP_POLICY env selects the reshard policy; fixed
+    seed and deterministic mode so the two arms differ in nothing else."""
+    import os
+
+    from torchtitan.distributed.activation_checkpoint import FullAC
+
+    config = deepseek_v4_debugmodel(seq_len)
+    config.model_spec = model_registry(
+        "debugmodel", seq_len=seq_len, moe_comm_backend="minimal_async_ep"
+    )
+    config.activation_checkpoint = FullAC.Config()
+    config.parallelism.expert_parallel_degree = 2
+    config.parallelism.fsdp_reshard_after_forward = os.environ.get("FSDP_POLICY", "default")
+    config.parallelism.fp8_expert_all_gather = os.environ.get("FP8_EXPERT_AG", "0") == "1"
+    if os.environ.get("TE_DENSE", "0") == "1":
+        _apply_te_dense(config)
+    if os.environ.get("TE_EXPERTS", "0") == "1":
+        assert _apply_te_experts(config) > 0
+    if os.environ.get("CUDNN_INDEXER", "0") == "1":
+        assert _enable_cudnn_indexer(config) > 0
+    if os.environ.get("FP8_DENSE", "0") == "1":
+        _apply_fp8_dense(config)
+    config.training.disable_cuda_graphs = True
+    config.debug.seed = 0
+    config.debug.deterministic = True
+    config.training.steps = 2
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_profile(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """dense-never with the profiler on (warmup 3, active 2, at step 10)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(microbatch, seq_len)
+    config.profiler.enable_profiling = True
+    config.profiler.profile_freq = 10
+    config.profiler.profiler_warmup = 3
+    config.profiler.profiler_active = 2
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_fp8ag(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The 401.4 best (dense-never) plus fp8 all-gather of the expert weights.
+
+    Expert all-gathers are ~95% of FSDP gather bytes and run twice per block per
+    step under FullAC (forward + backward recompute), ~1 s/step. Gathering
+    them as row-wise e4m3 halves that; the bf16 grouped GEMM and MinimalAsyncEP
+    are untouched. Numerics: GEMMs see fp8-rounded weights (row-wise scales),
+    the standard fp8 weight recipe -- measure, do not assume.
+    """
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(microbatch, seq_len)
+    config.parallelism.fp8_expert_all_gather = True
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_fp8ag_profile(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """fp8 expert all-gather with the profiler on (warmup 3, active 2, at step 10)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_fp8ag(microbatch, seq_len)
+    config.profiler.enable_profiling = True
+    config.profiler.profile_freq = 10
+    config.profiler.profiler_warmup = 3
+    config.profiler.profiler_active = 2
+    return config
+
+def _enable_cudnn_indexer(config: Trainer.Config) -> int:
+    """Route every CSA layer's top-k selection through cuDNN's fused indexer."""
+    n = 0
+    for layer in config.model_spec.model.layers:
+        inner = getattr(getattr(layer, "attention", None), "inner_attention", None)
+        if inner is not None and getattr(inner, "compress_ratio", 0) == 4:
+            inner.cudnn_indexer = True
+            n += 1
+    return n
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The 401 best (dense-never, 4 receive slots) plus cuDNN's fused indexer
+    top-k in place of the eager einsum + stable sort (Megatron #5992's idea;
+    the kernel ships in our cuDNN frontend 1.29). Sort/top-k kernels are 2.3%
+    of kernel time at 8K plus the dense score GEMM and its elementwise tail."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(microbatch, seq_len)
+    assert _enable_cudnn_indexer(config) > 0, "no CSA layer found"
+    return config
+
+FP8_DENSE_FILTER_FQNS = [
+    # Kept in bf16/fp32 on purpose (Megatron's DSv4 correctness list keeps the
+    # CSA compressor and indexer in high precision under FP8; the router gate
+    # scores in fp32; the LM head is left bf16 as in every fp8 recipe here).
+    "lm_head",
+    "router.gate",
+    "indexer",
+    "compressor",
+    # Too small to gain: attn_sink is 1x64, wkv is 4096->512, wq_a 4096->1024.
+    # torchao's H100-tuned auto filter also rejected wq_b (K=1024, N=32768),
+    # the single largest dense GEMM in the model, so it is not used here.
+    "attn_sink",
+    "attention.wkv",
+    "attention.wq_a",
+]
+
+def _apply_fp8_dense(config: Trainer.Config) -> Trainer.Config:
+    """Swap the dense ``Linear`` configs (attention projections, shared
+    experts) to torchao rowwise Float8Linear. Expert grouped GEMMs are not
+    touched: fp8 ``_scaled_grouped_mm`` aborts on sm_103 and the MXFP8 path
+    measured -7.5% here. Runs on the model config tree, so it composes with any
+    already-built recipe."""
+    from torchtitan.config.transform.quantization import Float8LinearConverter
+
+    if os.environ.get("FP8_DENSE_IMPL", "torchao") == "custom":
+        # torchao-free tensorwise fp8 linear with cached weight casts
+        # (torchtitan/quantization/custom_fp8.py; probe 821).
+        from torchtitan.models.common.linear import Linear
+        from torchtitan.quantization.custom_fp8 import convert_linear_config
+        from torchtitan.quantization.utils import module_filter_fn
+
+        fqns = [f for f in FP8_DENSE_FILTER_FQNS if f != "auto_filter_small_kn"]
+        n = 0
+        for fqn, lc, parent, attr in list(config.model_spec.model.traverse(Linear.Config)):
+            if type(lc) is not Linear.Config or not module_filter_fn(lc, fqn, fqns):
+                continue
+            new_cfg = convert_linear_config(lc)
+            if isinstance(parent, list):
+                parent[attr] = new_cfg
+            else:
+                setattr(parent, attr, new_cfg)
+            n += 1
+        assert n > 0, "custom fp8: no linear converted"
+        return config
+
+    # FP8_DENSE_RECIPE: tensorwise (default; the only recipe whose compiled
+    # fwd+bwd beat bf16 on GB300 in probe 817), rowwise, rowwise_with_gw_hp.
+    recipe = os.environ.get("FP8_DENSE_RECIPE", "tensorwise")
+    conv = Float8LinearConverter(
+        Float8LinearConverter.Config(
+            recipe_name="rowwise", filter_fqns=list(FP8_DENSE_FILTER_FQNS)
+        )
+    )
+    config.model_spec.model = conv.convert(config.model_spec.model)
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_fp8dense(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The 401 best (dense-never, 4 receive slots) plus fp8 dense linears.
+
+    Dense bf16 GEMMs (attention projections, shared expert, indexer scores)
+    are 11.3% of kernel time in the job-702 profile; rowwise fp8 halves the
+    tensor-core work of the ones converted here. FP8_DENSE_COMPILE=1 compiles
+    each Float8Linear module on its own so torchao's amax/scale/cast kernels
+    fuse (eager fp8 casts can eat the gain).
+    """
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(microbatch, seq_len)
+    # First-step compiles of the fp8 cast graphs can exceed the 300 s default
+    # while FSDP collectives are pending (job 823); warm-up handles the known
+    # shapes, this covers anything it misses.
+    config.comm.init_timeout_seconds = 1800
+    return _apply_fp8_dense(config)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_fp8dense(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """Stack: dense-never + 4 slots + cuDNN fused indexer (441.4, job 807)
+    + fp8 dense linears (wq_b, wo_a, wo_b, shared w13/w2)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx(microbatch, seq_len)
+    return _apply_fp8_dense(config)
+
+def _apply_te_dense(config: Trainer.Config) -> Trainer.Config:
+    """Swap the same dense ``Linear`` configs ``_apply_fp8_dense`` converts to
+    Transformer Engine's ``te.Linear`` (torchtitan/quantization/te_linear.py;
+    recipe via TE_DENSE_RECIPE). Job 837: TE beat the custom fp8 linear on
+    every shape and recipe."""
+    from torchtitan.models.common.linear import Linear
+    from torchtitan.quantization.te_linear import convert_linear_config
+    from torchtitan.quantization.utils import module_filter_fn
+
+    fqns = [f for f in FP8_DENSE_FILTER_FQNS if f != "auto_filter_small_kn"]
+    # TE_DENSE_EXCLUDE=wq_b,wo_b: keep those projections out of TE (e.g. wq_b's
+    # [T, 32768] output passes 2^31 elements at a 9x microbatch).
+    fqns += [f for f in os.environ.get("TE_DENSE_EXCLUDE", "").split(",") if f]
+    n = 0
+    for fqn, lc, parent, attr in list(config.model_spec.model.traverse(Linear.Config)):
+        if type(lc) is not Linear.Config or not module_filter_fn(lc, fqn, fqns):
+            continue
+        new_cfg = convert_linear_config(lc)
+        if isinstance(parent, list):
+            parent[attr] = new_cfg
+        else:
+            setattr(parent, attr, new_cfg)
+        n += 1
+    assert n > 0, "te dense: no linear converted"
+    config.comm.init_timeout_seconds = 1800
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """Stack: dense-never + 4 slots + cuDNN fused indexer (441.4, job 807)
+    + Transformer Engine fp8/fp4 dense linears (TE_DENSE_RECIPE) in place of
+    the custom fp8 linear of the 450.8 config (job 829)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx(microbatch, seq_len)
+    return _apply_te_dense(config)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_profile(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The 457.6 recipe with the profiler on (warmup 3, active 2, at step 10)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(microbatch, seq_len)
+    config.profiler.enable_profiling = True
+    config.profiler.profile_freq = 10
+    config.profiler.profiler_warmup = 3
+    config.profiler.profiler_active = 2
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 471 recipe at a 7x microbatch (57344 tokens per rank)."""
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(7, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_8x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 471 recipe at an 8x microbatch (65536 tokens per rank)."""
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(8, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_9x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """9x microbatch (73728 tokens per rank); needs OPT_STATE_OFFLOAD=1 to fit."""
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(9, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_10x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """10x microbatch (81920 tokens per rank); needs OPT_STATE_OFFLOAD=1 to fit."""
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(10, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_12x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """12x microbatch (98304 tokens per rank); needs TORCHTITAN_BLOCK_INPUT_OFFLOAD=1."""
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(12, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_profile(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 500.3 recipe at 7x with the profiler on (warmup 3, active 2, at step 10)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(7, seq_len)
+    config.profiler.enable_profiling = True
+    config.profiler.profile_freq = 10
+    config.profiler.profiler_warmup = 3
+    config.profiler.profiler_active = 2
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_14x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 500 recipe at a 14x microbatch (114688 tokens per rank); needs the block-input offload."""
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(14, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_16x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 500 recipe at a 16x microbatch (131072 tokens per rank); needs the block-input offload."""
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(16, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_12x_profile(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 513.9 recipe (12x, job 942) with the profiler on (warmup 3, active 2, at step 10)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(12, seq_len)
+    config.profiler.enable_profiling = True
+    config.profiler.profile_freq = 10
+    config.profiler.profiler_warmup = 3
+    config.profiler.profiler_active = 2
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_13x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 500 recipe at a 13x microbatch (106496 tokens per rank); needs the block-input offload."""
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(13, seq_len)
+
+def _swap_ep_backend(config: Trainer.Config, backend: str) -> int:
+    """Replace every MoE token dispatcher config with the one ``backend`` builds
+    (same num_experts/top_k/hidden_dim), keeping every other mutation the recipe
+    already applied to the model spec. Returns the number swapped."""
+    from torchtitan.models.common.config_utils import make_token_dispatcher_config
+    from torchtitan.models.common.moe import MoE
+
+    n = 0
+    for _, moe_cfg, _, _ in config.model_spec.model.traverse(MoE.Config):
+        td = moe_cfg.routed_experts.token_dispatcher
+        moe_cfg.routed_experts.token_dispatcher = make_token_dispatcher_config(
+            num_experts=td.num_experts,
+            top_k=td.top_k,
+            comm_backend=backend,
+            hidden_dim=td.hidden_dim,
+        )
+        n += 1
+    return n
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_deepep(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 482.8 recipe (7x) with DeepEP v2's ElasticBuffer dispatch in place of
+    MinimalAsyncEP (run with DEEPEP=1 so the launcher sets CUDA_HOME/NVSHMEM/
+    PYTHONPATH). EP=2 is intra-node, so GIN stays disabled. Earlier, at 1k and
+    EP=4, DeepEP measured -6.6% vs MinimalAsyncEP; attention is now far cheaper
+    and the EP dispatch copy + barrier are the largest exposed item, so retest."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x(seq_len)
+    assert _swap_ep_backend(config, "deepep") > 0
+    return config
+
+def _apply_te_experts(config: Trainer.Config) -> int:
+    """Swap every MoE's GroupedExperts config to TEGroupedExperts (MXFP8 grouped
+    GEMMs via Transformer Engine, torchtitan/quantization/te_grouped.py)."""
+    from torchtitan.models.common.moe import GroupedExperts, MoE
+    from torchtitan.quantization.te_grouped import convert_experts_config
+
+    n = 0
+    for _, moe_cfg, _, _ in config.model_spec.model.traverse(MoE.Config):
+        ie = moe_cfg.routed_experts.inner_experts
+        if type(ie) is GroupedExperts.Config:
+            moe_cfg.routed_experts.inner_experts = convert_experts_config(ie)
+            n += 1
+    return n
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_teexperts(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 482.8 recipe (7x) with the expert grouped GEMMs in MXFP8 through TE."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x(seq_len)
+    assert _apply_te_experts(config) > 0
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_teexperts(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """TE MXFP8 grouped experts on the cudnnidx + TE dense recipe (6x fits; 7x OOMs, job 875)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(microbatch, seq_len)
+    assert _apply_te_experts(config) > 0
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_sac_ep4_1x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """Selective AC at EP=4 on the current recipe (TE dense + cuDNN indexer), 1x
+    microbatch -- the only microbatch SAC's saved activations have ever fit (the
+    181.69-recipe sweep, jobs 557-561). Re-measured on the 500.3 recipe."""
+    from torchtitan.distributed.activation_checkpoint import SelectiveAC
+
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(1, seq_len)
+    config.parallelism.expert_parallel_degree = 4
+    config.activation_checkpoint = SelectiveAC.Config()
+    return config
+
+def _sac_variant(microbatch: int, ep: int, seq_len: int | None = 8192) -> Trainer.Config:
+    from torchtitan.distributed.activation_checkpoint import SelectiveAC
+
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(microbatch, seq_len)
+    config.parallelism.expert_parallel_degree = ep
+    config.activation_checkpoint = SelectiveAC.Config()
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_sac_ep2_4x(seq_len: int | None = 8192) -> Trainer.Config:
+    """Selective AC, EP=2, 4x: SAC at 1x used only 89 GiB on this recipe (job 900)."""
+    return _sac_variant(4, 2, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_sac_ep4_4x(seq_len: int | None = 8192) -> Trainer.Config:
+    return _sac_variant(4, 4, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_sac_ep4_3x(seq_len: int | None = 8192) -> Trainer.Config:
+    return _sac_variant(3, 4, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_4x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """FullAC reference at 4x for the selective-AC comparison."""
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(4, seq_len)
+
+def _ep1_variant(microbatch: int, seq_len: int | None = 8192) -> Trainer.Config:
+    """EP=1: every rank runs all 256 experts on its own tokens (standard local
+    dispatcher, no EP comm); experts are FSDP-sharded 32-way like everything
+    else, so each layer's full expert set (6.4 GB) is gathered per pass. The
+    default reshard policy is required (dense-never would keep every layer's
+    experts unsharded at EP=1)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(microbatch, seq_len)
+    config.parallelism.expert_parallel_degree = 1
+    config.parallelism.fsdp_reshard_after_forward = "default"
+    assert _swap_ep_backend(config, "standard") > 0
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep1_1x(seq_len: int | None = 8192) -> Trainer.Config:
+    return _ep1_variant(1, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep1_7x(seq_len: int | None = 8192) -> Trainer.Config:
+    return _ep1_variant(7, seq_len)
