@@ -1,0 +1,10 @@
+###### env: CUBLAS_WORKSPACE_CONFIG=unset ######
+###### hero200_128gpu_hsdp4x32_perfgov  branch=dsv4_te_mhc  commit=1457b7ba  steps=200  job=257  15:31:21 ######
+###### torchtitan resolved to /mnt/dgxc/chelsea/torchtitan/torchtitan/__init__.py
+###### nodes=32 (yqb01-qa01-mgx-[00037-00038,00040-00044,00046-00057,00060-00072]) ######
+###### parallelism env: TORCHTITAN_LEAF_COMPILE=unset NCCL_PROTO=auto NCCL_ALGO=auto ######
+###### wandb: disabled (NO_WANDB set) ######
+###### END hero200_128gpu_hsdp4x32_perfgov exit=0 16:05:44 ######
+step: 198  loss:  2.75494  grad_norm:  0.2746  memory: 238.21GiB(86.15%)  tps: 8,382  tflops: 742.94  mfu: 29.72%
+step: 199  loss:  2.76105  grad_norm:  0.2666  memory: 238.21GiB(86.15%)  tps: 8,387  tflops: 743.37  mfu: 29.73%
+step: 200  loss:  2.75942  grad_norm:  0.2480  memory: 238.21GiB(86.15%)  tps: 8,329  tflops: 738.17  mfu: 29.53%
