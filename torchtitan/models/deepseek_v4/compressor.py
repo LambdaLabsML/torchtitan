@@ -7,6 +7,8 @@
 from dataclasses import dataclass
 from functools import cache
 
+import logging
+import os
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -26,6 +28,13 @@ def _hadamard(dim: int, dtype: torch.dtype, device: torch.device) -> torch.Tenso
     while h.shape[0] < dim:
         h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
     return h
+
+
+from torchtitan.models.common.linear import _RouterGateLinearFunction
+
+_BF16_GEMM = os.environ.get("COMPRESSOR_BF16_GEMM", "0") == "1"
+_bf16_logged = False
+logger = logging.getLogger(__name__)
 
 
 class Compressor(Module):
@@ -123,9 +132,23 @@ class Compressor(Module):
         rd = self.rope_head_dim
         ratio = self.compress_ratio
         dtype = x.dtype
-        with torch.autocast(device_type=x.device.type, dtype=torch.float32):
-            kv = self.wkv(x)
-            score = self.wgate(x)
+        if _BF16_GEMM and x.is_cuda and x.dtype is torch.bfloat16 and self.wkv.weight.dtype is torch.bfloat16 and self.wkv.bias is None and self.wgate.bias is None:
+            # COMPRESSOR_BF16_GEMM=1: the fp32 autocast below casts x [T, D] and
+            # both weights up to fp32 on every call (fwd + FullAC recompute).
+            # bf16 values are exact in TF32, so a bf16 tensor-core GEMM with
+            # fp32 accumulation/output computes the same products; only the
+            # accumulation order differs. Same Function the router gate uses.
+            global _bf16_logged
+            if not _bf16_logged:
+                _bf16_logged = True
+                logger.info("Compressor: bf16-in/fp32-out GEMMs active (COMPRESSOR_BF16_GEMM=1)")
+            x2 = x.reshape(-1, x.shape[-1])
+            kv = _RouterGateLinearFunction.apply(x2, self.wkv.weight).reshape(*x.shape[:-1], -1)
+            score = _RouterGateLinearFunction.apply(x2, self.wgate.weight).reshape(*x.shape[:-1], -1)
+        else:
+            with torch.autocast(device_type=x.device.type, dtype=torch.float32):
+                kv = self.wkv(x)
+                score = self.wgate(x)
         if seqlen % ratio != 0:
             raise ValueError(
                 f"seqlen ({seqlen}) must be divisible by compress_ratio ({ratio})"
