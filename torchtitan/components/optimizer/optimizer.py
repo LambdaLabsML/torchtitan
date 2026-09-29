@@ -301,8 +301,15 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
 
     def step(self, closure: Callable[[], float] | None = None) -> float | None:
         assert closure is None, "OptimizersContainer does not support closures"
+        from torchtitan.components.optimizer import state_offload
+
         for optimizer in self.optimizers:
-            optimizer.step()
+            if state_offload.ENABLED and state_offload.LAYERWISE:
+                state_offload.layerwise_step(self, optimizer)
+            elif state_offload.ENABLED:
+                state_offload.offload_step(optimizer)
+            else:
+                optimizer.step()
         return None
 
     def zero_grad(self, set_to_none: bool = True) -> None:
