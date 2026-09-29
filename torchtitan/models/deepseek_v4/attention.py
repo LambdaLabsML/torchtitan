@@ -566,6 +566,35 @@ class CompressedSparseAttention(DSV4FlexInnerAttention):
         )
 
 
+class _GroupedLowRankProj(torch.autograd.Function):
+    """``einsum("tgd,grd->tgr", o, w)`` as strided bmm with no permute copies.
+
+    Forward writes ``[T, G, R]`` directly through a transposed view; backward
+    does the same for ``d_o``. The weight gradient is a plain bmm.
+    """
+
+    @staticmethod
+    def forward(ctx, o, w):
+        ctx.save_for_backward(o, w)
+        t, g, _ = o.shape
+        r = w.shape[1]
+        out = torch.empty(t, g, r, device=o.device, dtype=o.dtype)
+        torch.bmm(o.transpose(0, 1), w.transpose(1, 2), out=out.transpose(0, 1))
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        o, w = ctx.saved_tensors
+        g3 = grad.transpose(0, 1)  # [G, T, R] view
+        d_o = d_w = None
+        if ctx.needs_input_grad[0]:
+            d_o = torch.empty_like(o)
+            torch.bmm(g3, w, out=d_o.transpose(0, 1))
+        if ctx.needs_input_grad[1]:
+            d_w = torch.bmm(g3.transpose(1, 2), o.transpose(0, 1))
+        return d_o, d_w
+
+
 class Attention(BaseAttention):
     """DeepSeek V4 attention wrapper around sparse inner attention.
 
@@ -725,7 +754,13 @@ class Attention(BaseAttention):
                     wo_a,
                     {"dp": spmd.R, "cp": spmd.R, "tp": spmd.S(0)},
                 )
-        o = torch.einsum("tgd,grd->tgr", o, wo_a)
+        # Grouped low-rank projection without the einsum's permute copies: the
+        # einsum copied ``o`` ([T, G, D], 3.2 GiB at 8k/6x) into batch-major
+        # layout and copied its output back to token-major -- ~4.5 ms per
+        # layer-step of pure copies in the job 680 trace. Strided bmm reads
+        # ``o`` in place and writes straight into a token-major buffer
+        # (probe 848: 15.21 -> 11.75 ms fwd+bwd, bitwise identical).
+        o = _GroupedLowRankProj.apply(o, wo_a)
         with spmd.local():
             o = o.reshape(num_tokens, -1)
             _assert_spmd_attention_type(o, tp=spmd.S(1))
