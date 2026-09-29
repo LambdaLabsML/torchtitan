@@ -349,6 +349,75 @@ def _copy_rows_to_peer_ptrs_kernel(
     tl.store(dst_ptr, values, mask=mask & dst_rank_mask[:, None])
 
 
+# --- TMA-store variant (MINIMAL_ASYNC_EP_COPY_TMA=1) -------------------------
+# Ordinary vectorized stores into peer memory top out near 620 GB/s per
+# direction on GB300 NVLink; TMA bulk stores get closer to line rate (2-GPU
+# bench at the 7x shape: 2.25 -> 2.00 ms per leg, bitwise). Each bf16 row of
+# NUM_COLS is one TMA box [NUM_COLS//256, 256] against the peer buffer viewed
+# as [rows*NUM_COLS//256, 256] (TMA boxes are capped at 256 per dim). EP_SIZE=2
+# only (one descriptor per peer, static dispatch); other cases take the stock
+# kernel. Needs triton.set_allocator (descriptor scratch), set lazily below.
+_COPY_TMA = os.environ.get("MINIMAL_ASYNC_EP_COPY_TMA", "0") == "1"
+_tma_allocator_set = False
+
+
+def _ensure_tma_allocator(device) -> None:
+    global _tma_allocator_set
+    if _tma_allocator_set:
+        return
+
+    def _alloc(size: int, align: int, stream):
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    triton.set_allocator(_alloc)
+    _tma_allocator_set = True
+
+
+@triton.jit
+def _tma_copy_rows_to_peer_ptrs_kernel(
+    src,
+    dst_ptrs: tl.pointer_type(tl.int64),
+    dst_ranks: tl.pointer_type(tl.int64),
+    dst_rows: tl.pointer_type(tl.int64),
+    num_valid_rows: tl.pointer_type(tl.int64),
+    src_rows: tl.pointer_type(tl.int64),
+    NUM_ROWS: tl.constexpr,
+    CAP_ROWS: tl.constexpr,
+    NUM_COLS: tl.constexpr,
+    SRC_ROW_STRIDE: tl.constexpr,
+    HAS_NUM_VALID_ROWS: tl.constexpr,
+    HAS_SRC_ROWS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+) -> None:
+    CH: tl.constexpr = NUM_COLS // 256
+    row0 = tl.program_id(0) * BLOCK_M
+    row_limit = NUM_ROWS
+    if HAS_NUM_VALID_ROWS:
+        row_limit = tl.load(num_valid_rows)
+        if row0 >= row_limit:
+            return
+    base0 = tl.load(dst_ptrs + 0).to(tl.pointer_type(tl.bfloat16))
+    base1 = tl.load(dst_ptrs + 1).to(tl.pointer_type(tl.bfloat16))
+    d0 = tl.make_tensor_descriptor(base0, shape=[CAP_ROWS * CH, 256], strides=[256, 1], block_shape=[CH, 256])
+    d1 = tl.make_tensor_descriptor(base1, shape=[CAP_ROWS * CH, 256], strides=[256, 1], block_shape=[CH, 256])
+    ci = tl.arange(0, CH)[:, None] * 256 + tl.arange(0, 256)[None, :]
+    for i in tl.static_range(BLOCK_M):
+        r = row0 + i
+        if r < row_limit:
+            dr = tl.load(dst_ranks + r)
+            if dr >= 0:
+                sr = r
+                if HAS_SRC_ROWS:
+                    sr = tl.load(src_rows + r)
+                drow = tl.load(dst_rows + r).to(tl.int32)
+                v = tl.load(src + sr.to(tl.int64) * SRC_ROW_STRIDE + ci)
+                if dr == 0:
+                    d0.store([drow * CH, 0], v)
+                else:
+                    d1.store([drow * CH, 0], v)
+
+
+
 def copy_full_counts_to_peers_kernel(
     counts: torch.Tensor,
     dsts: list[torch.Tensor],
@@ -398,6 +467,34 @@ def copy_rows_to_peers_kernel(
     if len(dsts) != ep_size:
         raise ValueError(f"expected {ep_size} destination buffers, got {len(dsts)}.")
 
+    if (
+        _COPY_TMA
+        and ep_size == 2
+        and src.dtype == torch.bfloat16
+        and num_cols % 256 == 0
+        and src.stride(1) == 1
+        and dsts[0].stride(1) == 1
+        and dsts[0].stride(0) == num_cols
+    ):
+        _ensure_tma_allocator(src.device)
+        tma_block_m = 4
+        _tma_copy_rows_to_peer_ptrs_kernel[(triton.cdiv(num_rows, tma_block_m),)](
+            src,
+            dst_ptrs,
+            dst_ranks,
+            dst_rows,
+            num_valid_rows if num_valid_rows is not None else dst_rows[:1],
+            src_rows if src_rows is not None else dst_rows,
+            NUM_ROWS=num_rows,
+            CAP_ROWS=dsts[0].shape[0],
+            NUM_COLS=num_cols,
+            SRC_ROW_STRIDE=src.stride(0),
+            HAS_NUM_VALID_ROWS=num_valid_rows is not None,
+            HAS_SRC_ROWS=src_rows is not None,
+            BLOCK_M=tma_block_m,
+            num_warps=4,
+        )
+        return
     block_n = min(_MAX_BLOCK_N, triton.next_power_of_2(num_cols))
     grid = (triton.cdiv(num_rows, block_m), triton.cdiv(num_cols, block_n))
     dst_dtype = _HIDDEN_ROW_DTYPES.get(src.dtype)
