@@ -311,6 +311,13 @@ def init_buffer(
     _buffer_key = buffer_key
 
 
+# Row-copy launch geometry. Defaults are the historical values; the 2-GPU
+# microbenchmark (/mnt/dgxc/bench_ep_copy.py) at the 7x shape is where
+# alternatives are measured before an 8-node A/B.
+_COPY_BLOCK_M = os.environ.get("MINIMAL_ASYNC_EP_COPY_BLOCK_M")
+_COPY_NUM_WARPS = os.environ.get("MINIMAL_ASYNC_EP_COPY_WARPS")
+
+
 def _copy_rows_to_peers_and_wait_cuda(
     x: torch.Tensor,
     dst_ranks: torch.Tensor,
@@ -330,6 +337,10 @@ def _copy_rows_to_peers_and_wait_cuda(
     microbatch communication overlap.
     """
     assert _buffer_state is not None
+    if _COPY_BLOCK_M is not None:  # env overrides the call sites' (4, 8)
+        block_m = int(_COPY_BLOCK_M)
+    if _COPY_NUM_WARPS is not None:
+        num_warps = int(_COPY_NUM_WARPS)
 
     buffer_index = _buffer_state.hidden_recv_buffer_index
     _buffer_state.hidden_recv_buffer_index = (
