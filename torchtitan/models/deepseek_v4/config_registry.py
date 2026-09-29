@@ -1067,3 +1067,88 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_12x_hy
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_12x(seq_len)
     assert _swap_ep_backend(config, "hybridep") > 0
     return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_profile_balanced(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 7x profile variant with forced load-balanced routing: splits the EP
+    barrier wait into token-imbalance vs launch jitter (pair with job 938)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_profile(seq_len)
+    config.debug.moe_force_load_balance = True
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_13x_balanced(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 13x recipe with forced load-balanced routing (Megatron's
+    --moe-router-force-load-balancing equivalent): the balanced-regime number."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(13, seq_len)
+    config.debug.moe_force_load_balance = True
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_7x_balanced(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 7x recipe with forced load-balanced routing (balanced-regime number)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(7, seq_len)
+    config.debug.moe_force_load_balance = True
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_10x_balanced(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """The 10x recipe with forced load-balanced routing (needs the block-input offload)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(10, seq_len)
+    config.debug.moe_force_load_balance = True
+    return config
+
+def _force_balanced_routing(config: Trainer.Config) -> int:
+    """Benchmark aid: round-robin expert assignment on every MoE block.
+
+    The EP load probe (job 749) showed the from-scratch router collapsing onto
+    the same 6 experts in 93% of layer forwards by step 5, with the EP-rank
+    receive imbalance at 1.3x mean (p90 1.67x). Throughput measured under that
+    collapse is not what a trained model sees; this forces perfectly balanced
+    routing so the expert GEMMs and the EP barrier are measured as they would
+    be in steady-state training. Loss is meaningless with it on.
+    """
+    n = 0
+    for layer in config.model_spec.model.layers:
+        moe = getattr(layer, "moe", None)
+        if moe is not None:
+            moe.router._debug_force_load_balance = True
+            n += 1
+    return n
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_balanced(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The 402 best (dense-never) with forced round-robin routing."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(microbatch, seq_len)
+    assert _force_balanced_routing(config) > 0
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_6x_balanced(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """6x (even sequence count) with forced balanced routing: the control for the
+    two-microbatch schedule A/B."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(6, seq_len)
+    config.debug.moe_force_load_balance = True
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_8x_balanced(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """8x with forced balanced routing (needs the block-input offload)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(8, seq_len)
+    config.debug.moe_force_load_balance = True
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_9x_balanced(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """9x with forced balanced routing (fits once the DSA backward runs the atomic path)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(9, seq_len)
+    config.debug.moe_force_load_balance = True
+    return config
