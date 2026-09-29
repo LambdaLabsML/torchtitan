@@ -253,6 +253,17 @@ class FlexInnerAttention(InnerAttention):
     class Config(InnerAttention.Config):
         block_size: int | tuple[int, int] = _DEFAULT_SPARSE_BLOCK_SIZE
         kernel_options: dict = field(default_factory=dict)
+        max_autotune: bool | None = None
+        """Override Inductor's autotuning for this layer's flex kernels.
+
+        ``None`` keeps the class default below. Set ``False`` once
+        ``kernel_options`` are pinned: autotune then only re-benchmarks the
+        pinned choice against variants it cannot use. Measured on 64x GB300 at
+        head_dim=512, where the tiles must be pinned for the kernel to run at
+        all, turning it off was throughput-neutral (92.01 vs 92.15 TFLOP/s)
+        and removed ~228 s of startup per distinct shape -- on a new shape
+        (a batched microbatch, say) autotune otherwise dominates the run.
+        """
 
     inductor_configs: ClassVar[dict[str, bool]] = {
         "wrap_inductor_compiled_regions": True,
@@ -276,9 +287,35 @@ class FlexInnerAttention(InnerAttention):
         options=inductor_configs,
     )
 
+    # One compiled callable per distinct option set, shared across layers.
+    # Compiling per instance would defeat the reason _compiled_flex_attn is a
+    # ClassVar (many compiled flex instances are slow), while a single ClassVar
+    # cannot express a per-layer override.
+    _compiled_flex_attn_variants: ClassVar[dict[tuple, Callable]] = {}
+
+    @classmethod
+    def _compiled_flex_attn_for(cls, configs: dict) -> Callable:
+        if configs == cls.inductor_configs:
+            return cls._compiled_flex_attn
+        key = tuple(sorted(configs.items()))
+        fn = cls._compiled_flex_attn_variants.get(key)
+        if fn is None:
+            # pyrefly: ignore[no-matching-overload]
+            fn = torch.compile(flex_attention, options=dict(configs))
+            cls._compiled_flex_attn_variants[key] = fn
+        return fn
+
     def __init__(self, config: Config) -> None:
         super().__init__()
         self.kernel_options = config.kernel_options
+        self.effective_inductor_configs = dict(self.inductor_configs)
+        if config.max_autotune is not None:
+            self.effective_inductor_configs["max_autotune"] = config.max_autotune
+            # coordinate descent starts from autotune's pick; without autotune
+            # it only re-tunes the pinned config, so it goes with it.
+            self.effective_inductor_configs["coordinate_descent_tuning"] = (
+                config.max_autotune
+            )
 
     def _get_aux_request(self, *, return_lse: bool) -> AuxRequest:
         """Return the auxiliary outputs needed from this attention call."""
@@ -305,6 +342,7 @@ class FlexInnerAttention(InnerAttention):
         enable_gqa: bool,
         return_aux: AuxRequest,
         kernel_options: dict,
+        inductor_configs: dict | None = None,
     ):
         """Run compiled FlexInnerAttention outside SPMD typechecking.
 
@@ -318,7 +356,10 @@ class FlexInnerAttention(InnerAttention):
         TODO(pianpwk): Move flex-typechecking into pytorch/spmd_types.
         """
         with spmd.no_typecheck():
-            out, aux = FlexInnerAttention._compiled_flex_attn(
+            compiled = FlexInnerAttention._compiled_flex_attn_for(
+                inductor_configs or FlexInnerAttention.inductor_configs
+            )
+            out, aux = compiled(
                 q,
                 k,
                 v,
@@ -387,7 +428,7 @@ class FlexInnerAttention(InnerAttention):
         # a non-inductor backend, regional_inductor scoops just this region into
         # an inductor sub-compile (see distributed/compile.py). A null context on
         # the default inductor / eager paths, so no dead metadata is emitted.
-        with maybe_regional_inductor(FlexInnerAttention.inductor_configs):
+        with maybe_regional_inductor(self.effective_inductor_configs):
             out_1HTV, aux = FlexInnerAttention.compiled_flex_attn(
                 q_1HTK,
                 k_1HTK,
@@ -398,6 +439,7 @@ class FlexInnerAttention(InnerAttention):
                 enable_gqa=enable_gqa,
                 return_aux=aux_request,
                 kernel_options=self.kernel_options,
+                inductor_configs=self.effective_inductor_configs,
             )
         self._process_aux(aux)
         if batched:
