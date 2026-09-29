@@ -14,6 +14,7 @@ from torchtitan.config import (
     TrainingConfig,
 )
 from torchtitan.distributed import ParallelDims
+import torchtitan.distributed.fsdp_direct_gather  # noqa: F401  (installs the FSDP2 patch when FSDP_DIRECT_GATHER=1)
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.compile import apply_compile
 from torchtitan.distributed.fsdp import resolve_fsdp_mesh, resolve_sparse_fsdp_mesh
