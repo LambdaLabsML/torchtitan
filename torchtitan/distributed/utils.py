@@ -271,8 +271,18 @@ def enable_fp32_matmul_emulation_with_bf16x9() -> None:
     ):
         return
 
+    # BF16x9 is the default because it is the most accurate option that still
+    # uses tensor cores. It is not always the right trade: it runs nine bf16
+    # products per fp32 product, and where the inputs are themselves bf16-valued
+    # (so exactly representable in TF32's 11-bit mantissa) TF32 is far cheaper
+    # for a precision loss that is still orders of magnitude below bf16.
+    # Measured on a GB300 for dsv4's mHC projection [49152,4096]x[4096,24]:
+    #   bfx9 0.463 ms, rel-err 2.7e-07
+    #   tf32 0.132 ms, rel-err 7.3e-06
+    #   bf16 0.241 ms, rel-err 1.7e-03
+    precision = os.environ.get("TORCHTITAN_FP32_MATMUL_PRECISION", "bfx9")
     try:
-        torch.backends.cuda.matmul.fp32_precision = "bfx9"
+        torch.backends.cuda.matmul.fp32_precision = precision
     except (AttributeError, RuntimeError, ValueError) as exc:
         raise ValueError(
             "TorchTitan on NVIDIA GPUs with compute capability 10.0 or later "
@@ -280,7 +290,7 @@ def enable_fp32_matmul_emulation_with_bf16x9() -> None:
             "(pytorch/pytorch#195301) and CUDA 12.9 or later."
         ) from exc
 
-    logger.info("Enabled BF16x9 emulation for FP32 CUDA matmuls")
+    logger.info("FP32 CUDA matmul precision: %s", precision)
 
 
 def set_batch_invariance(enable: bool) -> None:
