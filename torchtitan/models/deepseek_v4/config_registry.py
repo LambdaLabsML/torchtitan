@@ -208,9 +208,16 @@ _GB300_FLEX_KERNEL_OPTIONS = {
     "BLOCK_N": 32,
     "num_stages": 1,
     "num_warps": 4,
+    # All 16, not the 16/32/32/16 pinned when this workaround was first
+    # written. Letting Inductor autotune the backward freely (job 545) picked
+    # 16 across the board and ran 11.6% faster end to end -- 181.53 vs 162.62
+    # TFLOP/s -- at identical memory. Smaller tiles mean less shared memory
+    # per block, so more blocks stay resident; at head_dim=512 occupancy
+    # matters more than tile size. The original 16/32/32/16 was chosen to
+    # stop a launch failure, never benchmarked against alternatives.
     "BLOCK_M1": 16,
-    "BLOCK_N1": 32,
-    "BLOCK_M2": 32,
+    "BLOCK_N1": 16,
+    "BLOCK_M2": 16,
     "BLOCK_N2": 16,
 }
 
@@ -236,6 +243,15 @@ def deepseek_v4_flash_8k_gb300(seq_len: int | None = 8192) -> Trainer.Config:
     The tuned recipe behind the leaf-compile measurements in this branch.
     Levers, each measured against the one before it:
 
+    - ``optimizer.implementation = "fused_opt_states_bf16"`` -- fused AdamW
+      with bf16 moment buffers, halving optimizer state again on top of the
+      bf16 training dtype.
+    - ``training.dtype = "bfloat16"`` -- full bf16 training: parameters,
+      gradients and optimizer states, with no fp32 master copy. This is the
+      lever that makes the model fit at all; torchtitan's ``float32`` default
+      costs ~80 GiB per rank here (measured: 178 GiB peak with it, 260 GiB
+      without, which on a 277 GiB card means allocator pressure and ~4% lost
+      throughput).
     - ``expert_parallel_degree=4`` -- one node's NVLink group per expert
       group; the stock 64 scored 18.29 TFLOP/s against 21.2 here.
     - ``block_size=32`` on the DSA block mask (+15.8%), plus the GB300 tile
@@ -268,6 +284,10 @@ def deepseek_v4_flash_8k_gb300(seq_len: int | None = 8192) -> Trainer.Config:
         expert_parallel_degree=4,
     )
     config.activation_checkpoint = FullAC.Config()
+    optimizer = default_adamw(lr=8e-4)
+    optimizer.implementation = "fused_opt_states_bf16"
+    config.optimizer = optimizer
+    config.training.dtype = "bfloat16"
     config.training.mixed_precision_reduce = "bfloat16"
     config.training.num_tokens_per_microbatch_per_dp_rank = seq_len or 8192
     config.training.max_context_length = seq_len or 8192
@@ -342,4 +362,88 @@ def deepseek_v4_flash_8k_gb300_batched_stages2_profile(
     config.profiler.profile_freq = 10
     config.profiler.profiler_warmup = 3
     config.profiler.profiler_active = 2
+    return config
+
+
+def deepseek_v4_flash_8k_gb300_free_bwd_tiles(
+    microbatch: int = 4, seq_len: int | None = 8192, autotune: bool = True
+) -> Trainer.Config:
+    """The GB300 recipe with the BACKWARD flex tiles unpinned.
+
+    ``BLOCK_M1/N1/M2/N2`` were pinned because at head_dim=512 the backward
+    otherwise died with "CUDA error: unspecified launch failure", and the pin
+    also caps those tiles at ``block_size`` (32), which is why the backward
+    kernel has been the single largest cost in every profile (40%+ of kernel
+    time). If a newer Inductor can pick valid backward tiles on its own, they
+    may be larger than 32 and the backward may get cheaper. Autotune defaults
+    back ON here, since with nothing pinned Inductor has to search for a
+    configuration that fits in 232,448 B of shared memory.
+
+    The forward tiles stay pinned: those were needed for the forward to
+    compile at all.
+    """
+    from torchtitan.models.common.attention import FlexInnerAttention
+
+    config = deepseek_v4_flash_8k_gb300_batched(microbatch, seq_len)
+    for layer in config.model_spec.model.layers:
+        inner = getattr(getattr(layer, "attention", None), "inner_attention", None)
+        if isinstance(inner, FlexInnerAttention.Config):
+            inner.kernel_options = {
+                k: v
+                for k, v in _GB300_FLEX_KERNEL_OPTIONS.items()
+                if not k.startswith(("BLOCK_M1", "BLOCK_N1", "BLOCK_M2", "BLOCK_N2"))
+            }
+            inner.max_autotune = autotune
+    return config
+
+
+def deepseek_v4_flash_8k_gb300_fp32_params(
+    microbatch: int = 4, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """fp32 parameters with bf16 optimizer states -- the configuration
+    ``fused_opt_states_bf16`` is actually for.
+
+    On top of ``training.dtype="bfloat16"`` the flag is a no-op: full bf16
+    training already puts parameters, gradients AND optimizer states in bf16,
+    so there is nothing left for it to halve (measured: 192.71 GiB either
+    way, 162.62 vs 162.68 TFLOP/s). Its real use is the other trade -- keep
+    fp32 master weights for convergence safety and pay for them with bf16
+    moments instead of fp32 ones. This config measures what that costs.
+    """
+    config = deepseek_v4_flash_8k_gb300_batched(microbatch, seq_len)
+    config.training.dtype = "float32"
+    return config
+
+
+def deepseek_v4_flash_8k_gb300_fastdata(
+    microbatch: int = 4, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The GB300 recipe with the input pipeline widened.
+
+    This tree uses Grain, not the PyTorch DataLoader, so the familiar
+    ``num_workers`` / ``prefetch_factor`` / ``persistent_workers`` /
+    ``pin_memory`` knobs do not exist. The equivalents are:
+
+    - ``read_options.num_threads`` (default 16) -- Grain's reader threads,
+      the analogue of ``num_workers``;
+    - ``read_options.prefetch_buffer_size`` (default 500) -- records read
+      ahead, the analogue of ``prefetch_factor``;
+    - ``num_prefetch_batches`` (default 2) -- assembled batches held ready.
+
+    Grain's workers are persistent and its output is already pinned, so those
+    two flags have no counterpart to set. ``resize_fn`` / ``max_patches`` are
+    vision knobs and do not apply to a text model.
+
+    Expectation: little or nothing. The 4x profile has the GPU idle 1.2% of
+    the step, which bounds anything the input pipeline can win -- a starved
+    loader would show up as idle gaps. Measured here so the question is
+    settled rather than assumed.
+    """
+    config = deepseek_v4_flash_8k_gb300_batched(microbatch, seq_len)
+    import grain
+
+    config.dataloader.read_options = grain.ReadOptions(
+        num_threads=32, prefetch_buffer_size=2000
+    )
+    config.dataloader.num_prefetch_batches = 8
     return config
