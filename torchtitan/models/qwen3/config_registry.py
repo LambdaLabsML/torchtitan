@@ -1038,6 +1038,90 @@ def qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead() -> Traine
     return config
 
 
+# ---------------------------------------------------------------------------
+# TAKE 2, 2026-09-29/30: ATTENTION BACKEND.
+#
+# Everything above ran the default attn_backend="flex". Profiling the stacked
+# best config (qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead,
+# "B" below; torch profiler, rank 0, one 4.80 s step) showed where the step
+# actually went:
+#     flex_attention backward    1743.7 ms  32.5% of kernel time
+#     MoE grouped GEMMs          1128.1 ms  21.0%
+#     NCCL                        717.8 ms  13.4%
+#     flex_attention forward      201.8 ms   3.8%
+# The backward was 8.6x its own forward. Inductor's pick for it was 128x128
+# tiles at 4 warps and 255 registers/thread (i.e. spilling), with the q/k
+# RMSNorm, RoPE and GQA expand prologue-fused into the template. The same
+# lesson -- the attention backward kernel is the first thing to fix -- was the
+# largest single lever on the GB300 DeepSeek-V4-flash campaign.
+#
+# Both alternatives keep the same document-causal masking; only the kernel
+# changes. Measured on 8x B200, 100 steps, TF/GPU over steps 21-100 (mean /
+# median), same day:
+#     B            (job 5456)  630.97 / 633.42   159.88GiB   loss@100 6.469
+#     B_flexflash  (job 5457)  858.15 / 867.39   161.42GiB   loss@100 6.475  +36.0%
+#     B_varlen     (job 5462)  894.18 / 911.70   159.09GiB   loss@100 6.486  +41.7%
+# B re-measured job 1340's 631.84 to within 0.1%, so the comparison holds
+# across the three weeks since. MFU stays N/A (MXFP8), compare TF/GPU.
+# ---------------------------------------------------------------------------
+
+
+def _qwen3_30b_a3b_best_with_attn_backend(attn_backend: str) -> Trainer.Config:
+    config = qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.model_spec = model_registry(
+        "30B-A3B",
+        attn_backend=attn_backend,
+        converters=[
+            MXFP8LinearConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=["attention", "lm_head"],
+            ),
+        ],
+    )
+    return config
+
+
+def qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_flexflash() -> Trainer.Config:
+    """B with FlexAttention's FLASH backend (FA4 / CuTe DSL), block_size (256, 128).
+
+    Same block mask as flex, but FA4's Blackwell-native kernels instead of the
+    Triton template, so the spilling backward and its fused prologue are gone.
+    CUDA graphs stay on.
+
+    MEASURED (job 5457): 858.15 TF/GPU mean, 867.39 median, 22,836 tok/s/GPU,
+    161.42GiB -- +36.0% over B (630.97, job 5456). Loss tracks B (6.475 vs
+    6.469 at step 100, unseeded). On gpt_oss 20b (head_dim 64, sliding windows)
+    the same switch was worth only +0.2 pts; Qwen3's head_dim 128 GQA-8 causal
+    shape is where the Triton backward was worst.
+    """
+    return _qwen3_30b_a3b_best_with_attn_backend("flex_flash")
+
+
+def qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_varlen() -> Trainer.Config:
+    """B with varlen (flash-attention varlen) attention. THE FASTEST BACKEND.
+
+    varlen's cu_seqlens change shape every step, so CUDA graphs must be off
+    (RESULTS_GPTOSS20B.md) -- a forced second variable, and it still wins.
+
+    MEASURED (job 5462): 894.18 TF/GPU mean, 911.70 median, 23,795 tok/s/GPU,
+    159.09GiB -- +41.7% over B and +4.2% over _flexflash. Loss@100 6.486.
+    The mean trails the median because of periodic dataloader stalls (c4 shard
+    fetches every ~2.13M tokens/rank, plus one 255 TF/GPU step at 37), not the
+    backend.
+
+    Post-change profile (job 5481, 3.27 s step): grouped GEMM 28.7%, NCCL
+    24.6% of kernel time (GPU busy 99.2%, so mostly overlapped), elementwise
+    15.4%, dense GEMM + attention 13.4%, MXFP8 quantize 8.2%, MoE dispatch
+    gather backward 4.7%.
+    """
+    config = _qwen3_30b_a3b_best_with_attn_backend("varlen")
+    config.training.disable_cuda_graphs = True
+    return config
+
+
 def qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_seed42() -> Trainer.Config:
     """The stacked config at seed=42, for the numerics comparison its parent needs."""
     config = qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead()
