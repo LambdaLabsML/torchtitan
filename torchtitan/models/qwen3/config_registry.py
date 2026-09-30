@@ -33,6 +33,7 @@ from torchtitan.hf_datasets.text_datasets import (
     HuggingFaceTextDataLoader,
 )
 from torchtitan.models.common.config_utils import decoder_vocab_size
+from torchtitan.tools.profiler import Profiler
 from torchtitan.trainer import Trainer
 
 from . import model_registry
@@ -1191,6 +1192,27 @@ def qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_varlen_bf16
     """
     config = qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_varlen()
     config.optimizer.implementation = "fused_opt_states_bf16"
+    return config
+
+
+def qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_varlen_profile() -> Trainer.Config:
+    """_varlen with the torch profiler capturing step 20, traces to
+    outputs/profiling/traces_varlen/. Run with TT_STEPS=24 and read it with
+    analyze_trace_qwen3.py. Profiling adds overhead: take throughput from
+    the unprofiled _varlen (job 5462), not from this.
+
+    Job 5481 (3.27 s step, rank 0): grouped GEMM 28.7%, NCCL 24.6% of kernel
+    time (GPU busy 99.2%), elementwise 15.4%, dense GEMM + attention 13.4%,
+    MXFP8 quantize 8.2%, MoE dispatch-gather backward
+    (indexing_backward_kernel) 4.7%.
+    """
+    config = qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_varlen()
+    config.profiler = Profiler.Config(
+        enable_profiling=True,
+        profile_freq=20,
+        save_traces_folder="profiling/traces_varlen",
+    )
+    config.training.steps = 24
     return config
 
 
