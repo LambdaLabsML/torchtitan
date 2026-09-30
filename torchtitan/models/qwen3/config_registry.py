@@ -1122,6 +1122,78 @@ def qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_varlen() ->
     return config
 
 
+# ---------------------------------------------------------------------------
+# TAKE 2: BF16 TRAINING RECIPE -- memory for bs=12/14 on the new backends.
+#
+# fp32 params + grads + AdamW moments cost 16 B/param = 56.9GiB/rank here.
+# Two ways to cut it, from the GB300 DeepSeek-V4-flash recipe:
+#   _bf16train      training.dtype="bfloat16": params, grads and moments in
+#                   bf16 (8 B/param, -28.4GiB). No fp32 master weights.
+#   _bf16optstates  optimizer.implementation="fused_opt_states_bf16": fp32
+#                   master weights, bf16 moments (12 B/param, -14.2GiB).
+# Neither is faster at a fixed batch (job 5470: 857.21 vs 858.15 TF/GPU on
+# _flexflash, -29GiB); the win is the batch they open.
+#
+# THE BEST STACK so far (8x B200, 100 steps, TF/GPU steps 21-100 mean /
+# median), all with TORCHTITAN_FP32_MATMUL_PRECISION=tf32 and
+# --training.local_batch_size N:
+#   _varlen_bf16train      bs=12 (job 6173)  942.02 / 963.82  149.84GiB
+#   _varlen_bf16optstates  bs=12 (job 6174)  934.84 / 954.09  164.36GiB
+#   _varlen_bf16train      bs=14 (job 6175)  953.31 / 963.13  169.94GiB (95.3%)
+# against 630.97 / 633.42 for B (job 5456): +49 to +51%. bs=14's median
+# equals bs=12's; its mean lead is mostly that it missed the one-off ~296
+# TF/GPU dataloader stall 6173/6174 hit, and it sits at 95.3% of HBM. Use
+# bs=12 for throughput numbers; _bf16optstates for real training until
+# _bf16train has a seeded loss comparison.
+# ---------------------------------------------------------------------------
+
+
+def qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_flexflash_bf16train() -> Trainer.Config:
+    """_flexflash with full-bf16 training: params, grads AND AdamW states in bf16.
+
+    MEASURED (job 5470): 857.21 TF/GPU mean, 871.11 median, 132.45GiB -- flat
+    against _flexflash (858.15, job 5457) at -28.97GiB. Loss@100 6.558 vs
+    6.475, unseeded.
+
+    NUMERICS: no fp32 master weights. AdamW updates below bf16's resolution
+    of the weight are lost; needs a seeded loss comparison before a real run.
+    """
+    config = qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_flexflash()
+    config.training.dtype = "bfloat16"
+    return config
+
+
+def qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_varlen_bf16train() -> Trainer.Config:
+    """_varlen with full-bf16 training (see _flexflash_bf16train). Run at bs=12.
+
+    MEASURED, --training.local_batch_size 12:
+        job 5479             904.04 / 922.47 TF/GPU  149.84GiB  (+1.1% vs _varlen)
+        job 6173  + tf32     942.02 / 963.82 TF/GPU  149.84GiB  BEST AT bs=12
+    and at --training.local_batch_size 14 + tf32:
+        job 6175             953.31 / 963.13 TF/GPU  169.94GiB (95.3%)
+    """
+    config = qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_varlen()
+    config.training.dtype = "bfloat16"
+    return config
+
+
+def qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_varlen_bf16optstates() -> Trainer.Config:
+    """_varlen with fp32 master weights + bf16 AdamW moments. Run at bs=12.
+
+    The configuration ``fused_opt_states_bf16`` is actually for: keep fp32
+    params for convergence safety and pay for them with bf16 exp_avg /
+    exp_avg_sq (-14.2GiB/rank, half of _bf16train).
+
+    MEASURED, --training.local_batch_size 12:
+        job 5480             898.64 / 917.01 TF/GPU  164.36GiB  (+0.5% vs _varlen)
+        job 6174  + tf32     934.84 / 954.09 TF/GPU  164.36GiB
+    ~0.8% behind _varlen_bf16train at bs=12; the choice for real training.
+    """
+    config = qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_varlen()
+    config.optimizer.implementation = "fused_opt_states_bf16"
+    return config
+
+
 def qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_seed42() -> Trainer.Config:
     """The stacked config at seed=42, for the numerics comparison its parent needs."""
     config = qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead()
