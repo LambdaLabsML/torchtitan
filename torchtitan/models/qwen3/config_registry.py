@@ -1195,6 +1195,38 @@ def qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_varlen_bf16
     return config
 
 
+def qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_varlen_bf16train_loaderworkers() -> Trainer.Config:
+    """_varlen_bf16train with the c4 dataloader moved off the training process.
+    THE FASTEST QWEN3-30B-A3B CONFIG. Run at bs=12 with tf32:
+
+        TORCHTITAN_FP32_MATMUL_PRECISION=tf32 \\
+            --training.local_batch_size 12
+
+    num_workers defaults to 0, so streaming c4 -- the HTTP shard reads and the
+    tokenization -- ran inside the training process every step. varlen has
+    CUDA graphs off, so that CPU time sat on the kernel-launch path, and every
+    ~2.13M tokens/rank (26 steps at bs=10, ~22 at bs=12) a shard fetch stalled
+    a step outright. Four persistent, pinned, prefetching workers take it off.
+
+    MEASURED at bs=12 + tf32, TF/GPU steps 21-100, same day:
+        _varlen_bf16train (control, job 6177)  943.95 mean /   963.64 median  25,119 tok/s/GPU
+        this config               (job 6180)   985.33 mean / 1,012.31 median  26,220 tok/s/GPU
+    +4.4% tok/s, +5.1% median, 149.84GiB either way; +56.2% over the take-1
+    best (630.97, job 5456). Slow steps (<850 TF/GPU) 5/80 -> 3/80; one
+    ~300 TF/GPU stall per run remains (a local c4 copy would remove it).
+    Loss@100 6.563 (unseeded; worker interleaving changes the sample order).
+
+    packing_buffer_size, resize_fn and max_patches are multimodal-loader
+    fields (mm_datasets.py) and do not exist on HuggingFaceTextDataLoader.
+    """
+    config = qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_varlen_bf16train()
+    config.dataloader.num_workers = 4
+    config.dataloader.persistent_workers = True
+    config.dataloader.prefetch_factor = 4
+    config.dataloader.pin_memory = True
+    return config
+
+
 def qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_varlen_profile() -> Trainer.Config:
     """_varlen with the torch profiler capturing step 20, traces to
     outputs/profiling/traces_varlen/. Run with TT_STEPS=24 and read it with
