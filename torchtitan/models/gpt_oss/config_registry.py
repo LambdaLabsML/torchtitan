@@ -1214,6 +1214,9 @@ def gptoss20b_mxfp8_lmhead_sacgmm_bs5() -> Trainer.Config:
 
     Ran seeded only (job 6376, seed 42, 300 steps, 146.54GiB) as the
     reference for jobs 6377-6379.
+
+    Ran seeded only (job 6376, seed 42, 300 steps, 146.54GiB) as the
+    reference for jobs 6377-6379.
     """
     config = gptoss20b_mxfp8_lmhead()
     config.activation_checkpoint = SelectiveAC.Config(save_grouped_mm=True)
@@ -1273,4 +1276,31 @@ def gptoss20b_mxfp8_lmhead_bf16reduce_bf16train_sacgmm_noreshard_bs5_biasgemm() 
     """
     return _enable_expert_bias_grad_gemm(
         gptoss20b_mxfp8_lmhead_bf16reduce_bf16train_sacgmm_noreshard_bs5()
+    )
+
+
+def _set_swiglu_contiguous_halves(config: Trainer.Config) -> Trainer.Config:
+    for layer in config.model_spec.model.layers:
+        layer.moe.routed_experts.inner_experts.swiglu_interleaved = False
+    return config
+
+
+def gptoss20b_mxfp8_lmhead_bf16reduce_bf16train_sacgmm_noreshard_bs5_biasgemm_swigluhalves() -> Trainer.Config:
+    """The wave-2 stack (_sacgmm_noreshard_bs5_biasgemm; job 6374 with tf32 +
+    pointwise autotune: 986.95 TF/GPU mean, 991.61 median) with the mlp1
+    output stored as contiguous [gate | linear] halves instead of interleaved.
+
+    In that stack's profile (job 6375, 1.31 s step) the swiglu forward and
+    the two swiglu-backward kernels are the largest non-GEMM compute: 27.9 +
+    59.6 + 45.5 = 133 ms, ~2.5 ms per layer for the backward against ~0.7 ms
+    for its bytes. The interleaved split x[..., ::2] / x[..., 1::2] makes
+    every load and store in them stride 2. Same model up to a fixed
+    permutation of mlp1's rows (CPU check: outputs and all grads bitwise
+    equal after permuting); from-scratch training only.
+
+    NOT YET MEASURED: queued as job 7258 against control 7257, both with
+    tf32 + pointwise autotune.
+    """
+    return _set_swiglu_contiguous_halves(
+        gptoss20b_mxfp8_lmhead_bf16reduce_bf16train_sacgmm_noreshard_bs5_biasgemm()
     )
