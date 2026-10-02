@@ -1068,3 +1068,73 @@ def gptoss20b_mxfp8_lmhead_profile() -> Trainer.Config:
     )
     config.training.steps = 24
     return config
+
+
+def gptoss20b_mxfp8_lmhead_bf16reduce() -> Trainer.Config:
+    """gptoss20b_mxfp8_lmhead with gradients reduce-scattered in bf16.
+
+    The reference still reduces in fp32 (mixed_precision_reduce defaults to
+    "float32"), so every step FSDP widens each block's bf16 gradients into an
+    fp32 buffer (chunk_cat_cuda_kernel<float, BFloat16>, 90 ms per profiled
+    step on the compute stream in traces_20b_best) and reduce-scatters twice
+    the bytes (ReduceScatter_Sum_f32, 587 ms on the comm stream; mostly
+    overlapped, but the last blocks' reduce-scatters trail the backward).
+    Same lever as gpt_oss_120b_bf16reduce, +5.0% there (jobs 2295 vs 2292,
+    confirmed three times), and every take-2 Qwen3 config reduces in bf16.
+
+    NUMERICS: gradients summed across 8 shards in bf16. On the 120b, seeded
+    loss diffs stayed within +-0.016 over 600 paired steps.
+
+    MEASURED (job 6212, steps 21-100): 840.97 TF/GPU mean, 841.44 median,
+    130.61GiB -- +2.0% over the same-week reference (gptoss20b_mxfp8_lmhead,
+    job 6237: 824.26 / 824.17). Seeded (seed 42, 300 steps, bs=5,
+    save_grouped_mm; jobs 6377 vs 6376): loss within +-0.015 of fp32 reduce
+    per 100-step window.
+    """
+    config = gptoss20b_mxfp8_lmhead()
+    config.training.mixed_precision_reduce = "bfloat16"
+    return config
+
+
+def gptoss20b_mxfp8_lmhead_bf16reduce_bf16train() -> Trainer.Config:
+    """_bf16reduce with full-bf16 training: params, grads AND AdamW states in bf16
+    (the GB300 recipe, split/04; take2-qwen3/bf16-training-recipe).
+
+    What it removes on this model: the fp32 -> bf16 parameter cast FSDP
+    does before each all-gather, half of the fused-AdamW traffic (24 ms per
+    profiled step in traces_20b_best), and the fp32 sharded-gradient
+    buffers. 16 -> 8 bytes per parameter frees ~19.5GiB per rank at 20.9B
+    parameters, from 131.53GiB. On Qwen3-30B-A3B it was flat at equal batch
+    (job 5470) and paid only once the memory was spent. Here the memory goes
+    to saved expert GEMMs (take2-gptoss20b/sac-save-grouped-mm); spending it
+    on MemoryBudgetAC 0.6 instead OOMed asking for the same 1.41GiB as job
+    1026 (job 6217).
+
+    NUMERICS: no fp32 master weights. AdamW updates below bf16's resolution
+    of the weight are lost; needs a seeded loss comparison before a real run.
+
+    MEASURED (job 6216): 845.80 / 846.50 TF/GPU, 110.49GiB (-21.0GiB) --
+    +2.6% over the reference (job 6237), +0.6% over _bf16reduce. Seeded
+    against fp32 (jobs 6378 vs 6376, bs=5, 300 steps): +0.16 loss over steps
+    11-100, then -0.015 (101-200) and -0.048 (201-300). No divergence; not
+    cleared for long runs.
+    """
+    config = gptoss20b_mxfp8_lmhead_bf16reduce()
+    config.training.dtype = "bfloat16"
+    return config
+
+
+def gptoss20b_mxfp8_lmhead_bf16reduce_bf16optstates() -> Trainer.Config:
+    """_bf16reduce with fp32 master weights + bf16 AdamW moments.
+
+    The convergence-safe half of _bf16train: fused_opt_states_bf16 keeps fp32
+    params and halves only exp_avg / exp_avg_sq (~-9.7GiB per rank). On
+    Qwen3-30B-A3B it trailed _bf16train by ~0.8% (jobs 6174 vs 6173) and is
+    the choice for real training.
+
+    MEASURED (job 6220): 840.75 / 841.12 TF/GPU, 120.88GiB -- level with
+    _bf16reduce at -9.7GiB.
+    """
+    config = gptoss20b_mxfp8_lmhead_bf16reduce()
+    config.optimizer.implementation = "fused_opt_states_bf16"
+    return config
