@@ -1788,3 +1788,28 @@ def gpt_oss_120b_bf16reduce_lr3e4_take2stack_sacgmm_tail6() -> Trainer.Config:
         save_grouped_mm_from_layer=30,
     )
     return config
+
+
+def gpt_oss_120b_bf16reduce_lr3e4_take2stack_skipexperts() -> Trainer.Config:
+    """The take-2 stack with the routed experts kept out of FSDP
+    (ParallelismConfig.fsdp_skip_unsharded_experts).
+
+    At EP=8 on 8 GPUs the expert data-parallel mesh (efsdp) has one rank:
+    each of the 128 experts lives on exactly one GPU and nothing needs
+    gathering or reducing. FSDP2 still wraps them as a one-rank param group
+    and, every step, copies each block's 16 local experts (~398M params,
+    ~0.8GB bf16) into fresh unsharded storage in forward, again in backward
+    (reshard_after_forward), and copies their gradients through the
+    reduce-scatter staging buffer -- order 4 x 0.8GB of copies per block, 36
+    blocks, all on the critical path's streams. It is also why
+    gpt_oss_120b_noreshard cost ~+29GiB at bs=1 (job 1507): "never" kept a
+    second, unsharded copy of every expert resident.
+
+    The GB300 lineage removed the same kind of staging copy for EP=2 experts
+    with FSDP direct all-gather / reduce-scatter (split/39, split/42: +5.6%
+    and +1.3% there); at efsdp=1 the copy has no collective behind it at all,
+    so the experts simply leave FSDP. Expect lower peak memory as well.
+    """
+    config = gpt_oss_120b_bf16reduce_lr3e4_take2stack()
+    config.parallelism.fsdp_skip_unsharded_experts = True
+    return config

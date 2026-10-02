@@ -135,6 +135,22 @@ class ParallelismConfig:
     only `data_parallel_shard_degree` can be negative. 1 means disabled.
     """
 
+    fsdp_skip_unsharded_experts: bool = False
+    """
+    With expert parallelism, keep the routed experts out of FSDP when the
+    expert data-parallel mesh (``efsdp``) has a single rank, i.e. when
+    ``expert_parallel_degree`` equals the data-parallel shard degree.
+
+    Each expert then lives on exactly one rank, so there is nothing to gather
+    or reduce -- but FSDP2 still manages the experts as a one-rank param group
+    and, every step, copies each block's expert weights into fresh unsharded
+    storage in forward and again in backward, and copies their gradients
+    through the reduce-scatter staging buffer. Skipping FSDP for them
+    (``fully_shard(..., ignored_params=...)``) removes those copies; the
+    experts stay EP-sharded DTensors and their gradients accumulate in place.
+    No effect when ``efsdp`` has more than one rank.
+    """
+
     fsdp_reshard_after_forward: Literal["default", "always", "never"] = "default"
     """
     `reshard_after_forward` specifies the policy for applying `reshard_after_forward`
