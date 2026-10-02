@@ -120,6 +120,7 @@ def apply_fsdp_to_decoder(
     dp_mesh_dims: "DataParallelMeshDims | None" = None,
     edp_mesh_dims: "DataParallelMeshDims | None" = None,
     enable_symm_mem: bool = False,
+    skip_unsharded_experts: bool = False,
 ):
     """
     Apply data parallelism (via FSDP2) to a decoder-style transformer model.
@@ -206,6 +207,20 @@ def apply_fsdp_to_decoder(
                 reshard_after_forward=reshard_after_forward_policy == "always",
             )
 
+    # Experts excluded from FSDP (ParallelismConfig.fsdp_skip_unsharded_experts):
+    # with a one-rank expert DP mesh FSDP would only copy them every step.
+    ignored_expert_params: set[nn.Parameter] = set()
+    skip_experts = (
+        skip_unsharded_experts
+        and ep_degree > 1
+        and edp_mesh is not None
+        and edp_mesh.size() == 1
+    )
+    if skip_experts:
+        logger.info(
+            "fsdp: efsdp mesh has one rank; routed experts are kept out of FSDP"
+        )
+
     for layer_id, transformer_block in model.layers.items():
         # NOTE: In an MoE layer, we use shard_placement_fn to apply different
         # FSDP mesh and shard placement to different parameters:
@@ -255,6 +270,14 @@ def apply_fsdp_to_decoder(
                     **fsdp_config,
                     reshard_after_forward=reshard_after_forward,
                     shard_placement_fn=_experts_shard_placement_fn,
+                )
+            elif skip_experts:
+                ignored_expert_params |= expert_params
+                fully_shard(
+                    transformer_block,
+                    **fsdp_config,
+                    reshard_after_forward=reshard_after_forward,
+                    ignored_params=expert_params,
                 )
             else:
                 # ep_degree > 1: per-param mesh
@@ -307,7 +330,12 @@ def apply_fsdp_to_decoder(
                 reshard_after_forward=reshard_after_forward,
             )
 
-    fully_shard(model, **fsdp_config)
+    fully_shard(
+        model,
+        **fsdp_config,
+        # The root would otherwise claim every parameter no child manages.
+        ignored_params=ignored_expert_params or None,
+    )
 
     if enable_symm_mem:
         enable_fsdp_symm_mem(model)
