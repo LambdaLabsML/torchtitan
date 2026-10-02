@@ -1714,3 +1714,22 @@ def gpt_oss_120b_bf16reduce_lr3e4_mxfp8_attn_lmhead() -> Trainer.Config:
         ],
     )
     return config
+
+
+def gpt_oss_120b_bf16reduce_lr3e4_take2stack() -> Trainer.Config:
+    """Every bf16 take-2 lever above at once, so one night yields both the
+    per-lever A/B and the stacked number: bias grad GEMM, contiguous-halves
+    swiglu, dataloader workers and SelectiveAC without RNG preservation.
+
+    Run with TORCHTITAN_FP32_MATMUL_PRECISION=tf32 and pointwise autotune
+    (TT_INDUCTOR="TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1
+    TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1"), the GPT-OSS-20B best's
+    environment. MXFP8 is left out: it is the one lever here that adds memory
+    on a config at 94.8% of HBM. Drop any lever that measures negative on its
+    own and re-run before quoting this.
+    """
+    config = gpt_oss_120b_bf16reduce_lr3e4_norng()
+    _enable_expert_bias_grad_gemm(config)
+    _set_swiglu_contiguous_halves(config)
+    _set_loader_workers(config)
+    return config
