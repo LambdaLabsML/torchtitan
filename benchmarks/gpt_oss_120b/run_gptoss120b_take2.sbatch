@@ -28,9 +28,13 @@
 #   sbatch --export=ALL,TT_REPO=...,TT_CONFIG=...,TORCHTITAN_FP32_MATMUL_PRECISION=tf32 ...
 #   TT_INDUCTOR="A=1 B=2" sbatch --export=ALL,TT_REPO=...,TT_CONFIG=... ...
 #   (TT_EXTRA / TT_INDUCTOR go in the environment: a space inside --export splits it)
+#
+# qos=dev (priority 500) is interactive-only and rejects sbatch; launch this
+# script under dev with srun_dev.sh, which passes the same knobs through:
+#   TT_REPO=<worktree> TT_CONFIG=<config> [knobs] srun_dev.sh <label>
 #SBATCH --job-name=tt-gptoss120b-take2
 #SBATCH --partition=b200full_1
-#SBATCH --qos=dev
+#SBATCH --qos=short
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:8
 #SBATCH --exclusive
