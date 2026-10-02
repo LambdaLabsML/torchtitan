@@ -1220,3 +1220,57 @@ def gptoss20b_mxfp8_lmhead_sacgmm_bs5() -> Trainer.Config:
     config.parallelism.fsdp_reshard_after_forward = "default"
     config.training.local_batch_size = 5
     return config
+
+
+def _enable_expert_bias_grad_gemm(config: Trainer.Config) -> Trainer.Config:
+    for layer in config.model_spec.model.layers:
+        layer.moe.routed_experts.inner_experts.bias_grad_gemm = True
+    return config
+
+
+def gptoss20b_mxfp8_lmhead_biasgemm() -> Trainer.Config:
+    """gptoss20b_mxfp8_lmhead with the expert bias gradients as one-hot GEMMs
+    (GptOssGroupedExperts.Config.bias_grad_gemm, moe.ExpertBiasAdd).
+
+    Target: in traces_20b_best the three kernels that fuse the swiglu
+    backward with the mlp1/mlp2 bias-gradient index_put scatter run 135.6,
+    100.6 and 97.2 ms per profiled step (3.4-4.7 ms per layer): R = 262,144
+    rows land on 33 bias rows, ~8,000 atomic adds per address. The same
+    gradient is (P, R) x (R, X) one-hot GEMM; the forward gather-add is
+    unchanged, so its fusion into the swiglu is kept.
+
+    NUMERICS: forward and every non-bias gradient are bitwise identical to
+    stock (CPU check); the bias gradients accumulate in fp32 inside the GEMM
+    and are deterministic. Against an fp64 segment sum at 2,000 rows per
+    expert: one-hot GEMM 1.7e-3 relative error, eager bf16 index_put 5.3e-2.
+
+    MEASURED (job 6238): 832.41 / 832.44 TF/GPU, 131.53GiB -- +1.0% over the
+    reference (job 6237), at the edge of the ~0.7% noise band.
+    """
+    return _enable_expert_bias_grad_gemm(gptoss20b_mxfp8_lmhead())
+
+
+def gptoss20b_mxfp8_lmhead_bf16reduce_bf16train_sacgmm_noreshard_bs5_biasgemm() -> Trainer.Config:
+    """The wave-1 best (_bf16train_sacgmm_noreshard_bs5, job 6218, 959.78
+    TF/GPU) with the one-hot-GEMM expert bias gradient.
+
+    On the reference _biasgemm measured +1.0% (832.41 vs 824.26, jobs 6238
+    vs 6237), at the edge of the ~0.7% noise band; this re-measures it on
+    the stack, where saving the expert GEMMs changed what the backward does.
+
+    MEASURED (job 6373): 968.89 / 970.72 TF/GPU, +0.7% over _noreshard_bs5
+    (job 6371). THE BEST CONFIG, run with
+    TORCHTITAN_FP32_MATMUL_PRECISION=tf32 and
+    TT_INDUCTOR="TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1
+    TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1": 986.95 / 991.61 TF/GPU,
+    160.95GiB (job 6374), 987.14 / 988.97 seeded (job 6379) -- +19.7% over
+    the reference (job 6237). Reproduce with:
+
+        TORCHTITAN_FP32_MATMUL_PRECISION=tf32 \\
+        TT_INDUCTOR="TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1 TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1" \\
+        sbatch --time=01:30:00 --export=ALL,TT_REPO=<worktree>,TT_CONFIG=<this config> \\
+            benchmarks/gpt_oss_20b/run_gptoss20b_take2.sbatch
+    """
+    return _enable_expert_bias_grad_gemm(
+        gptoss20b_mxfp8_lmhead_bf16reduce_bf16train_sacgmm_noreshard_bs5()
+    )
