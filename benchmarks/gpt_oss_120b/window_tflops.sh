@@ -2,15 +2,15 @@
 # Mean / median TF/GPU, tok/s/GPU and peak memory of a GPT-OSS-120B run over a
 # fixed step window, so runs capped by walltime compare like for like.
 #
-# Usage: window_tflops.sh <log> [first_step=200] [last_step=1500]
+# Usage: window_tflops.sh <log> [first_step=21] [last_step=200]
 #
 # The 120b throughput climbs for the first few hundred steps while the expert
 # load balancer converges (job 2278 vs 2268), so a whole-run mean depends on
 # how far the run got before --time stopped it. Read every A/B pair over the
 # same window. Accepts torchtitan's thousands separator ("1,012.31").
 LOG=${1:?usage: window_tflops.sh <log> [first_step] [last_step]}
-LO=${2:-200}
-HI=${3:-1500}
+LO=${2:-21}
+HI=${3:-200}
 sed -r 's/\x1B\[[0-9;]*[mGKH]//g' "$LOG" \
   | grep -E 'step: *[0-9]+.*tflops:' \
   | awk -v lo="$LO" -v hi="$HI" '
