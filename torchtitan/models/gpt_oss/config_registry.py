@@ -1138,3 +1138,85 @@ def gptoss20b_mxfp8_lmhead_bf16reduce_bf16optstates() -> Trainer.Config:
     config = gptoss20b_mxfp8_lmhead_bf16reduce()
     config.optimizer.implementation = "fused_opt_states_bf16"
     return config
+
+
+def gptoss20b_mxfp8_lmhead_bf16reduce_bf16train_sacgmm_bs6() -> Trainer.Config:
+    """_bf16train with SelectiveAC saving the expert GEMMs, at bs=6, FSDP
+    resharding by default.
+
+    MemoryBudgetAC(0.5) recomputes the expert GEMMs: in traces_20b_best the
+    forward-layout grouped-mm kernel runs 106 times against 58 for each
+    backward kernel, i.e. all 48 per-step expert GEMMs twice, ~300 ms. Stock
+    SelectiveAC is no better -- aten._grouped_mm is in neither save list and
+    unlisted ops default to PREFER_RECOMPUTE. save_grouped_mm=True
+    (perf/sac-save-grouped-mm) fixes that: +13.9% on gpt-oss-20b at equal
+    batch on 64x GB300 (job 61 vs sac_compile).
+
+    Memory, from B200 measurements: selac_compile ~7.5GiB per batch unit
+    (job 997), saving mlp1 (R, 2F) + mlp2 (R, D) ~11.8GiB per unit (GB300 job
+    61), ~29.5GiB fixed under bf16 training -> bs=6 ~146GiB. no-reshard
+    (+34GiB) does not fit at bs=6; _noreshard_bs5 trades one batch unit for
+    it. Try bs=7 (~165GiB) with TT_EXTRA if this lands low.
+
+    MEASURED (job 6213): 933.93 / 935.10 TF/GPU, 143.51GiB (80.5%) -- +13.3%
+    over the reference (job 6237). _noreshard_bs5 beats it.
+    """
+    config = gptoss20b_mxfp8_lmhead_bf16reduce_bf16train()
+    config.activation_checkpoint = SelectiveAC.Config(save_grouped_mm=True)
+    config.parallelism.fsdp_reshard_after_forward = "default"
+    config.training.local_batch_size = 6
+    return config
+
+
+def gptoss20b_mxfp8_lmhead_bf16reduce_bf16train_sacgmm_noreshard_bs5() -> Trainer.Config:
+    """_sacgmm with no-reshard kept, at bs=5 (~160GiB estimated).
+
+    no-reshard was +0.70 pts on selac_compile (job 1014). This asks whether
+    it is still worth a batch unit once the expert GEMMs are saved; on GB300
+    it stopped paying under memory pressure (880.7 at bs=6 vs 917.0 at bs=4).
+
+    MEASURED (job 6218): 959.78 / 961.37 TF/GPU, 160.95GiB (90.2%) -- +16.4%
+    over the reference (job 6237). Re-measured 962.37 / 964.31 (job 6371);
+    965.64 / 967.05 with TORCHTITAN_FP32_MATMUL_PRECISION=tf32 (job 6372).
+    bs=6 with no-reshard does not fit (~+19GiB per batch unit).
+    """
+    config = gptoss20b_mxfp8_lmhead_bf16reduce_bf16train_sacgmm_bs6()
+    config.parallelism.fsdp_reshard_after_forward = "never"
+    config.training.local_batch_size = 5
+    return config
+
+
+def gptoss20b_mxfp8_lmhead_bf16reduce_sacgmm_bs5() -> Trainer.Config:
+    """_sacgmm without bf16 training: fp32 master weights and AdamW states.
+
+    Separates save_grouped_mm from the bf16 recipe. fp32 costs ~19.5GiB more
+    fixed memory (~49GiB), so bs=5 at default reshard (~146GiB).
+
+    MEASURED (job 6219): 910.71 / 912.44 TF/GPU, 143.65GiB -- +10.5% over
+    the reference (job 6237): save_grouped_mm without bf16 training.
+    """
+    config = gptoss20b_mxfp8_lmhead_bf16reduce()
+    config.activation_checkpoint = SelectiveAC.Config(save_grouped_mm=True)
+    config.parallelism.fsdp_reshard_after_forward = "default"
+    config.training.local_batch_size = 5
+    return config
+
+
+def gptoss20b_mxfp8_lmhead_sacgmm_bs5() -> Trainer.Config:
+    """save_grouped_mm at bs=5 with the reference's fp32 numerics: fp32 master
+    weights, fp32 AdamW states and fp32 gradient reduce.
+
+    The numerics control for the bf16 recipe. Run seeded (--debug.seed 42)
+    beside _bf16reduce_sacgmm_bs5 and _bf16train_sacgmm_noreshard_bs5:
+    same batch and same math (reshard policy does not change the result),
+    so loss differences are bf16 reduce / bf16 training alone. Default
+    reshard because fp32 + no-reshard at bs=5 (~178GiB) does not fit.
+
+    Ran seeded only (job 6376, seed 42, 300 steps, 146.54GiB) as the
+    reference for jobs 6377-6379.
+    """
+    config = gptoss20b_mxfp8_lmhead()
+    config.activation_checkpoint = SelectiveAC.Config(save_grouped_mm=True)
+    config.parallelism.fsdp_reshard_after_forward = "default"
+    config.training.local_batch_size = 5
+    return config
