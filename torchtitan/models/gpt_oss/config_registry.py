@@ -1743,3 +1743,41 @@ def gpt_oss_120b_bf16reduce_lr3e4_take2stack() -> Trainer.Config:
     _set_swiglu_contiguous_halves(config)
     _set_loader_workers(config)
     return config
+
+
+# ---------------------------------------------------------------------------
+# Take 2, wave 2 (2026-10-03): three more levers on the take-2 stack.
+#
+# gpt_oss_120b_bf16reduce_lr3e4_take2stack + tf32 + pointwise autotune (job
+# 7627, normal warmup): 772.73 mean / 776.29 median TF/GPU over steps
+# 1000-1500 (+13.1% / +12.0% over job 2307), peak 165.88GiB (93.01%); over
+# 200 steps (job 7605) 571.35 / 574.00 over steps 101-200, 164.27GiB.
+# ---------------------------------------------------------------------------
+
+
+def gpt_oss_120b_bf16reduce_lr3e4_take2stack_sacgmm_tail6() -> Trainer.Config:
+    """The take-2 stack, saving the expert GEMM outputs in the last 6 of 36
+    blocks instead of recomputing them (SelectiveAC.Config.save_grouped_mm
+    with save_grouped_mm_from_layer=30).
+
+    SelectiveAC recomputes every aten._grouped_mm in backward because torch's
+    compute_intensive_ops predates grouped mm. Saving them all was
+    GPT-OSS-20B's largest take-2 lever (+16.4%, job 6218), but here it costs
+    ~1.13GiB per block at bs=2 (mlp1 out ~65,536 x 5,760 bf16 + mlp2 out
+    ~65,536 x 2,880), ~41GiB for all 36 -- far past the 178GiB card. The
+    stack peaks ~12GiB under the card (93%), and every 120b config at >=97%
+    has stalled, so this spends ~6.8GiB of it on 6 blocks (~172GiB, 96.5%).
+    Sweep the count on the command line:
+        TT_EXTRA="--activation_checkpoint.save_grouped_mm_from_layer 33"
+
+    If peak memory does not rise by ~1.1GiB per saved block, compile reused
+    one block's graph and policy across layers and the per-layer cutoff did
+    nothing -- read the memory before the throughput.
+    """
+    config = gpt_oss_120b_bf16reduce_lr3e4_take2stack()
+    config.activation_checkpoint = SelectiveAC.Config(
+        preserve_rng_state=False,
+        save_grouped_mm=True,
+        save_grouped_mm_from_layer=30,
+    )
+    return config
