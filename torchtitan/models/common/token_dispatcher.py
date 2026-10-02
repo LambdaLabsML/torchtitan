@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, cast
@@ -32,6 +33,100 @@ class LocalDispatchMetadata:
 
     token_indices_experts_sorted_N: torch.Tensor  # noqa: N815
     topk_scores_experts_sorted_N: torch.Tensor  # noqa: N815
+    # MOE_PERM_* only: the expert-sort permutation over N = T*K flattened
+    # (token, slot) pairs and its inverse; see _PermGather / _PermCombine.
+    perm_N: torch.Tensor | None = None  # noqa: N815
+    inv_perm_N: torch.Tensor | None = None  # noqa: N815
+
+
+# MOE_PERM_GATHER=1 / MOE_PERM_COMBINE=1 (EP=1 LocalTokenDispatcher only).
+# The dispatch gather x_TD[perm // K] and the combine scatter_add both move
+# rows through the same permutation. Stock autograd treats them as general
+# index / scatter ops: the gather's backward is the sort-based
+# indexing_backward_kernel (205 ms/step on Qwen3-30B-A3B, 48 x 4.2 ms at 81,920
+# tokens x top-8) and the combine is a deterministic scatter_add. Since every
+# token appears exactly K times, both reduce to "gather through the inverse
+# permutation, then sum the K copies": deterministic, atomic-free, and fusable
+# by inductor into one reduction.
+_PERM_GATHER = os.environ.get("MOE_PERM_GATHER", "0") == "1"
+_PERM_COMBINE = os.environ.get("MOE_PERM_COMBINE", "0") == "1"
+
+
+def _acc_dtype(t: torch.Tensor) -> torch.dtype:
+    """Accumulate the K copies in at least fp32 (the stock bf16 scatter_add
+    accumulated in bf16)."""
+    return torch.promote_types(t.dtype, torch.float32)
+
+
+class _PermGather(torch.autograd.Function):
+    """out_ND = x_TD[perm_N // K]; backward sums the K copies of each token."""
+
+    @staticmethod
+    def forward(ctx, x_TD, perm_N, inv_perm_N, top_k: int):
+        ctx.save_for_backward(inv_perm_N)
+        ctx.top_k = top_k
+        return x_TD[perm_N // top_k]
+
+    @staticmethod
+    def backward(ctx, grad_ND):
+        (inv_perm_N,) = ctx.saved_tensors
+        K = ctx.top_k
+        D = grad_ND.shape[-1]
+        grad_TD = (
+            grad_ND[inv_perm_N].view(-1, K, D).sum(dim=1, dtype=_acc_dtype(grad_ND))
+        ).to(grad_ND.dtype)
+        return grad_TD, None, None, None
+
+
+class _PermCombine(torch.autograd.Function):
+    """out_TD[t] = sum_k y_ND[inv_perm_N[t*K + k]]; backward is a plain gather."""
+
+    @staticmethod
+    def forward(ctx, y_ND, perm_N, inv_perm_N, top_k: int):
+        ctx.save_for_backward(perm_N)
+        ctx.top_k = top_k
+        D = y_ND.shape[-1]
+        return (
+            y_ND[inv_perm_N].view(-1, top_k, D).sum(dim=1, dtype=_acc_dtype(y_ND))
+        ).to(y_ND.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_TD):
+        (perm_N,) = ctx.saved_tensors
+        return grad_TD[perm_N // ctx.top_k], None, None, None
+
+
+# MOE_EP_PERM=1 (AllToAllTokenDispatcher, EP > 1). The EP path moves rows
+# through permutations four times per layer: the pre-all-to-all expert sort
+# x_TD[perm // K], the rank-major -> expert-major _permute (a bijection over the
+# R received rows), its inverse _unpermute, and the combine scatter_add. Stock
+# autograd differentiates the two gathers with scatter/index_put kernels
+# (tma_scatter_add_kernel 66 ms + indexing_backward_kernel 22 ms per profiled
+# step on GPT-OSS-120B, traces_120b_best_v2) and runs _unpermute and the combine
+# as scatters. With the inverse permutations in hand all four are plain gathers
+# in both directions (the K-duplicate ones sum their copies in fp32), using
+# _PermGather / _PermCombine above and _PermRows below.
+_EP_PERM = os.environ.get("MOE_EP_PERM", "0") == "1"
+
+
+def _inverse_permutation(perm: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(perm).scatter_(
+        0, perm, torch.arange(perm.numel(), device=perm.device)
+    )
+
+
+class _PermRows(torch.autograd.Function):
+    """out = x[perm] for a bijection perm; backward is grad[inv_perm]."""
+
+    @staticmethod
+    def forward(ctx, x_RD, perm_R, inv_perm_R):
+        ctx.save_for_backward(inv_perm_R)
+        return x_RD[perm_R]
+
+    @staticmethod
+    def backward(ctx, grad_RD):
+        (inv_perm_R,) = ctx.saved_tensors
+        return grad_RD[inv_perm_R], None, None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -42,6 +137,8 @@ class AllToAllDispatchMetadata(LocalDispatchMetadata):
     permuted_indices: torch.Tensor  # for _unpermute
     input_splits: list[int]
     output_splits: list[int]
+    # MOE_EP_PERM only: inverse of permuted_indices (R received rows).
+    inv_permuted_indices: torch.Tensor | None = None
 
 
 class LocalTokenDispatcher(Configurable):
@@ -105,6 +202,36 @@ class LocalTokenDispatcher(Configurable):
             topk_scores_experts_sorted_N,
         )
 
+    def _local_reorder_perm(
+        self,
+        x_TD: torch.Tensor,
+        topk_scores_TK: torch.Tensor,
+        topk_expert_ids_TK: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """_local_reorder that also returns the permutation and its inverse."""
+        perm_N = torch.argsort(topk_expert_ids_TK.view(-1), stable=True)
+        topk_scores_experts_sorted_N = topk_scores_TK.view(-1)[perm_N]
+        inv_perm_N = torch.empty_like(perm_N).scatter_(
+            0, perm_N, torch.arange(perm_N.numel(), device=perm_N.device)
+        )
+        token_indices_experts_sorted_N = perm_N // self.top_k
+        if _PERM_GATHER:
+            routed_input_ND = _PermGather.apply(x_TD, perm_N, inv_perm_N, self.top_k)
+        else:
+            routed_input_ND = x_TD[token_indices_experts_sorted_N]
+        return (
+            routed_input_ND,
+            token_indices_experts_sorted_N,
+            topk_scores_experts_sorted_N,
+            perm_N,
+            inv_perm_N,
+        )
+
+    def _use_perm(self) -> bool:
+        # Exact class only: EP dispatchers subclass this and reuse
+        # _local_reorder after the all-to-all, where rows are not T*K.
+        return (_PERM_GATHER or _PERM_COMBINE) and type(self) is LocalTokenDispatcher
+
     def dispatch(
         self,
         x_TD: torch.Tensor,
@@ -127,14 +254,26 @@ class LocalTokenDispatcher(Configurable):
             metadata: LocalDispatchMetadata for combine()
         """
         # R = N (no EP all-to-all)
-        (
-            routed_input_RD,
-            token_indices_experts_sorted_N,
-            topk_scores_experts_sorted_N,
-        ) = self._local_reorder(x_TD, topk_scores_TK, topk_expert_ids_TK)
+        perm_N = inv_perm_N = None
+        if self._use_perm():
+            (
+                routed_input_RD,
+                token_indices_experts_sorted_N,
+                topk_scores_experts_sorted_N,
+                perm_N,
+                inv_perm_N,
+            ) = self._local_reorder_perm(x_TD, topk_scores_TK, topk_expert_ids_TK)
+        else:
+            (
+                routed_input_RD,
+                token_indices_experts_sorted_N,
+                topk_scores_experts_sorted_N,
+            ) = self._local_reorder(x_TD, topk_scores_TK, topk_expert_ids_TK)
         metadata = LocalDispatchMetadata(
             token_indices_experts_sorted_N=token_indices_experts_sorted_N,
             topk_scores_experts_sorted_N=topk_scores_experts_sorted_N,
+            perm_N=perm_N,
+            inv_perm_N=inv_perm_N,
         )
         return routed_input_RD, num_local_tokens_per_expert_E, metadata
 
@@ -153,6 +292,15 @@ class LocalTokenDispatcher(Configurable):
         Returns:
             out_TD: ``(T, D)`` combined output.
         """
+        if _PERM_COMBINE and metadata.inv_perm_N is not None:
+            scored_RD = (
+                routed_output_RD.to(torch.float32)
+                * metadata.topk_scores_experts_sorted_N.reshape(-1, 1)
+            ).to(routed_output_RD.dtype)
+            return _PermCombine.apply(
+                scored_RD, metadata.perm_N, metadata.inv_perm_N, self.top_k
+            )
+
         out_TD = torch.zeros_like(x_TD)
 
         routed_output_RD = (
@@ -412,11 +560,20 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
         ep_size = self.ep_mesh.size()
         # _local_reorder returns (N, D) where N = T*K.
         # EP all-to-all below produces (R, D) where R != N.
-        (
-            routed_input_ND,
-            token_indices_experts_sorted_N,
-            topk_scores_experts_sorted_N,
-        ) = self._local_reorder(x_TD, topk_scores_TK, topk_expert_ids_TK)
+        use_perm = self._use_ep_perm()
+        perm_N = inv_perm_N = None
+        if use_perm:
+            perm_N = torch.argsort(topk_expert_ids_TK.view(-1), stable=True)
+            inv_perm_N = _inverse_permutation(perm_N)
+            topk_scores_experts_sorted_N = topk_scores_TK.view(-1)[perm_N]
+            token_indices_experts_sorted_N = perm_N // self.top_k
+            routed_input_ND = _PermGather.apply(x_TD, perm_N, inv_perm_N, self.top_k)
+        else:
+            (
+                routed_input_ND,
+                token_indices_experts_sorted_N,
+                topk_scores_experts_sorted_N,
+            ) = self._local_reorder(x_TD, topk_scores_TK, topk_expert_ids_TK)
 
         if (
             get_spmd_backend() == "spmd_types" and spmd.is_type_checking()
@@ -486,6 +643,7 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
             ) = self._permute(
                 routed_input_RD,
                 num_global_tokens_per_local_expert_E,
+                use_perm=use_perm,
             )
 
         metadata = AllToAllDispatchMetadata(
@@ -495,6 +653,11 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
             permuted_indices=permuted_indices,
             input_splits=input_splits_list,
             output_splits=output_splits_list,
+            perm_N=perm_N,
+            inv_perm_N=inv_perm_N,
+            inv_permuted_indices=(
+                _inverse_permutation(permuted_indices) if use_perm else None
+            ),
         )
         return routed_input_RD, num_global_tokens_per_local_expert_e, metadata
 
@@ -502,6 +665,7 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
         self,
         routed_input_RD,
         num_global_tokens_per_local_expert_E,
+        use_perm: bool = False,
     ):
         """Reorder tokens from rank-major to expert-major layout.
 
@@ -545,11 +709,30 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
         )
 
         num_global_tokens_per_local_expert_e = t_mat.sum(0)
+        if use_perm:
+            # permuted_indices is a bijection over the R rows, so the backward
+            # is a gather through its inverse instead of an index_put scatter.
+            permuted_RD = _PermRows.apply(
+                routed_input_RD,
+                permuted_indices,
+                _inverse_permutation(permuted_indices),
+            )
+        else:
+            permuted_RD = routed_input_RD[permuted_indices, :]
         return (
             routed_input_RD.shape,
-            routed_input_RD[permuted_indices, :],
+            permuted_RD,
             permuted_indices,
             num_global_tokens_per_local_expert_e,
+        )
+
+    def _use_ep_perm(self) -> bool:
+        # Exact class only: TorchAOTokenDispatcher overrides _permute with
+        # token-group padding, where the rows are not a bijection.
+        return (
+            _EP_PERM
+            and type(self) is AllToAllTokenDispatcher
+            and get_spmd_backend() != "spmd_types"
         )
 
     def _unpermute(self, routed_output_RD, input_shape, permuted_indices):
@@ -593,9 +776,17 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
                 else self.ep_mesh.get_group()
             )
             # Reverse expert-major reordering
-            routed_output_RD = self._unpermute(
-                routed_output_RD, metadata.input_shape, metadata.permuted_indices
-            )
+            if metadata.inv_permuted_indices is not None:
+                # out[perm[i]] = y[i]  <=>  out = y[inv_perm]; backward y.grad = g[perm]
+                routed_output_RD = _PermRows.apply(
+                    routed_output_RD,
+                    metadata.inv_permuted_indices,
+                    metadata.permuted_indices,
+                )
+            else:
+                routed_output_RD = self._unpermute(
+                    routed_output_RD, metadata.input_shape, metadata.permuted_indices
+                )
             # All-to-all combine: returns AsyncCollectiveTensor — the a2a runs
             # on the NCCL stream and won't block until the tensor is accessed.
             routed_output_RD = self._combine_token_exchange(
@@ -617,6 +808,13 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
             routed_output_RD.to(torch.float32)
             * metadata.topk_scores_experts_sorted_N.reshape(-1, 1)
         ).to(routed_output_RD.dtype)
+
+        if metadata.perm_N is not None:
+            # MOE_EP_PERM: every token has exactly top_k rows, so the combine is a
+            # gather through the inverse sort plus a K-way fp32 sum.
+            return _PermCombine.apply(
+                routed_output_RD, metadata.perm_N, metadata.inv_perm_N, self.top_k
+            )
 
         token_indices_experts_sorted_N = metadata.token_indices_experts_sorted_N
 
