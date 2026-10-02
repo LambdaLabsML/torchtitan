@@ -1676,3 +1676,36 @@ def gpt_oss_120b_bf16reduce_lr3e4_norng() -> Trainer.Config:
     config = gpt_oss_120b_bf16reduce_lr3e4()
     config.activation_checkpoint = SelectiveAC.Config(preserve_rng_state=False)
     return config
+
+
+def gpt_oss_120b_bf16reduce_lr3e4_mxfp8_attn_lmhead() -> Trainer.Config:
+    """gpt_oss_120b_bf16reduce_lr3e4 with MXFP8 on the attention linears and
+    lm_head, as in every GPT-OSS-20B and Qwen3-30B-A3B take-2 config.
+
+    A retry, not a first try. gpt_oss_120b_mxfp8_linears_lmhead (job 1301)
+    read 468.26 TF/GPU on the old lr=8e-4 base at 170.77GiB / 96%, against
+    ~566 for the bf16 base at the time (job 208) -- and its attention-only
+    sibling oscillated with 7 expandable_segments mapping failures (job
+    1300). That was diagnosed as allocator pressure, not quantize cost: the
+    MXFP8 transients (+1.50GiB, jobs 1304 vs 1305) landed a 96% config in
+    the >=97% region where every 120b config has collapsed. The lr=3e-4 base
+    peaks at 169.13GiB (94.83%, job 2307), ~3GiB lower, which is the room
+    this needs. Attention + lm_head are ~32% of the per-token GEMM work.
+
+    Read TF/GPU, not MFU (N/A for low-precision runs). lm_head output feeds
+    the loss directly: reject on a visibly higher loss curve even if faster.
+    """
+    config = gpt_oss_120b_bf16reduce_lr3e4()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.model_spec = model_registry(
+        "120b",
+        converters=[
+            MXFP8LinearConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=["attention", "lm_head"],
+            ),
+        ],
+    )
+    return config
