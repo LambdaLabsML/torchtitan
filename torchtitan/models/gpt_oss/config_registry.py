@@ -1624,3 +1624,28 @@ def gpt_oss_120b_bf16reduce_lr3e4_swigluhalves() -> Trainer.Config:
     -4.5GiB peak and 6 slow steps (<350 TF/GPU) against the control's 23.
     """
     return _set_swiglu_contiguous_halves(gpt_oss_120b_bf16reduce_lr3e4())
+
+
+def _set_loader_workers(config: Trainer.Config) -> Trainer.Config:
+    config.dataloader.num_workers = 4
+    config.dataloader.persistent_workers = True
+    config.dataloader.prefetch_factor = 4
+    config.dataloader.pin_memory = True
+    return config
+
+
+def gpt_oss_120b_bf16reduce_lr3e4_loaderworkers() -> Trainer.Config:
+    """gpt_oss_120b_bf16reduce_lr3e4 with the c4 dataloader moved off the
+    training process: 4 persistent, pinned, prefetching workers per rank.
+
+    Every 120b config so far leaves num_workers at 0, so the streaming c4
+    reads and tokenization run inline every step, and with CUDA graphs off
+    (varlen) that CPU time sits on the kernel-launch path; a shard fetch
+    stalls a step outright every ~2.13M tokens/rank (~130 steps at bs=2).
+    The 120b's per-rank CPU stalls already show up as rank skew in the EP
+    all-to-all (traces_120b_best: seven ranks parked ~185 ms in one SendRecv
+    waiting for a rank whose CPU was busy). Same change as
+    take2-qwen3/dataloader-workers, +4.4% tok/s on Qwen3-30B-A3B (job 6180
+    vs 6177). Worker interleaving changes the sample order.
+    """
+    return _set_loader_workers(gpt_oss_120b_bf16reduce_lr3e4())
