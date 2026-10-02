@@ -107,8 +107,13 @@ class ExpertBiasAdd(torch.autograd.Function):
         return grad_RX, grad_EX, None, None
 
 
-def swiglu(x, alpha: float = 1.702, limit: float = 7.0):
-    x_glu, x_linear = x[..., ::2], x[..., 1::2]
+def swiglu(
+    x, alpha: float = 1.702, limit: float = 7.0, interleaved: bool = True
+):
+    if interleaved:
+        x_glu, x_linear = x[..., ::2], x[..., 1::2]
+    else:
+        x_glu, x_linear = x.chunk(2, dim=-1)
     # Clamp the input values
     x_glu = x_glu.clamp(min=None, max=limit)
     x_linear = x_linear.clamp(min=-limit, max=limit)
@@ -121,6 +126,12 @@ class GptOssGroupedExperts(GroupedExperts):
     @dataclass(kw_only=True, slots=True)
     class Config(GroupedExperts.Config):
         swiglu_limit: float = 7.0
+        swiglu_interleaved: bool = True
+        """mlp1 output columns alternate gate / linear (the HF checkpoint
+        layout). False stores them as contiguous halves [gate | linear], so
+        the swiglu and its backward read and write unit-stride instead of
+        stride 2. Same model up to a fixed permutation of mlp1's output rows;
+        for from-scratch training only (GptOssStateDictAdapter refuses it)."""
         bias_grad_gemm: bool = False
         """Add the per-expert biases with ExpertBiasAdd, whose backward is a
         one-hot GEMM instead of an index_put scatter. Off under spmd_types type
@@ -133,6 +144,7 @@ class GptOssGroupedExperts(GroupedExperts):
         num_experts = config.num_experts
         self.num_experts = num_experts
         self.swiglu_limit = config.swiglu_limit
+        self.swiglu_interleaved = config.swiglu_interleaved
         self.bias_grad_gemm = config.bias_grad_gemm
 
         self.mlp1_weight_EGD = nn.Parameter(
@@ -243,7 +255,9 @@ class GptOssGroupedExperts(GroupedExperts):
         else:
             h_RG = h_RG + b1[expert_idx_R].to(h_RG.dtype)
 
-        h_RF = swiglu(h_RG, limit=self.swiglu_limit)
+        h_RF = swiglu(
+            h_RG, limit=self.swiglu_limit, interleaved=self.swiglu_interleaved
+        )
         h_RD = self._grouped_mm(
             A=h_RF, B_t=mlp2_weight_EDF.transpose(-2, -1).bfloat16(), offs=offsets_E
         )
