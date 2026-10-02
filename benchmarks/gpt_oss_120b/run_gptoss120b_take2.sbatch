@@ -95,7 +95,8 @@ git -C "$REPO" rev-parse --short HEAD
 git -C "$REPO" rev-parse --abbrev-ref HEAD
 git -C "$REPO" status --porcelain
 echo "--- env knobs ---"
-for v in TORCHTITAN_FP32_MATMUL_PRECISION CUBLAS_NEW LD_PRELOAD TT_INDUCTOR; do
+for v in TORCHTITAN_FP32_MATMUL_PRECISION CUBLAS_NEW LD_PRELOAD TT_INDUCTOR \
+         MOE_EP_PERM MOE_PERM_GATHER MOE_PERM_COMBINE PYTORCH_ALLOC_CONF; do
     echo "$v=${!v:-<unset>}"
 done
 env | grep -E "^TORCHINDUCTOR_" | sort || echo "no TORCHINDUCTOR_* set"
