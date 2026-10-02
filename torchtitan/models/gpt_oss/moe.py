@@ -64,6 +64,49 @@ class ScaleBiasForward(torch.autograd.Function):
         return grad_output, None, None
 
 
+class ExpertBiasAdd(torch.autograd.Function):
+    """``h_RX + bias_EX[expert_idx_R] / tp_degree``, with the bias gradient as
+    a one-hot GEMM.
+
+    Stock autograd differentiates ``bias_EX[expert_idx_R]`` with an
+    ``index_put(accumulate=True)``: R rows (262,144 at bs=8) scattered into
+    E+1 = 33 bias rows. Under compile inductor fuses that scatter into the
+    swiglu-backward pointwise kernels as atomic adds with ~8,000-way contention
+    per address; those kernels ran 3.5-4.7 ms per layer in traces_20b_best,
+    against ~1.5 ms for the bytes they move. Rows are grouped by expert, so
+    the gradient is ``onehot_PR @ grad_RX``: one (P, R) x (R, X) GEMM with
+    fp32 accumulation, no atomics, and a deterministic result.
+
+    The forward is the same gather-add as before, so inductor still folds it
+    into the swiglu (mlp1) or the output add (mlp2). Like ScaleBiasForward the
+    bias is scaled by 1/tp_degree in the forward only.
+    """
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def forward(ctx, h_RX, bias_EX, expert_idx_R, tp_degree):
+        ctx.save_for_backward(expert_idx_R)
+        ctx.num_bias_rows = bias_EX.shape[0]
+        if tp_degree > 1:
+            bias_EX = bias_EX / tp_degree
+        return h_RX + bias_EX[expert_idx_R].to(h_RX.dtype)
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def backward(ctx, grad_RX):
+        (expert_idx_R,) = ctx.saved_tensors
+        E = ctx.num_bias_rows
+        # Pad the one-hot's row count to a multiple of 8 for the GEMM's
+        # alignment; the padding rows are all zero and sliced off.
+        P = (E + 7) // 8 * 8
+        onehot_PR = (
+            torch.arange(P, device=expert_idx_R.device).unsqueeze(1)
+            == expert_idx_R.unsqueeze(0)
+        ).to(grad_RX.dtype)
+        grad_EX = torch.mm(onehot_PR, grad_RX)[:E]
+        return grad_RX, grad_EX, None, None
+
+
 def swiglu(x, alpha: float = 1.702, limit: float = 7.0):
     x_glu, x_linear = x[..., ::2], x[..., 1::2]
     # Clamp the input values
@@ -78,6 +121,10 @@ class GptOssGroupedExperts(GroupedExperts):
     @dataclass(kw_only=True, slots=True)
     class Config(GroupedExperts.Config):
         swiglu_limit: float = 7.0
+        bias_grad_gemm: bool = False
+        """Add the per-expert biases with ExpertBiasAdd, whose backward is a
+        one-hot GEMM instead of an index_put scatter. Off under spmd_types type
+        checking, which needs ScaleBiasForward's typecheck."""
 
     def __init__(self, config: Config):
         Module.__init__(self)
@@ -86,6 +133,7 @@ class GptOssGroupedExperts(GroupedExperts):
         num_experts = config.num_experts
         self.num_experts = num_experts
         self.swiglu_limit = config.swiglu_limit
+        self.bias_grad_gemm = config.bias_grad_gemm
 
         self.mlp1_weight_EGD = nn.Parameter(
             torch.empty((num_experts, hidden_dim * 2, dim))
@@ -183,10 +231,17 @@ class GptOssGroupedExperts(GroupedExperts):
             offs=offsets_E,
         )
 
+        bias_grad_gemm = self.bias_grad_gemm and not (
+            get_spmd_backend() == "spmd_types" and spmd.is_type_checking()
+        )
+
         b1 = torch.cat(
             [mlp1_bias_EG, mlp1_bias_EG.new_zeros(1, mlp1_bias_EG.shape[-1])]
         )
-        h_RG = h_RG + b1[expert_idx_R].to(h_RG.dtype)
+        if bias_grad_gemm:
+            h_RG = ExpertBiasAdd.apply(h_RG, b1, expert_idx_R, 1)
+        else:
+            h_RG = h_RG + b1[expert_idx_R].to(h_RG.dtype)
 
         h_RF = swiglu(h_RG, limit=self.swiglu_limit)
         h_RD = self._grouped_mm(
@@ -197,6 +252,8 @@ class GptOssGroupedExperts(GroupedExperts):
         b2 = torch.cat(
             [mlp2_bias_ED, mlp2_bias_ED.new_zeros(1, mlp2_bias_ED.shape[-1])]
         )
+        if bias_grad_gemm:
+            return ExpertBiasAdd.apply(h_RD, b2, expert_idx_R, tp_degree)
         # ScaleBiasForward is an autograd.Function, so its input is a real tensor
         # either way -- the gather cannot be folded away here the way it is for
         # mlp1. This still drops one full-size (R, D) write, since previously
