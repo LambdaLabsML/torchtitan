@@ -17,12 +17,14 @@
 #     knobs);
 #   - HF auth from ~/.hf_token, so streamed c4 does not hit HTTP 429.
 #
-# Step count. TT_STEPS defaults to UNSET, i.e. the config's own 10000, and the
-# run is capped by --time instead. --training.steps N clamps the LR warmup to N
-# (lr_scheduler.py), which on this model changes the router's trajectory and
-# with it the expert balance and the throughput plateau (jobs 2268-2278 vs
-# 237). Compare runs over the same step window with window_tflops.sh.
-#
+# Step count. TT_STEPS defaults to 200 (the 20b take-2 runs used 100), read
+# over steps 21-200 with window_tflops.sh. --training.steps N also clamps the
+# LR warmup to N (lr_scheduler.py), so these runs warm up over 200 steps
+# instead of the config's 2000: comparable to each other, not to the
+# walltime-capped 120b runs (jobs 2307, 7559), whose throughput was still
+# rising past step 200 as the expert balancer converged. TT_STEPS= (empty)
+# restores the config's 10000 steps, capped by --time.
+
 # Submit with:
 #   sbatch --export=ALL,TT_REPO=<worktree>,TT_CONFIG=<config> run_gptoss120b_take2.sbatch
 #   sbatch --export=ALL,TT_REPO=...,TT_CONFIG=...,TORCHTITAN_FP32_MATMUL_PRECISION=tf32 ...
@@ -39,12 +41,12 @@
 #SBATCH --gres=gpu:8
 #SBATCH --exclusive
 #SBATCH --mem=0
-#SBATCH --time=00:50:00
+#SBATCH --time=00:20:00
 #SBATCH --output=/data/dj-mat-torchtitan-mfu/logs/gptoss120b-take2-%j.out
 
 set -x
 : "${TT_CONFIG:?set TT_CONFIG to a gpt_oss config_registry function name}"
-: "${TT_STEPS:=}"
+: "${TT_STEPS=200}"
 : "${TT_SEED:=}"
 : "${TT_EXTRA:=}"
 : "${TT_INDUCTOR:=}"
@@ -105,7 +107,7 @@ echo "=========================="
 STEPS_ARG=""
 if [ -n "$TT_STEPS" ]; then
     STEPS_ARG="--training.steps $TT_STEPS"
-    echo "WARNING: TT_STEPS=$TT_STEPS also rewrites the LR warmup; see the header."
+    echo "NOTE: TT_STEPS=$TT_STEPS also clamps the LR warmup to $TT_STEPS; see the header."
 fi
 SEED_ARG=""
 if [ -n "$TT_SEED" ]; then
@@ -115,7 +117,7 @@ fi
 # shellcheck disable=SC2086
 NGPU=8 MODULE=gpt_oss CONFIG="$TT_CONFIG" ./run_train.sh \
     $STEPS_ARG \
-    --metrics.log_freq 10 \
+    --metrics.log_freq 1 \
     $SEED_ARG \
     $TT_EXTRA
 TRAIN_RC=$?
