@@ -1654,3 +1654,21 @@ def gpt_oss_120b_bf16reduce_lr3e4_loaderworkers() -> Trainer.Config:
     Steps 21-100 are slower while the workers spin up (21-200 mean -0.2%).
     """
     return _set_loader_workers(gpt_oss_120b_bf16reduce_lr3e4())
+
+
+def gpt_oss_120b_bf16reduce_lr3e4_norng() -> Trainer.Config:
+    """gpt_oss_120b_bf16reduce_lr3e4 with preserve_rng_state=False in the
+    SelectiveAC policy.
+
+    GPT-OSS has no dropout or other in-block randomness, so stashing and
+    restoring CUDA RNG state around each of the 36 checkpointed blocks buys
+    nothing. On the diverging lr=8e-4 base it read 651.42 mean / 664.30
+    median TF/GPU over steps 200-1500 at 169.29GiB (job 2310) against
+    654.69 / 666.06 at 172.54GiB for its control (job 2311) -- level on
+    throughput, -3.25GiB peak -- but both runs were past the divergence that
+    gpt_oss_120b_bf16reduce_lr3e4 fixes, so this re-measures it on the
+    stable trajectory. Numerics-neutral while the block stays deterministic.
+    """
+    config = gpt_oss_120b_bf16reduce_lr3e4()
+    config.activation_checkpoint = SelectiveAC.Config(preserve_rng_state=False)
+    return config
