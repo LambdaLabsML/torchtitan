@@ -1262,7 +1262,7 @@ def gptoss20b_mxfp8_lmhead_bf16reduce_bf16train_sacgmm_noreshard_bs5_biasgemm() 
     the stack, where saving the expert GEMMs changed what the backward does.
 
     MEASURED (job 6373): 968.89 / 970.72 TF/GPU, +0.7% over _noreshard_bs5
-    (job 6371). THE BEST CONFIG, run with
+    (job 6371). Best without the swiglu layout change (see _swigluhalves), run with
     TORCHTITAN_FP32_MATMUL_PRECISION=tf32 and
     TT_INDUCTOR="TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1
     TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1": 986.95 / 991.61 TF/GPU,
@@ -1298,8 +1298,14 @@ def gptoss20b_mxfp8_lmhead_bf16reduce_bf16train_sacgmm_noreshard_bs5_biasgemm_sw
     permutation of mlp1's rows (CPU check: outputs and all grads bitwise
     equal after permuting); from-scratch training only.
 
-    NOT YET MEASURED: queued as job 7258 against control 7257, both with
-    tf32 + pointwise autotune.
+    MEASURED, both with TORCHTITAN_FP32_MATMUL_PRECISION=tf32 and pointwise
+    autotune (TT_INDUCTOR as in _biasgemm above): 1,010.27 TF/GPU mean,
+    1,012.19 median, 32,263 tok/s/GPU, 160.95GiB (job 7258) against the
+    same-day control _sacgmm_noreshard_bs5_biasgemm at 986.40 / 990.12
+    (job 7257) -- +2.4% mean, +2.2% median. THE BEST CONFIG: +22.6% over
+    the reference gptoss20b_mxfp8_lmhead (824.26, job 6237). Loss@100 6.576
+    vs 6.514 (unseeded; the layouts differ by a row permutation, so the
+    same seed is not the same initialization).
     """
     return _set_swiglu_contiguous_halves(
         gptoss20b_mxfp8_lmhead_bf16reduce_bf16train_sacgmm_noreshard_bs5_biasgemm()
