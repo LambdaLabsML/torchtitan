@@ -1727,6 +1727,16 @@ def gpt_oss_120b_bf16reduce_lr3e4_take2stack() -> Trainer.Config:
     environment. MXFP8 is left out: it is the one lever here that adds memory
     on a config at 94.8% of HBM. Drop any lever that measures negative on its
     own and re-run before quoting this.
+
+    MEASURED with tf32 + pointwise autotune:
+        200 steps (job 7605)    571.35 / 574.00 over steps 101-200, 164.27GiB,
+                                +14.4% over _lr3e4 (job 7597, 499.23 / 511.53)
+        normal warmup (job 7627) 772.73 / 776.29 over steps 1000-1500,
+                                737.17 / 755.77 over 200-1500, 165.88GiB (93.01%),
+                                vs job 2307 683.39 / 693.04 and 646.41 / 676.34:
+                                +13.1% / +12.0% at the plateau.
+    tf32, pointwise autotune and cuBLAS 13.8 were each neutral alone (jobs 7601,
+    7604, 7607: within +-0.5% of the control).
     """
     config = gpt_oss_120b_bf16reduce_lr3e4_norng()
     _enable_expert_bias_grad_gemm(config)
