@@ -1828,6 +1828,21 @@ def gpt_oss_120b_bf16reduce_lr3e4_take2stack_skipexperts() -> Trainer.Config:
 #   _take2stack                  560.59  167.00GiB  (job 7628)
 #   _take2stack_skipexperts      585.69  141.72GiB  (job 7630)  +4.5%, -25.3GiB
 #   _take2stack_sacgmm_tail6     569.59  168.95GiB  (job 7629)  +1.6%, +1.95GiB
+#
+# Measured against _take2stack_skipexperts (job 7632, 601.66, 142.27GiB):
+#   _skipexperts_sacgmmall                 669.84  166.95GiB  +11.3%  (job 7636)
+#   + MOE_EP_PERM=1                        631.02  142.52GiB   +4.9%  (job 7640)
+#   --training.local_batch_size 3          617.54  168.30GiB   +2.6%  (job 7633)
+#   --training.global_batch_size 64 (GA=4) 651.01  167.01GiB   +8.2%  (job 7639)
+#   --training.global_batch_size 32 (GA=2) 617.16  168.32GiB   +2.6%  (job 7637)
+#   local 1 / global 16 (GA=2)             594.50  141.50GiB   -1.2%  (job 7638)
+#   _skipexperts_sacgmm24                  600.71  141.97GiB   -0.2%  (job 7634)
+#   --training.local_batch_size 4          OOM                        (job 7635)
+#   bs=3 + MOE_EP_PERM=1                   OOM at step 53             (job 7641)
+#   _sacgmmall + MOE_EP_PERM=1             OOM at step 43             (job 7647)
+# A GA run has seen 2-4x the tokens by the same step, so part of its gain is
+# position in training; GA at local 2 also costs ~+26GiB, so it cannot stack
+# with _sacgmmall.
 # ---------------------------------------------------------------------------
 
 
@@ -1849,6 +1864,11 @@ def gpt_oss_120b_bf16reduce_lr3e4_take2stack_skipexperts_sacgmm24() -> Trainer.C
     Saving 6 blocks on the stack measured +1.95GiB (job 7629), well under the
     ~6.8GiB the tensor sizes predict, so the per-block cost is bracketed at
     0.33-1.13GiB: 24 blocks is +8 to +27GiB, inside the headroom either way.
+
+    MEASURED (job 7634): 600.71 / 608.57 over steps 101-200, 141.97GiB --
+    level with _take2stack_skipexperts (job 7632, 601.66 / 604.96, 142.27GiB) and
+    no memory added: the per-block cutoff does not survive compile (see
+    SelectiveAC.Config.save_grouped_mm_from_layer).
     """
     return _skipexperts_save_grouped_mm(12)
 
@@ -1860,5 +1880,14 @@ def gpt_oss_120b_bf16reduce_lr3e4_take2stack_skipexperts_sacgmmall() -> Trainer.
     +12 to +41GiB on 141.72GiB by the same bracket as _sacgmm24: fits if the
     measured 0.33GiB/block holds, OOMs at the tensor-size estimate. Either
     outcome pins the per-block cost.
+
+    MEASURED (200 steps, tf32 + pointwise autotune, TF/GPU mean / median over
+    steps 101-200, same day):
+        _take2stack_skipexperts  (job 7632)  601.66 / 604.96  142.27GiB
+        this config              (job 7636)  669.84 / 670.59  166.95GiB (93.61%)  +11.3%
+    +24.7GiB, 0.69GiB per block. THE BEST 120B CONFIG; run with
+    TORCHTITAN_FP32_MATMUL_PRECISION=tf32 and pointwise autotune. Adding
+    MOE_EP_PERM=1 on top OOMs by ~4GiB on the most loaded rank at step ~43 (job
+    7647); MOE_EP_PERM is the better lever only where this memory is not spent.
     """
     return _skipexperts_save_grouped_mm(0)
