@@ -1820,3 +1820,45 @@ def gpt_oss_120b_bf16reduce_lr3e4_take2stack_skipexperts() -> Trainer.Config:
     config = gpt_oss_120b_bf16reduce_lr3e4_take2stack()
     config.parallelism.fsdp_skip_unsharded_experts = True
     return config
+
+
+# ---------------------------------------------------------------------------
+# Wave 3: spend the memory fsdp_skip_unsharded_experts freed. Wave 2 (200
+# steps, tf32 + pointwise autotune, TF/GPU mean over steps 101-200):
+#   _take2stack                  560.59  167.00GiB  (job 7628)
+#   _take2stack_skipexperts      585.69  141.72GiB  (job 7630)  +4.5%, -25.3GiB
+#   _take2stack_sacgmm_tail6     569.59  168.95GiB  (job 7629)  +1.6%, +1.95GiB
+# ---------------------------------------------------------------------------
+
+
+def _skipexperts_save_grouped_mm(from_layer: int) -> Trainer.Config:
+    config = gpt_oss_120b_bf16reduce_lr3e4_take2stack_skipexperts()
+    config.activation_checkpoint = SelectiveAC.Config(
+        preserve_rng_state=False,
+        save_grouped_mm=True,
+        save_grouped_mm_from_layer=from_layer,
+    )
+    return config
+
+
+def gpt_oss_120b_bf16reduce_lr3e4_take2stack_skipexperts_sacgmm24() -> Trainer.Config:
+    """_take2stack_skipexperts saving the expert GEMM outputs in the last 24
+    of 36 blocks (save_grouped_mm_from_layer=12).
+
+    skipexperts peaks at 141.72GiB (79.46%, job 7630), ~36GiB under the card.
+    Saving 6 blocks on the stack measured +1.95GiB (job 7629), well under the
+    ~6.8GiB the tensor sizes predict, so the per-block cost is bracketed at
+    0.33-1.13GiB: 24 blocks is +8 to +27GiB, inside the headroom either way.
+    """
+    return _skipexperts_save_grouped_mm(12)
+
+
+def gpt_oss_120b_bf16reduce_lr3e4_take2stack_skipexperts_sacgmmall() -> Trainer.Config:
+    """_take2stack_skipexperts saving the expert GEMM outputs in all 36
+    blocks -- GPT-OSS-20B's sac-save-grouped-mm setting (+16.4% there).
+
+    +12 to +41GiB on 141.72GiB by the same bracket as _sacgmm24: fits if the
+    measured 0.33GiB/block holds, OOMs at the tensor-size estimate. Either
+    outcome pins the per-block cost.
+    """
+    return _skipexperts_save_grouped_mm(0)
