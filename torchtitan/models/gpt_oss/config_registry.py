@@ -1647,5 +1647,10 @@ def gpt_oss_120b_bf16reduce_lr3e4_loaderworkers() -> Trainer.Config:
     waiting for a rank whose CPU was busy). Same change as
     take2-qwen3/dataloader-workers, +4.4% tok/s on Qwen3-30B-A3B (job 6180
     vs 6177). Worker interleaving changes the sample order.
+
+    MEASURED (200 steps, TF/GPU mean / median over steps 101-200, same day):
+        control _lr3e4        (job 7597)  499.23 / 511.53  173.76GiB
+        this config           (job 7600)  530.20 / 534.63  170.54GiB   +6.2%
+    Steps 21-100 are slower while the workers spin up (21-200 mean -0.2%).
     """
     return _set_loader_workers(gpt_oss_120b_bf16reduce_lr3e4())
