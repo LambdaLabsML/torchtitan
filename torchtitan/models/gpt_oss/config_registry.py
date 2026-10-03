@@ -1773,6 +1773,13 @@ def gpt_oss_120b_bf16reduce_lr3e4_take2stack_sacgmm_tail6() -> Trainer.Config:
     If peak memory does not rise by ~1.1GiB per saved block, compile reused
     one block's graph and policy across layers and the per-layer cutoff did
     nothing -- read the memory before the throughput.
+
+    MEASURED (200 steps, tf32 + pointwise autotune, TF/GPU mean / median over
+    steps 101-200): 569.59 / 570.54 at 168.95GiB (job 7629) vs the stack's
+    560.59 / 567.34 at 167.00GiB (job 7628), +1.6% -- but only +1.95GiB, not the
+    ~6.8GiB predicted. save_grouped_mm_from_layer does not take effect under
+    compile (see its docstring), so this is not a measurement of saving 6 blocks.
+    Saving all 36 is _take2stack_skipexperts_sacgmmall.
     """
     config = gpt_oss_120b_bf16reduce_lr3e4_take2stack()
     config.activation_checkpoint = SelectiveAC.Config(
