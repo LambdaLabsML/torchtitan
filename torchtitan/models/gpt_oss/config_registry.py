@@ -1668,6 +1668,10 @@ def gpt_oss_120b_bf16reduce_lr3e4_norng() -> Trainer.Config:
     throughput, -3.25GiB peak -- but both runs were past the divergence that
     gpt_oss_120b_bf16reduce_lr3e4 fixes, so this re-measures it on the
     stable trajectory. Numerics-neutral while the block stays deterministic.
+
+    MEASURED (200 steps, TF/GPU mean / median over steps 101-200, same day):
+        control _lr3e4        (job 7597)  499.23 / 511.53  173.76GiB
+        this config           (job 7603)  508.47 / 518.15  173.27GiB   +1.9%
     """
     config = gpt_oss_120b_bf16reduce_lr3e4()
     config.activation_checkpoint = SelectiveAC.Config(preserve_rng_state=False)
