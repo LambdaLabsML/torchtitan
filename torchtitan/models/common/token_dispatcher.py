@@ -106,6 +106,11 @@ class _PermCombine(torch.autograd.Function):
 # as scatters. With the inverse permutations in hand all four are plain gathers
 # in both directions (the K-duplicate ones sum their copies in fp32), using
 # _PermGather / _PermCombine above and _PermRows below.
+#
+# MEASURED on gpt_oss_120b_bf16reduce_lr3e4_take2stack (200 steps, tf32 +
+# pointwise autotune, TF/GPU mean over steps 101-200): 611.20 with
+# MOE_EP_PERM=1 (job 7631) vs 560.59 without (job 7628), +9.0%, at +1.1GiB.
+# With fsdp_skip_unsharded_experts: 631.02 vs 601.66 (jobs 7640 / 7632), +4.9%.
 _EP_PERM = os.environ.get("MOE_EP_PERM", "0") == "1"
 
 
