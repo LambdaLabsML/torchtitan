@@ -1617,5 +1617,10 @@ def gpt_oss_120b_bf16reduce_lr3e4_swigluhalves() -> Trainer.Config:
 
     Same model up to a fixed permutation of mlp1's output rows; from-scratch
     training only (GptOssStateDictAdapter refuses HF conversion with it).
+
+    MEASURED (200 steps, TF/GPU mean / median over steps 101-200, same day):
+        control _lr3e4        (job 7597)  499.23 / 511.53  173.76GiB
+        this config           (job 7599)  525.33 / 531.78  169.30GiB   +5.2%
+    -4.5GiB peak and 6 slow steps (<350 TF/GPU) against the control's 23.
     """
     return _set_swiglu_contiguous_halves(gpt_oss_120b_bf16reduce_lr3e4())
