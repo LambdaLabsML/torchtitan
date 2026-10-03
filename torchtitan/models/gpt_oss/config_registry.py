@@ -1589,5 +1589,10 @@ def gpt_oss_120b_bf16reduce_lr3e4_biasgemm() -> Trainer.Config:
 
     On GPT-OSS-20B: +1.0% on its reference (job 6238), +0.7% on the stack
     (job 6373). Forward and all non-bias gradients are bitwise identical.
+
+    MEASURED (200 steps, TF/GPU mean / median over steps 101-200, same day):
+        control _lr3e4        (job 7597)  499.23 / 511.53  173.76GiB
+        this config           (job 7602)  516.73 / 522.26  172.90GiB   +3.5%
+    Replicate controls landed within +-0.5% of each other over this window.
     """
     return _enable_expert_bias_grad_gemm(gpt_oss_120b_bf16reduce_lr3e4())
