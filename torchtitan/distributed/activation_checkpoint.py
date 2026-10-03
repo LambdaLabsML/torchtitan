@@ -237,6 +237,13 @@ class SelectiveAC(ActivationCheckpointing):
         backward peak, so the memory cost is linear in the number of saved
         blocks, whichever they are; this lets a model with a few GiB of headroom
         spend exactly that much.
+
+        INEFFECTIVE UNDER torch.compile as measured: the per-block compile
+        reuses layers.0's graph -- and the SAC policy traced into it -- for
+        every block, so the cutoff applies the first block's choice to all.
+        On GPT-OSS-120B a cutoff of 12 left peak memory unchanged (job 7634)
+        while saving all blocks added 24.7GiB (job 7636). Works eagerly; with
+        compile use save_grouped_mm on every block or none.
         """
 
     def get_save_ops(self) -> set:
