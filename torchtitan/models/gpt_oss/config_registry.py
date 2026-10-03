@@ -1694,6 +1694,11 @@ def gpt_oss_120b_bf16reduce_lr3e4_mxfp8_attn_lmhead() -> Trainer.Config:
 
     Read TF/GPU, not MFU (N/A for low-precision runs). lm_head output feeds
     the loss directly: reject on a visibly higher loss curve even if faster.
+
+    MEASURED -- NEGATIVE, not in any stack (200 steps, TF/GPU mean / median over
+    steps 101-200, same day):
+        control _lr3e4        (job 7597)  499.23 / 511.53  173.76GiB
+        this config           (job 7606)  489.43 / 496.49  170.75GiB   -2.0%
     """
     config = gpt_oss_120b_bf16reduce_lr3e4()
     model_compile_enabled = (
