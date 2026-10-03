@@ -1809,6 +1809,13 @@ def gpt_oss_120b_bf16reduce_lr3e4_take2stack_skipexperts() -> Trainer.Config:
     with FSDP direct all-gather / reduce-scatter (split/39, split/42: +5.6%
     and +1.3% there); at efsdp=1 the copy has no collective behind it at all,
     so the experts simply leave FSDP. Expect lower peak memory as well.
+
+    MEASURED (200 steps, tf32 + pointwise autotune, TF/GPU mean / median over
+    steps 101-200, same day):
+        _take2stack            (job 7628)  560.59 / 567.34  167.00GiB (93.63%)
+        this config            (job 7630)  585.69 / 589.93  141.72GiB (79.46%)  +4.5%
+    -25.3GiB of peak: more than the transient copies, so FSDP's unsharded and
+    staging buffers for the experts were resident too. Loss@200 6.130 vs 6.136.
     """
     config = gpt_oss_120b_bf16reduce_lr3e4_take2stack()
     config.parallelism.fsdp_skip_unsharded_experts = True
