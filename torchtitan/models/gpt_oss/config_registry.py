@@ -1889,5 +1889,16 @@ def gpt_oss_120b_bf16reduce_lr3e4_take2stack_skipexperts_sacgmmall() -> Trainer.
     TORCHTITAN_FP32_MATMUL_PRECISION=tf32 and pointwise autotune. Adding
     MOE_EP_PERM=1 on top OOMs by ~4GiB on the most loaded rank at step ~43 (job
     7647); MOE_EP_PERM is the better lever only where this memory is not spent.
+
+    LONG RUN (job 7653, normal 2000-step warmup, tf32 + pointwise autotune, 50
+    min cap at step 3011), TF/GPU mean / median:
+        steps  200-1500   833.07 / 851.71
+        steps 1000-1500   871.96 / 876.35   19,252 tok/s/GPU
+        steps 2000-3011   870.29 / 874.72
+    Peak 166.07GiB (93.12%), flat; no step under 700 TF/GPU after step 1000.
+    At steps 1000-1500: +27.6% / +26.5% over gpt_oss_120b_bf16reduce_lr3e4
+    (job 2307, 683.39 / 693.04) and +12.8% / +12.9% over _take2stack (job 7627,
+    772.73 / 776.29). Loss 4.856 @1000, 4.263 @1500, 3.749 @3000 (2307: 4.792 /
+    4.331 / 3.823).
     """
     return _skipexperts_save_grouped_mm(0)
