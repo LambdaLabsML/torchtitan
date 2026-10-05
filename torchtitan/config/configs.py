@@ -149,7 +149,7 @@ class ParallelismConfig:
     only `data_parallel_shard_degree` can be negative. 1 means disabled.
     """
 
-    fsdp_reshard_after_forward: Literal["default", "always", "never"] = "default"
+    fsdp_reshard_after_forward: Literal["default", "always", "never", "dense-never"] = "default"
     """
     `reshard_after_forward` specifies the policy for applying `reshard_after_forward`
     within an FSDP setup. `reshard_after_forward` controls parameter behavior after forward,
@@ -162,6 +162,9 @@ class ParallelismConfig:
       scenarios.
     - "always" will enable `reshard_after_forward` for all forward passes.
     - "never" will disable `reshard_after_forward` for all forward passes.
+    - "dense-never" disables it for the dense parameters only; routed experts
+      (MoE, under expert parallelism) still reshard, since unsharded they can
+      be hundreds of GiB per rank.
     """
 
     fsdp_symm_mem_scope: Annotated[FSDPSymmMemScope, tyro.conf.Suppress] = None
