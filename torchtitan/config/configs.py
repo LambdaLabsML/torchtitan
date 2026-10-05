@@ -149,6 +149,14 @@ class ParallelismConfig:
     only `data_parallel_shard_degree` can be negative. 1 means disabled.
     """
 
+    fp8_expert_all_gather: bool = False
+    """
+    Gather MoE expert weights as row-wise e4m3 fp8 (with fp32 scales) and
+    dequantize to bf16 after the all-gather, halving the bytes of the largest
+    FSDP collective. Master weights and the expert GEMM stay bf16. See
+    torchtitan/distributed/fp8_allgather.py (Megatron-LM #5470's idea).
+    """
+
     fsdp_reshard_after_forward: Literal["default", "always", "never", "dense-never"] = "default"
     """
     `reshard_after_forward` specifies the policy for applying `reshard_after_forward`
