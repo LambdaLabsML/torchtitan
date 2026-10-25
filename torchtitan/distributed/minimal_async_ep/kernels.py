@@ -6,6 +6,7 @@
 
 # pyrefly: ignore-errors
 
+import os
 import torch
 import triton
 import triton.language as tl
@@ -13,7 +14,7 @@ import triton.language as tl
 
 _COUNT_COPY_BLOCK_SIZE = 1024
 _METADATA_BLOCK_SIZE = 256
-_MAX_BLOCK_N = 2048
+_MAX_BLOCK_N = int(os.environ.get("MINIMAL_ASYNC_EP_COPY_BLOCK_N", "2048"))
 
 # MinimalAsyncEP hidden buffers use TrainingConfig.mixed_precision_param,
 # currently restricted to bfloat16 or float32.
