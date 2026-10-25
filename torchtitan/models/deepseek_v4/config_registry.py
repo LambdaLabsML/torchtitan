@@ -650,6 +650,18 @@ def deepseek_v4_debugmodel_asyncep_policy(
         assert _enable_cudnn_indexer(config) > 0
     if os.environ.get("FP8_DENSE", "0") == "1":
         _apply_fp8_dense(config)
+    if os.environ.get("DUAL_MB", "0") == "1" or os.environ.get("DEBUG_MB4", "0") == "1":
+        # the two-microbatch schedule needs an even sequence count; DEBUG_MB4=1
+        # gives the matching single-microbatch reference at the same 4 sequences
+        config.training.num_tokens_per_microbatch_per_dp_rank = 4 * (seq_len or DEFAULT_DEBUG_MODEL_SEQ_LEN)
+    if os.environ.get("DUAL_MB", "0") == "1":
+        assert _enable_dual_microbatch(config) > 0
+    mp = os.environ.get("MP_PARAM")
+    if mp:  # e.g. float32: removes the bf16 rounding of grads so two-half sums match one GEMM
+        config.training.mixed_precision_param = mp
+        config.training.mixed_precision_reduce = mp
+    if os.environ.get("BALANCED_ROUTING", "0") == "1":
+        assert _force_balanced_routing(config) > 0
     config.training.disable_cuda_graphs = True
     config.debug.seed = 0
     config.debug.deterministic = True
@@ -1151,4 +1163,52 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_9x_bal
     """9x with forced balanced routing (fits once the DSA backward runs the atomic path)."""
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(9, seq_len)
     config.debug.moe_force_load_balance = True
+    return config
+
+def _enable_dual_microbatch(config: Trainer.Config) -> int:
+    """Turn on the two-microbatch EP-overlap schedule on every MoE block and
+    size MinimalAsyncEP's receive pool for it. Returns the block count."""
+    from torchtitan.distributed.minimal_async_ep.api import set_microbatch_split
+
+    n = 0
+    for layer in config.model_spec.model.layers:
+        if getattr(layer, "moe", None) is not None:
+            layer.dual_microbatch = True
+            n += 1
+    set_microbatch_split(2)
+    return n
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_dualmb(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The 402 best (dense-never) plus the two-microbatch EP overlap.
+
+    Each block splits its 6 sequences into two halves of 3 and overlaps one
+    half's MinimalAsyncEP dispatch/combine (comm stream) with the other half's
+    attention and experts (compute stream) -- Megatron's combined-1F1B
+    fine-grained EP overlap, inside one block. Targets the ~10% of GPU time
+    the profiles show fully exposed in the dispatch copy and EP barrier. The
+    receive pool becomes four half-size slots (same bytes as today's two).
+    """
+    assert microbatch % 2 == 0, "dual microbatch needs an even sequence count"
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(microbatch, seq_len)
+    assert _enable_dual_microbatch(config) > 0, "no MoE block found"
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_dualmb_balanced(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """Dual-microbatch EP overlap with forced round-robin routing."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_dualmb(microbatch, seq_len)
+    assert _force_balanced_routing(config) > 0
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_6x_balanced_dualmb(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """6x balanced with the two-microbatch EP overlap schedule (halves of 3
+    whole sequences). Needs CUDA_MODULE_LOADING=EAGER; the receive pool grows
+    to 8 slots (4 per in-flight half)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_6x_balanced(seq_len)
+    assert _enable_dual_microbatch(config) > 0
     return config
