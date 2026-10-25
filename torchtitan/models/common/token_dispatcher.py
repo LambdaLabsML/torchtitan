@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import spmd_types as spmd
+import os
 import torch
 from torch.distributed._functional_collectives import all_to_all_single
 from torch.distributed.tensor import DeviceMesh
@@ -1108,6 +1109,16 @@ class MinimalAsyncEPTokenDispatcher(BaseEPTokenDispatcher):
         num_local_experts = num_local_tokens_per_expert_E.numel() // ep_size
         num_receive_rows_per_source_rank = num_tokens * min(top_k, num_local_experts)
         receive_capacity = ep_size * num_receive_rows_per_source_rank
+        # MINIMAL_ASYNC_EP_POOL_FACTOR (see minimal_async_ep/api.py): bound the
+        # receive rows at factor x the expected receive instead of ep_size x it.
+        # The receive layout is compacted by actual counts, so only the total
+        # must cover what arrives; under forced balanced routing that is exactly
+        # num_receive_rows_per_source_rank. Imbalanced routing beyond the factor
+        # would overflow the buffer -- balanced-regime measurements only.
+        _factor = os.environ.get("MINIMAL_ASYNC_EP_POOL_FACTOR")
+        if _factor is not None:
+            bounded = (int(float(_factor) * num_receive_rows_per_source_rank) + 127) & ~127
+            receive_capacity = min(receive_capacity, bounded)
 
         (
             hidden_states_RD,
