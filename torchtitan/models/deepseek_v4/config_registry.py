@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
@@ -668,6 +669,8 @@ def deepseek_v4_debugmodel_asyncep_policy(
     config.parallelism.fp8_expert_all_gather = os.environ.get("FP8_EXPERT_AG", "0") == "1"
     if os.environ.get("CUDNN_INDEXER", "0") == "1":
         assert _enable_cudnn_indexer(config) > 0
+    if os.environ.get("FP8_DENSE", "0") == "1":
+        _apply_fp8_dense(config)
     config.training.disable_cuda_graphs = True
     config.debug.seed = 0
     config.debug.deterministic = True
@@ -736,3 +739,87 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx(
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(microbatch, seq_len)
     assert _enable_cudnn_indexer(config) > 0, "no CSA layer found"
     return config
+FP8_DENSE_FILTER_FQNS = [
+    # Kept in bf16/fp32 on purpose (Megatron's DSv4 correctness list keeps the
+    # CSA compressor and indexer in high precision under FP8; the router gate
+    # scores in fp32; the LM head is left bf16 as in every fp8 recipe here).
+    "lm_head",
+    "router.gate",
+    "indexer",
+    "compressor",
+    # Too small to gain: attn_sink is 1x64, wkv is 4096->512, wq_a 4096->1024.
+    # torchao's H100-tuned auto filter also rejected wq_b (K=1024, N=32768),
+    # the single largest dense GEMM in the model, so it is not used here.
+    "attn_sink",
+    "attention.wkv",
+    "attention.wq_a",
+]
+
+
+def _apply_fp8_dense(config: Trainer.Config) -> Trainer.Config:
+    """Swap the dense ``Linear`` configs (attention projections, shared
+    experts) to torchao rowwise Float8Linear. Expert grouped GEMMs are not
+    touched: fp8 ``_scaled_grouped_mm`` aborts on sm_103 and the MXFP8 path
+    measured -7.5% here. Runs on the model config tree, so it composes with any
+    already-built recipe."""
+    from torchtitan.config.transform.quantization import Float8LinearConverter
+
+    if os.environ.get("FP8_DENSE_IMPL", "torchao") == "custom":
+        # torchao-free tensorwise fp8 linear with cached weight casts
+        # (torchtitan/quantization/custom_fp8.py; probe 821).
+        from torchtitan.models.common.linear import Linear
+        from torchtitan.quantization.custom_fp8 import convert_linear_config
+        from torchtitan.quantization.utils import module_filter_fn
+
+        fqns = [f for f in FP8_DENSE_FILTER_FQNS if f != "auto_filter_small_kn"]
+        n = 0
+        for fqn, lc, parent, attr in list(config.model_spec.model.traverse(Linear.Config)):
+            if type(lc) is not Linear.Config or not module_filter_fn(lc, fqn, fqns):
+                continue
+            new_cfg = convert_linear_config(lc)
+            if isinstance(parent, list):
+                parent[attr] = new_cfg
+            else:
+                setattr(parent, attr, new_cfg)
+            n += 1
+        assert n > 0, "custom fp8: no linear converted"
+        return config
+
+    # FP8_DENSE_RECIPE: tensorwise (default; the only recipe whose compiled
+    # fwd+bwd beat bf16 on GB300 in probe 817), rowwise, rowwise_with_gw_hp.
+    recipe = os.environ.get("FP8_DENSE_RECIPE", "tensorwise")
+    conv = Float8LinearConverter(
+        Float8LinearConverter.Config(
+            recipe_name="rowwise", filter_fqns=list(FP8_DENSE_FILTER_FQNS)
+        )
+    )
+    config.model_spec.model = conv.convert(config.model_spec.model)
+    return config
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_fp8dense(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The 401 best (dense-never, 4 receive slots) plus fp8 dense linears.
+
+    Dense bf16 GEMMs (attention projections, shared expert, indexer scores)
+    are 11.3% of kernel time in the job-702 profile; rowwise fp8 halves the
+    tensor-core work of the ones converted here. FP8_DENSE_COMPILE=1 compiles
+    each Float8Linear module on its own so torchao's amax/scale/cast kernels
+    fuse (eager fp8 casts can eat the gain).
+    """
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(microbatch, seq_len)
+    # First-step compiles of the fp8 cast graphs can exceed the 300 s default
+    # while FSDP collectives are pending (job 823); warm-up handles the known
+    # shapes, this covers anything it misses.
+    config.comm.init_timeout_seconds = 1800
+    return _apply_fp8_dense(config)
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_fp8dense(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """Stack: dense-never + 4 slots + cuDNN fused indexer (441.4, job 807)
+    + fp8 dense linears (wq_b, wo_a, wo_b, shared w13/w2)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx(microbatch, seq_len)
+    return _apply_fp8_dense(config)

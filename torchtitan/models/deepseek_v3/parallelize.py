@@ -1,8 +1,11 @@
+import os
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+
+from torch import nn
 
 from torchtitan.config import (
     CompileConfig,
@@ -16,6 +19,11 @@ from torchtitan.distributed.compile import apply_compile
 from torchtitan.distributed.fsdp import resolve_fsdp_mesh, resolve_sparse_fsdp_mesh
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.deepseek_v3.mtp import apply_fsdp_to_mtp_decoder
+
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def parallelize_deepseekv3(
@@ -45,6 +53,39 @@ def parallelize_deepseekv3(
 
     if ac_config is not None:
         ac_config.build(dump_folder=dump_folder).apply(model)
+
+    fp8_linears = [
+        name
+        for name, m in model.named_modules()
+        if "Float8" in type(m).__name__ and isinstance(m, nn.Linear)
+    ]
+    if fp8_linears:
+        logger.info(
+            "fp8 dense: %d Float8Linear modules, e.g. %s",
+            len(fp8_linears),
+            ", ".join(fp8_linears[:4]),
+        )
+    if any("CustomFloat8" in type(m).__name__ for m in model.modules()):
+        from torchtitan.quantization.custom_fp8 import warmup_custom_fp8
+
+        warmup_custom_fp8(
+            model, num_tokens=training.num_tokens_per_microbatch_per_dp_rank
+        )
+
+    if os.environ.get("FP8_DENSE_COMPILE", "0") == "1":
+        # Compile each Float8Linear on its own (the block itself stays eager:
+        # whole-block compile graph-breaks in the SPMD typecheck context) so
+        # torchao's per-call amax/scale/cast kernels fuse around the fp8 GEMM.
+        n = 0
+        names = []
+        for name, module in model.named_modules():
+            if "Float8" in type(module).__name__ and isinstance(module, nn.Linear):
+                module.compile(dynamic=False)
+                n += 1
+                names.append(name)
+        logger.info(
+            "fp8 dense: compiled %d Float8Linear modules (%s)", n, ", ".join(names[:6])
+        )
 
     if model_compile_enabled:
         apply_compile(
