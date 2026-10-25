@@ -666,6 +666,8 @@ def deepseek_v4_debugmodel_asyncep_policy(
     config.parallelism.expert_parallel_degree = 2
     config.parallelism.fsdp_reshard_after_forward = os.environ.get("FSDP_POLICY", "default")
     config.parallelism.fp8_expert_all_gather = os.environ.get("FP8_EXPERT_AG", "0") == "1"
+    if os.environ.get("CUDNN_INDEXER", "0") == "1":
+        assert _enable_cudnn_indexer(config) > 0
     config.training.disable_cuda_graphs = True
     config.debug.seed = 0
     config.debug.deterministic = True
@@ -710,4 +712,27 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_fp8ag_profile(
     config.profiler.profile_freq = 10
     config.profiler.profiler_warmup = 3
     config.profiler.profiler_active = 2
+    return config
+
+
+def _enable_cudnn_indexer(config: Trainer.Config) -> int:
+    """Route every CSA layer's top-k selection through cuDNN's fused indexer."""
+    n = 0
+    for layer in config.model_spec.model.layers:
+        inner = getattr(getattr(layer, "attention", None), "inner_attention", None)
+        if inner is not None and getattr(inner, "compress_ratio", 0) == 4:
+            inner.cudnn_indexer = True
+            n += 1
+    return n
+
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx(
+    microbatch: int = 6, seq_len: int | None = 8192
+) -> Trainer.Config:
+    """The 401 best (dense-never, 4 receive slots) plus cuDNN's fused indexer
+    top-k in place of the eager einsum + stable sort (Megatron #5992's idea;
+    the kernel ships in our cuDNN frontend 1.29). Sort/top-k kernels are 2.3%
+    of kernel time at 8K plus the dense score GEMM and its elementwise tail."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever(microbatch, seq_len)
+    assert _enable_cudnn_indexer(config) > 0, "no CSA layer found"
     return config
