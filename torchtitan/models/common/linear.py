@@ -16,6 +16,8 @@
 from dataclasses import dataclass
 
 import spmd_types as spmd
+import logging
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,6 +29,11 @@ from torchtitan.protocols.module import Module
 
 # Shape suffix legend for the router gate:
 #   T = num tokens, D = model dimension, E = num experts
+
+
+logger = logging.getLogger(__name__)
+_BF16_FP32OUT = os.environ.get("LINEAR_BF16_FP32OUT", "0") == "1"
+_bf16_logged = False
 
 
 class Linear(nn.Linear, Module):
@@ -64,6 +71,27 @@ class CastLinear(Linear):
         self.compute_dtype = TORCH_DTYPE_MAP[config.compute_dtype]
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if (
+            _BF16_FP32OUT
+            and self.compute_dtype is torch.float32
+            and input.device.type == "cuda"
+            and input.dtype is torch.bfloat16
+            and self.weight.dtype is torch.bfloat16
+        ):
+            # LINEAR_BF16_FP32OUT=1: bf16 tensor-core GEMM with fp32 accumulation
+            # and output instead of casting input and weight up to fp32 first.
+            # bf16 values are exact in TF32, so the products are the same; only
+            # the accumulation order differs. Removes a [T, in] fp32 copy per
+            # call (the DSv4 compressor's wkv/wgate: ~1% of the step).
+            global _bf16_logged
+            if not _bf16_logged:
+                _bf16_logged = True
+                logger.info("Linear: bf16-in/fp32-out GEMM path active (LINEAR_BF16_FP32OUT=1), first module in=%d out=%d", self.in_features, self.out_features)
+            lead = input.shape[:-1]
+            out = _RouterGateLinearFunction.apply(input.reshape(-1, input.shape[-1]), self.weight)
+            if self.bias is not None:
+                out = out + self.bias.to(torch.float32)
+            return out.reshape(*lead, out.shape[-1])
         # The optimizer updates the weight each step, so training cannot cache
         # the upcast copy. Inference may be able to cache it between syncs.
         bias = None if self.bias is None else self.bias.to(self.compute_dtype)
