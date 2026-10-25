@@ -973,3 +973,58 @@ def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_teexpe
     config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(microbatch, seq_len)
     assert _apply_te_experts(config) > 0
     return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_sac_ep4_1x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """Selective AC at EP=4 on the current recipe (TE dense + cuDNN indexer), 1x
+    microbatch -- the only microbatch SAC's saved activations have ever fit (the
+    181.69-recipe sweep, jobs 557-561). Re-measured on the 500.3 recipe."""
+    from torchtitan.distributed.activation_checkpoint import SelectiveAC
+
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(1, seq_len)
+    config.parallelism.expert_parallel_degree = 4
+    config.activation_checkpoint = SelectiveAC.Config()
+    return config
+
+def _sac_variant(microbatch: int, ep: int, seq_len: int | None = 8192) -> Trainer.Config:
+    from torchtitan.distributed.activation_checkpoint import SelectiveAC
+
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(microbatch, seq_len)
+    config.parallelism.expert_parallel_degree = ep
+    config.activation_checkpoint = SelectiveAC.Config()
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_sac_ep2_4x(seq_len: int | None = 8192) -> Trainer.Config:
+    """Selective AC, EP=2, 4x: SAC at 1x used only 89 GiB on this recipe (job 900)."""
+    return _sac_variant(4, 2, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_sac_ep4_4x(seq_len: int | None = 8192) -> Trainer.Config:
+    return _sac_variant(4, 4, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_sac_ep4_3x(seq_len: int | None = 8192) -> Trainer.Config:
+    return _sac_variant(3, 4, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense_4x(
+    seq_len: int | None = 8192,
+) -> Trainer.Config:
+    """FullAC reference at 4x for the selective-AC comparison."""
+    return deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(4, seq_len)
+
+def _ep1_variant(microbatch: int, seq_len: int | None = 8192) -> Trainer.Config:
+    """EP=1: every rank runs all 256 experts on its own tokens (standard local
+    dispatcher, no EP comm); experts are FSDP-sharded 32-way like everything
+    else, so each layer's full expert set (6.4 GB) is gathered per pass. The
+    default reshard policy is required (dense-never would keep every layer's
+    experts unsharded at EP=1)."""
+    config = deepseek_v4_flash_8k_gb300_cudnn_full_ep2_densenever_cudnnidx_tedense(microbatch, seq_len)
+    config.parallelism.expert_parallel_degree = 1
+    config.parallelism.fsdp_reshard_after_forward = "default"
+    assert _swap_ep_backend(config, "standard") > 0
+    return config
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep1_1x(seq_len: int | None = 8192) -> Trainer.Config:
+    return _ep1_variant(1, seq_len)
+
+def deepseek_v4_flash_8k_gb300_cudnn_full_ep1_7x(seq_len: int | None = 8192) -> Trainer.Config:
+    return _ep1_variant(7, seq_len)
