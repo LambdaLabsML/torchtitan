@@ -24,6 +24,7 @@ from torchtitan.distributed.activation_checkpoint import (
 )
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.models.common.config_utils import decoder_vocab_size
+from torchtitan.tools.profiler import Profiler
 from torchtitan.trainer import Trainer
 
 from . import model_registry
@@ -1036,4 +1037,34 @@ def gptoss20b_membudget() -> Trainer.Config:
     config = gptoss20b_selac()
     config.activation_checkpoint = MemoryBudgetAC.Config(memory_budget=0.5)
     config.compile = CompileConfig(enable=True, components=["model", "loss"])
+    return config
+
+
+def gptoss20b_mxfp8_lmhead_profile() -> Trainer.Config:
+    """gptoss20b_mxfp8_lmhead (the take-2 reference) with the torch profiler
+    capturing step 20, traces to outputs/profiling/traces_20b_take2/. Run with
+    TT_STEPS=24. Profiling adds overhead: take throughput from the unprofiled
+    config, not from this.
+
+    Why: the only 20b trace on disk (traces_20b_best, 2026-09-02, 2.88 s
+    profiled step) ranks, after the grouped GEMMs (1,345 ms): fp32
+    ReduceScatter 587 ms on the comm stream, three fused swiglu-backward /
+    bias-grad kernels carrying index_put 333 ms, chunk_cat<float, bf16>
+    90 ms, dispatch-gather indexing_backward_kernel 67 ms, router SIMT
+    sgemm 37 ms. This re-takes it on the take-2 base.
+
+    Job 6215 (2026-09-30, 2.51 s profiled step, rank 0): grouped GEMM 1,145
+    ms (the forward kernel runs 96 times against 48 per backward kernel:
+    MemoryBudgetAC recomputes every expert GEMM), fp32 ReduceScatter 444 ms
+    on the comm stream, swiglu-backward + bias-grad index_put kernels 312
+    ms, FA4 181 ms, chunk_cat<float, bf16> 69 ms, dispatch-gather
+    indexing_backward_kernel 69 ms.
+    """
+    config = gptoss20b_mxfp8_lmhead()
+    config.profiler = Profiler.Config(
+        enable_profiling=True,
+        profile_freq=20,
+        save_traces_folder="profiling/traces_20b_take2",
+    )
+    config.training.steps = 24
     return config
