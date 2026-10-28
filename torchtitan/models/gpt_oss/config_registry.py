@@ -1214,6 +1214,9 @@ def gptoss20b_mxfp8_lmhead_sacgmm_bs5() -> Trainer.Config:
 
     Ran seeded only (job 6376, seed 42, 300 steps, 146.54GiB) as the
     reference for jobs 6377-6379.
+
+    Ran seeded only (job 6376, seed 42, 300 steps, 146.54GiB) as the
+    reference for jobs 6377-6379.
     """
     config = gptoss20b_mxfp8_lmhead()
     config.activation_checkpoint = SelectiveAC.Config(save_grouped_mm=True)
@@ -1259,7 +1262,7 @@ def gptoss20b_mxfp8_lmhead_bf16reduce_bf16train_sacgmm_noreshard_bs5_biasgemm() 
     the stack, where saving the expert GEMMs changed what the backward does.
 
     MEASURED (job 6373): 968.89 / 970.72 TF/GPU, +0.7% over _noreshard_bs5
-    (job 6371). THE BEST CONFIG, run with
+    (job 6371). Best without the swiglu layout change (see _swigluhalves), run with
     TORCHTITAN_FP32_MATMUL_PRECISION=tf32 and
     TT_INDUCTOR="TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1
     TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1": 986.95 / 991.61 TF/GPU,
@@ -1273,4 +1276,37 @@ def gptoss20b_mxfp8_lmhead_bf16reduce_bf16train_sacgmm_noreshard_bs5_biasgemm() 
     """
     return _enable_expert_bias_grad_gemm(
         gptoss20b_mxfp8_lmhead_bf16reduce_bf16train_sacgmm_noreshard_bs5()
+    )
+
+
+def _set_swiglu_contiguous_halves(config: Trainer.Config) -> Trainer.Config:
+    for layer in config.model_spec.model.layers:
+        layer.moe.routed_experts.inner_experts.swiglu_interleaved = False
+    return config
+
+
+def gptoss20b_mxfp8_lmhead_bf16reduce_bf16train_sacgmm_noreshard_bs5_biasgemm_swigluhalves() -> Trainer.Config:
+    """The wave-2 stack (_sacgmm_noreshard_bs5_biasgemm; job 6374 with tf32 +
+    pointwise autotune: 986.95 TF/GPU mean, 991.61 median) with the mlp1
+    output stored as contiguous [gate | linear] halves instead of interleaved.
+
+    In that stack's profile (job 6375, 1.31 s step) the swiglu forward and
+    the two swiglu-backward kernels are the largest non-GEMM compute: 27.9 +
+    59.6 + 45.5 = 133 ms, ~2.5 ms per layer for the backward against ~0.7 ms
+    for its bytes. The interleaved split x[..., ::2] / x[..., 1::2] makes
+    every load and store in them stride 2. Same model up to a fixed
+    permutation of mlp1's rows (CPU check: outputs and all grads bitwise
+    equal after permuting); from-scratch training only.
+
+    MEASURED, both with TORCHTITAN_FP32_MATMUL_PRECISION=tf32 and pointwise
+    autotune (TT_INDUCTOR as in _biasgemm above): 1,010.27 TF/GPU mean,
+    1,012.19 median, 32,263 tok/s/GPU, 160.95GiB (job 7258) against the
+    same-day control _sacgmm_noreshard_bs5_biasgemm at 986.40 / 990.12
+    (job 7257) -- +2.4% mean, +2.2% median. THE BEST CONFIG: +22.6% over
+    the reference gptoss20b_mxfp8_lmhead (824.26, job 6237). Loss@100 6.576
+    vs 6.514 (unseeded; the layouts differ by a row permutation, so the
+    same seed is not the same initialization).
+    """
+    return _set_swiglu_contiguous_halves(
+        gptoss20b_mxfp8_lmhead_bf16reduce_bf16train_sacgmm_noreshard_bs5_biasgemm()
     )

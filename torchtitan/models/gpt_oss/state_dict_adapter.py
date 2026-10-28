@@ -17,6 +17,10 @@ from .model import GptOssModel
 class GptOssStateDictAdapter(MoEStateDictAdapter):
     def __init__(self, model_config: GptOssModel.Config, hf_assets_path: str | None):
         super().__init__(model_config, hf_assets_path)
+        self._swiglu_halves = any(
+            not layer.moe.routed_experts.inner_experts.swiglu_interleaved
+            for layer in model_config.layers
+        )
 
         self.from_hf_map = {
             "model.embed_tokens.weight": "tok_embeddings.weight",
@@ -43,6 +47,14 @@ class GptOssStateDictAdapter(MoEStateDictAdapter):
             "model.norm.weight": "norm.weight",
             "lm_head.weight": "lm_head.weight",
         }
+
+    def _check_swiglu_layout(self) -> None:
+        if self._swiglu_halves:
+            raise NotImplementedError(
+                "swiglu_interleaved=False permutes mlp1's output rows away from "
+                "the HF gate_up_proj layout; HF conversion would need that "
+                "permutation and is not implemented."
+            )
 
     def get_hf_storage_reader(
         self, path: str, from_quantized: bool = False
@@ -77,6 +89,7 @@ class GptOssStateDictAdapter(MoEStateDictAdapter):
                  One can save into unquantized hf checkpoints with last_save_in_hf = true.
         """
 
+        self._check_swiglu_layout()
         to_hf_map = {v: k for k, v in self.from_hf_map.items()}
         hf_state_dict = {}
 
@@ -103,6 +116,7 @@ class GptOssStateDictAdapter(MoEStateDictAdapter):
         """
         Convert from hf format state dict to tt model state dict.
         """
+        self._check_swiglu_layout()
         self._validate_hf_rope_config(CosSinRoPE.Config)
 
         state_dict = {}
