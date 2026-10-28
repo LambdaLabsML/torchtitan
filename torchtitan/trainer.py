@@ -341,6 +341,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             config.debug,
             distinct_seed_mesh_dims=["pp"],
         )
+        dist_utils.set_fp32_matmul_precision_from_env()
 
         # build model (using meta init)
         model_config = model_spec.model

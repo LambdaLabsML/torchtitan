@@ -173,6 +173,26 @@ def dist_mean(
     )
 
 
+def set_fp32_matmul_precision_from_env() -> None:
+    """Apply ``TORCHTITAN_FP32_MATMUL_PRECISION`` to fp32 CUDA matmuls.
+
+    Unset leaves PyTorch's default ("ieee"), which on Blackwell runs fp32
+    GEMMs on the SIMT cores (cutlass3x_sm100_simt_sgemm). The MoE router gate
+    runs under fp32 autocast, so on Qwen3-30B-A3B that is 93 ms of a 4.8 s step
+    (8x B200 profile). "tf32" moves it onto tensor cores; the gate's inputs are
+    bf16 activations and fp32 weights, and TF32's 10-bit mantissa is still
+    above bf16's 7. Measured +2.7% on
+    qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_flexflash
+    (881.62 vs 858.15 TF/GPU, jobs 5469 vs 5457). Same knob as the GB300
+    DeepSeek-V4-flash branch, which defaulted it to bfx9.
+    """
+    precision = os.environ.get("TORCHTITAN_FP32_MATMUL_PRECISION")
+    if not precision:
+        return
+    torch.backends.cuda.matmul.fp32_precision = precision
+    logger.info("FP32 CUDA matmul precision: %s", precision)
+
+
 def set_determinism(
     parallel_dims: ParallelDims,
     device: torch.device,
