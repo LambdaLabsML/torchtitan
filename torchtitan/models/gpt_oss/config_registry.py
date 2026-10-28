@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from dataclasses import dataclass
+import torch
 from torch.distributed.tensor import Shard
 
 from torchtitan.components.checkpoint import CheckpointManager
@@ -22,7 +24,12 @@ from torchtitan.components.quantization import (
     MXFP8LinearConverter,
 )
 from torchtitan.components.validate import Validator
-from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.config import (
+    CompileConfig,
+    DebugConfig,
+    ParallelismConfig,
+    TrainingConfig,
+)
 from torchtitan.distributed.activation_checkpoint import (
     FullAC,
     MemoryBudgetAC,
@@ -2129,3 +2136,596 @@ def gpt_oss_120b_noreshard_bs1() -> Trainer.Config:
     config = gpt_oss_120b_ep8_compile()
     config.parallelism.fsdp_reshard_after_forward = "never"
     return config
+
+
+# ---------------------------------------------------------------------------
+# Communication-efficiency wave (2026-09-16).
+#
+# Motivation and the correction it rests on. The trace that started this work
+# (job 1399, outputs/profiling/traces_120b_best/iteration_400) shows 41.0% of
+# kernel time in NCCL and only 9.6% of that comm hidden behind compute. Both
+# numbers are real, but they do NOT describe the 660 TFLOPs configuration:
+#
+#   job 237  gpt_oss_120b_ep8_compile_bs_increase  ~660 TFLOPs  step ~1,122 ms
+#   job 1399 same config, profiled                 ~460 TFLOPs  step ~1,674 ms
+#
+# Job 1399 was missing three environment variables that job 237 set:
+#   TORCH_NCCL_AVOID_RECORD_STREAMS=1
+#   NCCL_NVLS_ENABLE=0
+#   PYTORCH_ALLOC_CONF=...,garbage_collection_threshold:0.8
+# and it ran at 173.52GiB (97.29%) against job 237's 169.50GiB (95.04%).
+#
+# What the trace actually shows, measured per rank: all 7 non-rank-4 ranks each
+# sit ~185 ms inside ONE ncclDevKernel_SendRecv waiting for rank 4, whose GPU is
+# 29 ms busy out of that 185 ms window while its CPU is stuck in
+# CompiledFunctionBackward. So the dominant "communication" cost in that trace
+# is rank desynchronization under memory pressure, not bytes on the wire.
+# Correlating every NCCL kernel to its collective through the profiler's
+# "External id" (analyze_trace_comm.py) prices this exactly:
+#
+#   collective              bytes/step   kernel time   best rate   transfer   wait
+#   all_to_allv  (bf16)       55.87 GB     564.86 ms   713 GB/s    78.33 ms  486.53 ms
+#   reduce_scatter (fp32)      8.51 GB     122.27 ms   638 GB/s    13.34 ms  108.93 ms
+#   all_gather   (bf16)        1.21 GB      29.21 ms    82 GB/s    14.79 ms   14.42 ms
+#   ---------------------------------------------------------------------------------
+#   total                                   716.34 ms              106.46 ms  609.88 ms
+#
+# "transfer" is the time those same bytes would take at the best rate the run
+# itself achieved. So of 716 ms of NCCL kernel time, ~107 ms moves data and
+# ~610 ms is ranks waiting for each other. The largest dispatches (804-819 MB)
+# hit 693-713 GB/s, close to NVLink peak, while 52-135 MB calls land at
+# 0.3-14 GB/s -- those are not slow transfers, they are stalls.
+# Bandwidth is not the problem; arrival skew is.
+#
+# Trace compute union is 1,050 ms. Against job 237's 1,122 ms step that leaves
+# only ~70 ms of exposed comm at 660 TFLOPs, so the 41% headline overstates the
+# available win by roughly an order of magnitude. run_profile_v2.sbatch re-takes
+# the trace with job 237's environment to replace these estimates with a
+# measurement.
+#
+# The one comm cost the trace shows that is NOT overlap-dependent, and therefore
+# survives the correction, is the fp32 gradient path (see gpt_oss_120b_bf16reduce).
+# ---------------------------------------------------------------------------
+
+
+def gpt_oss_120b_bf16reduce() -> Trainer.Config:
+    """Best 120b config with the FSDP gradient reduce-scatter in bf16.
+
+    Single variable against gpt_oss_120b_ep8_compile_bs_increase (job 237,
+    ~660 TFLOPs/GPU, 14,600 tok/s/GPU, 169.50GiB): only
+    training.mixed_precision_reduce moves from "float32" to "bfloat16".
+
+    Why this one is not overlap-dependent. FSDP reduces gradients in fp32 while
+    the model trains in bf16, so every step pays twice:
+
+      ncclDevKernel_ReduceScatter_Sum_f32   122.27 ms   fp32 bytes on the wire
+      chunk_cat_cuda_kernel<float, BFloat16> 75.94 ms   bf16 -> fp32 copy-in
+
+    The 75.94 ms is ordinary compute on the critical path -- it is not comm and
+    cannot be hidden by better overlap -- and halving the reduce-scatter payload
+    is a byte reduction that does not depend on arrival skew. Verified against
+    the trace's record_param_comms: reduce-scatter input totals 2.114e9 elements
+    per step (2 x 579,133,440 for tok_embeddings and lm_head at vocab 201,088 x
+    dim 2,880, plus 36 x 26,924,672 for the per-layer dense params), which is
+    exactly the 2.114B dense parameter count. The 114.71B expert params are
+    EP-sharded and never enter this collective, so bf16 reduction here touches
+    only 1.8% of the model's parameters.
+
+    Expected size, stated before measuring: the Qwen3.5-122B precedent on this
+    same cluster measured +4.5% (RESULTS_QWEN35.md §17, jobs 647/648), and the
+    lesson recorded there applies -- a profile bucket's size is an upper bound on
+    what removing it can save, not an estimate, because FSDP already overlaps
+    gradient reduction with backward compute. Anything from +3% to +8% would be
+    consistent.
+
+    THIS CHANGES TRAINING NUMERICS and is not cleared for a real run. Gradients
+    reduced across 8 shards in bf16 accumulate rounding error that fp32
+    reduction exists to prevent. It must be read against a float32 control at
+    the same --debug.seed; gpt_oss_120b_ep8_compile_bs_increase run with the same
+    seed is that control, which is why no separate control config is added here.
+    On Qwen3.5 the paired curves converged (gap narrowing ~30x from step 15 to
+    150) with no instability, but 400 steps can reveal a problem, not prove its
+    absence at 10k.
+    """
+    config = gpt_oss_120b_ep8_compile_bs_increase()
+    config.training.mixed_precision_reduce = "bfloat16"
+    return config
+
+
+def gpt_oss_120b_fsdp_symm_mem() -> Trainer.Config:
+    """Best 120b config with FSDP2 symmetric-memory collectives.
+
+    Single variable against gpt_oss_120b_ep8_compile_bs_increase: only
+    parallelism.enable_fsdp_symm_mem moves from False to True. This routes the
+    FSDP all-gather and reduce-scatter through symmetric memory (direct NVLink
+    peer copies) instead of NCCL ring kernels.
+
+    Prior expectation is LOW. The same flag measured exactly flat on
+    Qwen3.5-122B on this cluster -- 11.82% MFU and 3,650 tok/s against a 3,648
+    baseline, identical peak memory (RESULTS_QWEN35.md §18, job 785). It is
+    included because the FSDP side here is a different shape than Qwen3.5's: at
+    EP=8 only the 2.114B dense params are FSDP-managed, and 1.16B of those are
+    two 579M-element embedding matrices, so this run's collectives are a few
+    very large buckets (2 x 144.8 MiB all-gathers) rather than many medium ones.
+    Symmetric memory helps large transfers more than small, so the Qwen3.5 null
+    result does not transfer cleanly.
+
+    Numerics are unchanged, so loss is directly comparable to job 237 and MFU is
+    valid. Cheap to run and independent of gpt_oss_120b_bf16reduce; if both win
+    they should be stacked and re-measured, not assumed additive.
+    """
+    config = gpt_oss_120b_ep8_compile_bs_increase()
+    config.parallelism.enable_fsdp_symm_mem = True
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Wave 2: the non-GEMM compute the corrected trace reading exposes.
+#
+# Once the 41% NCCL figure is understood as rank skew rather than bytes (see the
+# wave-1 block above), the trace's 570.54 ms of non-GEMM, non-NCCL kernel time
+# becomes the thing worth attacking. Attributed to call sites by External id:
+#
+#   ms      n    aten call site              what it is
+#   ------  ---  --------------------------  --------------------------------
+#   83.70   200  _fused_adamw_               optimizer step
+#   75.94    74  _chunk_cat                  FSDP bf16->fp32 grad copy-in
+#   38.71   439  copy_ (Memcpy DtoD)         staging copies
+#   26.43    36  <inductor fused pointwise>  router math + token permute
+#   23.89    36  <inductor fused pointwise>  index_put / index_select permute
+#   22.03    36  <inductor fused pointwise>  permute backward
+#   21.76    36  _index_put_impl_            MoE combine backward scatter
+#   21.56    36  <inductor fused pointwise>  index_put / index_select permute
+#   21.47    36  <inductor fused pointwise>  router + permute (fwd)
+#   16.55    37  div (fp32)                  FSDP gradient divide
+#   18.17   200  _foreach_norm/_foreach_mul_ grad-norm clipping
+#
+# Grouping those: ~178 ms is the MoE token permute/unpermute cluster (14
+# inductor pointwise kernels, all n=36, i.e. once per layer), ~228 ms is the
+# fp32 gradient path (_chunk_cat + fp32 div + the fp32 reduce-scatter), and
+# ~84 ms is the optimizer. Only 517 ms of the step is in GEMMs.
+#
+# The expert grouped GEMMs are the healthy part: ~352 TFLOP of expert work in
+# 341.80 ms is ~1,030 TFLOPs, 46% of the 2.25e15 bf16 peak. The dense GEMMs
+# (attention projections plus the 201,088-wide lm_head) manage ~530 TFLOPs.
+#
+# A second pattern from the logs drives the ordering below. Every configuration
+# that pushes HBM to >=97% collapses, and not by a little:
+#
+#   job 237  gpt_oss_120b_ep8_compile_bs_increase   95.04%   ~660 TFLOPs
+#   job 1399 same config, thinner env               97.29%   ~460 TFLOPs
+#   job 1300 gpt_oss_120b_mxfp8_linears             96.23%   ~460 TFLOPs
+#   job  661 gpt_oss_120b_membudget_bs3             97.55%     ~32 TFLOPs
+#   job 1518 gpt_oss_120b_noreshard                 97.56%     ~20 TFLOPs, then OOM
+#
+# That is the same mechanism as the trace's rank-4 straggler: near the limit the
+# allocator stalls, one rank falls behind, and every other rank bills the wait
+# to whatever collective it is parked in. So memory headroom is worth more here
+# than any single kernel on the list above, and a wave-2 candidate that spends
+# memory has to be judged against that, not just on its own kernel savings.
+#
+# Nothing in this block changes the permute implementation, because none of the
+# routes to one are open: TorchAOTokenDispatcher is reachable only through the
+# quantization converters, MXFP8GroupedExpertsConverter is architecturally
+# blocked (the CuTeDSL 1x32 quantize kernel needs K % 128 == 0 and GPT-OSS has
+# dim 2880), deepep and hybridep are not installed in the venv, and
+# minimal_async_ep hard-requires FullAC, which crashes under compile
+# ("AssertionError: Node add_21 was invalid, but is output"). What is left is
+# making the generated kernels better (inductor autotuning, driven by env vars
+# in run_gptoss120b_v2.sbatch since CompileConfig exposes no inductor knobs),
+# bounding how much of the cost is routing imbalance, and one retry of the
+# float8 path.
+# ---------------------------------------------------------------------------
+
+
+def gpt_oss_120b_balanced_diag() -> Trainer.Config:
+    """DIAGNOSTIC CEILING, not a shippable config: forced round-robin routing.
+
+    Sets debug.moe_force_load_balance on the best config. The router's own
+    top-k choice is replaced by round-robin assignment, so every expert receives
+    exactly the same number of tokens.
+
+    This is NOT a throughput candidate -- it changes which expert sees which
+    token, so the model being trained is not GPT-OSS-120B and the loss is
+    meaningless. It exists to put a number on how much of the MoE cost is
+    imbalance rather than intrinsic work, which three separate measurements
+    currently blame imbalance for:
+
+      - the 144 bf16 all-to-all payloads in the trace span 200.9-819.4 MB,
+        a 4x spread across calls that should be identical in a balanced model
+      - the permute kernels' cost scales with the largest expert group, not the
+        average, because grouped-mm pads to the biggest group
+      - rank 4 being ~185 ms late is consistent with it having drawn the heavy
+        share of routed tokens that step
+
+    Under forced balance all three effects vanish at once. Read the result as an
+    upper bound on what a real fix (auxiliary load-balancing loss, router
+    temperature, expert-capacity tuning) could recover, and read it on tok/s
+    only. If it is flat, imbalance is not the problem and this whole line of
+    attack closes -- which is worth one node-hour to know.
+
+    Numerics note: GptOssMoE subclasses the common MoE and does not override the
+    router, and GptOssModel subclasses the common Decoder, whose
+    update_from_config propagates debug.moe_force_load_balance into
+    router._debug_force_load_balance. So the flag does take effect on this model.
+    """
+    config = gpt_oss_120b_ep8_compile_bs_increase()
+    config.debug = DebugConfig(moe_force_load_balance=True)
+    return config
+
+
+def gpt_oss_120b_fp8_bs2() -> Trainer.Config:
+    """Float8 rowwise linears + float8 grouped experts on the best config.
+
+    gpt_oss_120b_fp8 already exists but was built on gpt_oss_120b_ep8_compile
+    (local_batch_size=1) and crashed when it ran as job 194:
+
+        CUDA error: unspecified launch failure  (cudaErrorLaunchFailure)
+        raised from currentStreamCaptureStatusMayInitCtx
+
+    This is the retry at bs=2 on the current best base rather than a re-run of
+    the same thing: the base config, the environment (job 194 predates
+    TORCH_NCCL_AVOID_RECORD_STREAMS / garbage_collection_threshold:0.8) and the
+    memory profile are all different now. It is the speculative entry of wave 2
+    and should be queued last.
+
+    Why it is worth one attempt despite the crash. Float8GroupedExpertsConverter
+    is the only open route to replacing the MoE permute: it swaps in
+    TorchAOTokenDispatcher, which uses torchao's permute_and_pad kernel instead
+    of the inductor-generated permute that costs ~178 ms per step. So this
+    single config attacks the largest non-GEMM pool AND the 341.80 ms of expert
+    grouped GEMM at once. MXFP8 cannot do this -- it needs K % 128 == 0 and
+    GPT-OSS's dim is 2880 -- but float8 needs only 16-element alignment and
+    2880 % 16 == 0.
+
+    Reading the result: MFU is computed against the bf16 peak (2.25e15), so a
+    float8 run inflates mfu% and metrics.py reports N/A. Compare on tok/s, which
+    is precision-neutral. Loss is not comparable to the bf16 runs.
+
+    Router gate and lm_head stay bf16 via filter_fqns: quantizing the router
+    perturbs expert assignment, and the 201,088-wide lm_head feeds the loss.
+
+    Memory is the risk as much as the crash. Every config in this registry that
+    reached >=97% of HBM collapsed, and bs=2 already sits at 95.04%. Float8
+    keeps master weights in bf16 and adds quantized copies plus padding, so this
+    could land the wrong side of that line even if the launch failure is gone.
+    If it OOMs or degrades, gpt_oss_120b_fp8 at bs=1 is the fallback shape.
+    """
+    config = gpt_oss_120b_ep8_compile_bs_increase()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.model_spec = model_registry(
+        "120b",
+        converters=[
+            Float8LinearConverter.Config(
+                recipe_name="rowwise",
+                filter_fqns=["lm_head", "gate"],
+            ),
+            Float8GroupedExpertsConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+            ),
+        ],
+    )
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Wave 3: expert load balance, which turns out to be the throughput limiter.
+#
+# gpt_oss_120b_balanced_diag (job 2278) was queued as a diagnostic ceiling and
+# came back as the largest result in this whole registry:
+#
+#   step            100   200   300   400   500   600   peak HBM
+#   job 2278 forced 686   689   681   684   682   683   163.68GiB (91.77%)
+#   job 2268 control 404   494   523   532   538   517   171.28GiB (96.03%)
+#   job  237 (*)     464   550   616   631   646   656   169.50GiB (95.04%)
+#   (*) different LR trajectory, see the TT_STEPS note below
+#
+# Forced round-robin routing is FLAT AT THE CEILING FROM STEP 100. Every other
+# run climbs toward it for hundreds of steps and never arrives. So the ramp that
+# looked like ordinary warmup is the auxiliary-loss-free load balancer slowly
+# converging, and the gap between the ramp and 683 is the cost of imbalance:
+# +27% throughput and 7.6GiB of peak memory, the latter mattering twice over
+# because every config here that touched 97% of HBM collapsed.
+#
+# The mechanism is in optimizer.py::_update_expert_bias:
+#
+#   expert_bias_delta_E = load_balance_coeff * sign(mean(tokens_per_expert) -
+#                                                   tokens_per_expert)
+#
+# A fixed-size sign step, DeepSeek-V3 style (arXiv 2408.15664), applied once per
+# optimizer step. GPT-OSS's 120b flavor hardcodes load_balance_coeff=1e-3
+# (gpt_oss/__init__.py:363), so a routing bias can travel at most 0.001 per
+# step: order 1000 steps to move one bias by 1.0 against softmax logits of order
+# 1. That is why balance is still converging at step 600, and it is the knob.
+#
+# The configs below raise it. This is a legitimate training knob, not a
+# benchmark cheat -- it is the published bias update rate, and the balancer adds
+# no gradient term to the objective (that is what "auxiliary-loss-free" means).
+# Too large should overshoot and oscillate, so 10x and 30x bracket it rather
+# than guessing one value.
+#
+# A METHODOLOGY NOTE that applies to every comparison here. Wave 1 and 2 ran
+# TT_STEPS=600, and LRSchedulersContainer clamps warmup to the total step count
+# (lr_scheduler.py:107-112), so those runs rewrote warmup_steps 2000 -> 600 and
+# reached the full 8e-4 LR by step 600 instead of ~2.4e-4. They are internally
+# comparable but are on a different, more aggressive LR trajectory than job 237,
+# which plausibly explains why the control plateaued at ~535 where job 237
+# reached 656: a faster-moving router gate balances worse. Wave 3 leaves
+# training.steps at the config's 10000 and caps the run with slurm --time
+# instead, so the LR trajectory is the real one.
+# ---------------------------------------------------------------------------
+
+
+def _gpt_oss_120b_with_load_balance_coeff(coeff: float) -> Trainer.Config:
+    """Best 120b config with the expert-bias update rate set to `coeff`.
+
+    Reaches into the per-layer MoE configs because load_balance_coeff is a model
+    flavor argument, hardcoded at 1e-3 by gpt_oss/__init__.py::_120b, with no
+    Trainer.Config field and no CLI override. All 36 layers must agree:
+    register_moe_load_balancing_hook raises if load_balance_coeff is set on some
+    MoE layers and not others, and nothing enforces a consistent VALUE, so an
+    inconsistent sweep would silently train 36 different balancers.
+    """
+    config = gpt_oss_120b_ep8_compile_bs_increase()
+    for layer in config.model_spec.model.layers:
+        layer.moe.load_balance_coeff = coeff
+    return config
+
+
+def gpt_oss_120b_lbc1e2() -> Trainer.Config:
+    """load_balance_coeff 1e-3 -> 1e-2 (10x). Single variable off job 237's config.
+
+    The conservative end of the bracket. At 10x, a routing bias can move 0.01
+    per step, so the ~1.0 of bias travel that balance appears to need arrives in
+    ~100 steps rather than ~1000. If the +27% ceiling from job 2278 is really
+    just convergence speed, this should track much closer to 683 early and
+    plateau higher than the ~535-656 band.
+
+    Numerics: this changes routing, so loss is not bit-comparable to the control,
+    but unlike gpt_oss_120b_balanced_diag it is a real model -- the router still
+    chooses experts, it is just nudged toward balance faster. MFU stays valid
+    (nothing is quantized). Watch peak HBM: job 2278 freed 7.6GiB by balancing,
+    and any of that which materializes here is worth as much as the throughput.
+    """
+    return _gpt_oss_120b_with_load_balance_coeff(1e-2)
+
+
+def gpt_oss_120b_lbc3e2() -> Trainer.Config:
+    """load_balance_coeff 1e-3 -> 3e-2 (30x). The aggressive end of the bracket.
+
+    Exists to find the overshoot. A sign-step update has no damping, so the bias
+    hunts around the balanced point with an amplitude proportional to the step
+    size; at some coeff the hunting itself costs more than the imbalance it
+    fixes, and expert assignment starts churning between steps, which also
+    defeats any expert specialization the model is trying to learn.
+
+    If this beats gpt_oss_120b_lbc1e2, the knob is not yet saturated and the
+    sweep should continue upward. If it is worse, the answer is between 1e-3 and
+    3e-2 and gpt_oss_120b_lbc1e2 is the better starting point. Either result
+    bounds the useful range, which is the reason to run both rather than pick
+    one. Judge on throughput AND on whether the loss curve stays smooth --
+    routing churn shows up as loss noise before it shows up as divergence.
+    """
+    return _gpt_oss_120b_with_load_balance_coeff(3e-2)
+
+
+# ---------------------------------------------------------------------------
+# Wave 4 (overnight 2026-09-16/17): memory headroom, from the AC save set.
+#
+# What waves 1-3 settled:
+#
+#   lever                          result
+#   -----------------------------  ------------------------------------------
+#   bf16 grad reduce               +5% twice (job 2269 vs 2268 at clamped LR,
+#                                  job 2295 vs 2292 at the real LR). KEEP.
+#   TT_STEPS fix                   job 2292 reproduced job 237 -- 628 TFLOPs
+#                                  at steps 600-1200 vs 237's 646-671. The LR
+#                                  clamp WAS the reason waves 1-2 sat at ~535.
+#   load_balance_coeff up          BACKWARDS for throughput. At step 1000:
+#                                  1e-3 -> 629, 1e-2 -> 554, 3e-2 -> 503.
+#                                  Monotonic. But loss and stability improve
+#                                  monotonically the other way (grad_norm at
+#                                  step ~2200: 1e-3 -> 4.2, 3e-2 -> 1.8).
+#   pointwise autotune             +1-3%, inside the control's own variance,
+#                                  and costs 2.7GiB. Marginal.
+#   fsdp symm mem                  flat. MAX_AUTOTUNE=1 Triton codegen bug.
+#                                  float8 crashes reproducibly. All closed.
+#   NCCL bandwidth                 closed. 586-670 GB/s in isolation vs 98.9
+#                                  aggregate in-run; NVLS/buffers/channels all
+#                                  flat; only 106ms of 468ms NCCL is transfer.
+#
+# And the thing that reframes what is left. Every run diverges once warmup ends
+# at step 2000 and the LR reaches its full 8e-4 (job 2292):
+#
+#   step    600   1000   1400   2000   2400   2800   3000
+#   tflops  627    629    532    596    562    528    503
+#   g_norm 0.54   0.36   0.36   1.42   6.50  38.75  24.75
+#   loss   5.10   4.38   4.34   4.48   4.74   4.93   4.84   <- rising
+#
+# Loss turns upward at ~step 1400 and grad_norm goes to 39. The throughput decay
+# is downstream of that: as the router destabilizes, expert assignment collapses
+# toward fewer experts, balance degrades, and throughput follows. Job 237 never
+# saw this because it stopped at step ~2000.
+#
+# So the honest figure for this configuration is ~628 TFLOPs (bf16reduce ~660),
+# measured over steps 600-1200, and anything past ~1400 is measuring a diverging
+# run. gpt_oss_120b_bf16reduce_lr3e4 below exists to fix that.
+#
+# THE REMAINING LEVER, and it comes from reading the AC policy rather than the
+# trace. activation_checkpoint.py::_get_default_save_ops puts the collectives in
+# the MUST_SAVE set:
+#
+#   comm_ops = [reduce_scatter_tensor, all_to_all_single, deepep.*, hybridep.*]
+#
+# with the stated rationale "to avoid re-communication". For GPT-OSS-120B at
+# EP=8 that is an expensive default. Each layer's dispatch all-to-all output is
+# ~65,536 rows x 2,880 x 2B = 377MB and the combine's is the same, so keeping
+# both across 36 layers is order 25GiB of the ~49GiB of activation memory at
+# bs=2 (bs=1 measured 144.96GiB and bs=2 169.50GiB, so ~24.5GiB per unit of
+# batch on top of ~120.5GiB of fixed param/grad/optimizer state).
+#
+# Spending 25GiB to avoid re-communication is the wrong trade on this model, for
+# a reason specific to what waves 1-3 measured: the all-to-all only moves ~78ms
+# of actual bytes per step, so recomputing the dispatch in backward should cost
+# order 20ms, while the memory it frees is the variable that has correlated with
+# throughput all along -- 91.77% HBM went with 683 TFLOPs, 95.92% with 628, and
+# everything at 97%+ collapsed. It should also put local_batch_size=3 in reach,
+# and bs 1->2 was +63%.
+#
+# The risk is a hang, not a slowdown, and it is the likely reason for the
+# MUST_SAVE default: re-issuing a collective during backward requires every rank
+# to do it in the same order. The wave-4 jobs therefore run with a short
+# walltime so a deadlock cannot consume the night.
+# ---------------------------------------------------------------------------
+
+
+class GptOssSelectiveACRecomputeA2A(SelectiveAC):
+    """SelectiveAC that recomputes the EP all-to-all instead of saving it.
+
+    Drops only ``_c10d_functional.all_to_all_single`` from the MUST_SAVE set,
+    leaving ``reduce_scatter_tensor`` saved. The reduce-scatter is FSDP's
+    gradient reduction, which happens in backward already and has no forward
+    output worth saving or recomputing; the all-to-all is the MoE dispatch and
+    combine, whose saved outputs are the large tensors.
+
+    Everything else about the policy is inherited, including the
+    "recompute every second matmul" balance and the force-recompute of
+    moe.router.gate. So this is a single-op change to the save set.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(SelectiveAC.Config):
+        pass
+
+    def get_save_ops(self) -> set:
+        ops = super().get_save_ops()
+        # _get_default_save_ops returns a set (it seeds from a set comprehension
+        # over compute_intensive_ops, then set.update(dict) folds in the
+        # resolved comm/compute op dicts by key), so discard is the right call
+        # and is a no-op if a future torch renames the op.
+        ops.discard(torch.ops._c10d_functional.all_to_all_single.default)
+        return ops
+
+
+def gpt_oss_120b_bf16reduce_a2arecompute() -> Trainer.Config:
+    """bf16 grad reduce + recompute the EP all-to-all instead of saving it.
+
+    Single variable against gpt_oss_120b_bf16reduce (job 2295, ~660 TFLOPs over
+    steps 600-1200 at 171.86GiB / 96.36%): only the AC save set changes.
+
+    Read the MEMORY first, not the throughput. The hypothesis is ~25GiB freed,
+    which would land this near 82-85% of HBM. If peak memory barely moves, the
+    estimate of what those saved buffers cost was wrong and
+    gpt_oss_120b_bf16reduce_a2arecompute_bs3 should be cancelled rather than
+    left in the queue. If memory drops a lot but throughput is flat or slightly
+    down, that is still the desired outcome -- the freed memory is the product,
+    and bs=3 is where it gets spent.
+
+    Failure mode to expect: a hang, not a slowdown. Re-issuing a collective in
+    backward needs all 8 ranks to agree on ordering, which is the likely reason
+    comm ops are MUST_SAVE by default. comm.train_timeout_seconds is 100, so a
+    deadlock should abort rather than sit, but these jobs are queued with a short
+    walltime anyway.
+    """
+    config = gpt_oss_120b_bf16reduce()
+    config.activation_checkpoint = GptOssSelectiveACRecomputeA2A.Config()
+    return config
+
+
+def gpt_oss_120b_bf16reduce_a2arecompute_bs3() -> Trainer.Config:
+    """The payoff run: local_batch_size 2 -> 3 on the memory freed above.
+
+    Batch size is the only lever on this model with a proven large payoff --
+    bs 1->2 was +63% (13.5% -> 27.9% MFU) -- and memory is the only thing that
+    has ever blocked bs=3. Two earlier attempts died of exactly that:
+    gpt_oss_120b_membudget_bs3 (job 661) fell to ~32 TFLOPs at 97.55% and
+    gpt_oss_120b_ep8_bs3 needs FullAC, which crashes under compile.
+
+    Arithmetic, to be checked against the run rather than trusted: fixed state
+    is ~120.5GiB, non-a2a activations are ~12GiB per unit of batch if the a2a
+    buffers really are ~25GiB of the ~49GiB at bs=2, so bs=3 projects to
+    ~120.5 + 36 = ~156GiB (~88%). That is inside the envelope but not
+    comfortably, and 88% is already past where job 2292 sat.
+
+    DEPENDS on gpt_oss_120b_bf16reduce_a2arecompute freeing what it is supposed
+    to. Check that job's peak memory before reading anything into this one; if
+    the bs=2 version did not drop well below 96%, this OOMs and the result means
+    nothing about batch size.
+    """
+    config = gpt_oss_120b_bf16reduce_a2arecompute()
+    config.training.local_batch_size = 3
+    return config
+
+
+def gpt_oss_120b_bf16reduce_lr3e4() -> Trainer.Config:
+    """bf16 grad reduce at lr 3e-4 instead of 8e-4, to stop the divergence.
+
+    Not a throughput lever -- a measurement-validity one, and a prerequisite for
+    this config being usable for real training at all. Job 2292 shows loss
+    turning upward at ~step 1400 and grad_norm reaching 38.75 by step 2800, with
+    throughput decaying 629 -> 503 as expert routing collapses. Every number
+    past ~step 1400 in waves 1-3 is measured on a diverging run, and the only
+    reason job 237 looked clean is that it stopped at step ~2000.
+
+    8e-4 is the stock gpt_oss_120b value and it is simply too high for 116.83B
+    params at global batch 16 sequences; grad_norm sitting at 39 against
+    max_norm 1.0 means the clip is scaling gradients down ~39x, which is not
+    training. 3e-4 is a conservative step down rather than a tuned value.
+
+    What to look for: does the 628/660 TFLOPs plateau HOLD past step 2000
+    instead of decaying? If yes, the sustainable figure for this configuration
+    is the plateau, the decay was a symptom of divergence, and long runs become
+    interpretable. Loss should also keep falling rather than turning up, which
+    is the actual point.
+    """
+    config = gpt_oss_120b_bf16reduce()
+    config.optimizer = default_adamw(lr=3e-4)
+    return config
+
+
+def gpt_oss_120b_bf16reduce_norng() -> Trainer.Config:
+    """bf16 grad reduce with preserve_rng_state=False in the AC policy.
+
+    Cheap rider, small expected effect. ActivationCheckpointing.Config defaults
+    preserve_rng_state=True, which stashes and restores RNG state around every
+    checkpointed region so recompute reproduces forward bit-exactly. GPT-OSS has
+    no dropout and nothing else stochastic inside a TransformerBlock, so there is
+    no RNG for the recompute to diverge on and the stash/restore is pure
+    overhead: 36 blocks x 2 (save + restore) per step, each touching CUDA RNG
+    state.
+
+    Expect low single digit percent at best. It is queued because it is one line,
+    numerics-neutral in the absence of in-block randomness, and independent of
+    everything else in this wave, so it costs only queue time. If the model ever
+    gains dropout this must be reverted.
+    """
+    config = gpt_oss_120b_bf16reduce()
+    config.activation_checkpoint = SelectiveAC.Config(preserve_rng_state=False)
+    return config
+
+
+def gpt_oss_120b_lbc3e4() -> Trainer.Config:
+    """load_balance_coeff 1e-3 -> 3e-4, completing the sweep downward.
+
+    The wave-3 bracket came back monotonic in the wrong direction: at step 1000,
+    1e-3 gave 629 TFLOPs, 1e-2 gave 554 and 3e-2 gave 503. Nothing in that
+    establishes that 1e-3 is the optimum -- it was only the smallest value
+    tested. A sign-step update with no damping oscillates with amplitude
+    proportional to the step size, so a smaller step should balance more slowly
+    but sit more quietly once there, and the trend says quieter is faster.
+
+    The expected cost is training quality, which moved the other way across the
+    same sweep: grad_norm at step ~2200 was 4.16 at 1e-3, 1.84 at 3e-2, and loss
+    at matched steps was better at higher coefficients. So this may buy
+    throughput and pay for it in stability, which would make it a real trade
+    rather than a free win, and worth knowing either way before anyone picks a
+    coefficient for a long run.
+
+    Run with gpt_oss_120b_bf16reduce's own control (job 2295) in mind: this one
+    is built on the plain best config, NOT on bf16reduce, so its comparison is
+    job 2292 at 628 TFLOPs. Keeping it off bf16reduce keeps it single-variable
+    against the wave-3 sweep it extends.
+    """
+    return _gpt_oss_120b_with_load_balance_coeff(3e-4)
