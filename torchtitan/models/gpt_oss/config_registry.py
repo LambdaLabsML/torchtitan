@@ -2729,3 +2729,25 @@ def gpt_oss_120b_lbc3e4() -> Trainer.Config:
     against the wave-3 sweep it extends.
     """
     return _gpt_oss_120b_with_load_balance_coeff(3e-4)
+
+
+def gpt_oss_120b_bf16reduce_lr3e4_biasgemm() -> Trainer.Config:
+    """gpt_oss_120b_bf16reduce_lr3e4 with the expert bias gradients as one-hot
+    GEMMs (GptOssGroupedExperts.Config.bias_grad_gemm, moe.ExpertBiasAdd).
+
+    The gather-add bias[expert_idx_R] differentiates to an
+    index_put(accumulate=True) that inductor fuses into the swiglu-backward
+    kernels as atomic adds. At EP=8, bs=2 each rank receives ~65,536 routed
+    rows onto 17 bias rows (16 local experts + the padding row): ~3,900
+    atomics per address, per layer, for both mlp1 and mlp2. The one-hot GEMM
+    computes the same gradient with fp32 accumulation, deterministically.
+
+    On GPT-OSS-20B: +1.0% on its reference (job 6238), +0.7% on the stack
+    (job 6373). Forward and all non-bias gradients are bitwise identical.
+
+    MEASURED (200 steps, TF/GPU mean / median over steps 101-200, same day):
+        control _lr3e4        (job 7597)  499.23 / 511.53  173.76GiB
+        this config           (job 7602)  516.73 / 522.26  172.90GiB   +3.5%
+    Replicate controls landed within +-0.5% of each other over this window.
+    """
+    return _enable_expert_bias_grad_gemm(gpt_oss_120b_bf16reduce_lr3e4())
