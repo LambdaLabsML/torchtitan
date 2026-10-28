@@ -229,6 +229,23 @@ class SelectiveAC(ActivationCheckpointing):
         largest activation in a GPT-OSS layer. Expect to lower local_batch_size.
         """
 
+        save_grouped_mm_from_layer: int = 0
+        """
+        With ``save_grouped_mm``, save the grouped-mm outputs only in blocks
+        ``layers.<i>`` with ``i >= save_grouped_mm_from_layer``; earlier blocks
+        recompute them as before. Every saved block's outputs are alive at the
+        backward peak, so the memory cost is linear in the number of saved
+        blocks, whichever they are; this lets a model with a few GiB of headroom
+        spend exactly that much.
+
+        INEFFECTIVE UNDER torch.compile as measured: the per-block compile
+        reuses layers.0's graph -- and the SAC policy traced into it -- for
+        every block, so the cutoff applies the first block's choice to all.
+        On GPT-OSS-120B a cutoff of 12 left peak memory unchanged (job 7634)
+        while saving all blocks added 24.7GiB (job 7636). Works eagerly; with
+        compile use save_grouped_mm on every block or none.
+        """
+
     def get_save_ops(self) -> set:
         """Returns the set of ops whose activations should be saved. Override
         to customize the save set."""
@@ -240,6 +257,10 @@ class SelectiveAC(ActivationCheckpointing):
     ) -> nn.Module:
         config = cast("SelectiveAC.Config", self.config)
         save_ops = self.get_save_ops()
+        if config.save_grouped_mm and config.save_grouped_mm_from_layer > 0:
+            layer_id = int(base_fqn.rsplit(".", 1)[-1]) if base_fqn else 0
+            if layer_id < config.save_grouped_mm_from_layer:
+                save_ops = save_ops - {torch.ops.aten._grouped_mm.default}
 
         # Collect weight shapes to force-recompute, stored as mm RHS shape
         # (in_f, out_f). For aten.linear we transpose args[1].shape at lookup
