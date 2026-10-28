@@ -2751,3 +2751,25 @@ def gpt_oss_120b_bf16reduce_lr3e4_biasgemm() -> Trainer.Config:
     Replicate controls landed within +-0.5% of each other over this window.
     """
     return _enable_expert_bias_grad_gemm(gpt_oss_120b_bf16reduce_lr3e4())
+
+
+def gpt_oss_120b_bf16reduce_lr3e4_swigluhalves() -> Trainer.Config:
+    """gpt_oss_120b_bf16reduce_lr3e4 with mlp1's output stored as contiguous
+    [gate | linear] halves instead of interleaved gate / linear columns.
+
+    The interleaved split x[..., ::2] / x[..., 1::2] makes every load and
+    store in the swiglu forward and backward stride 2; on GPT-OSS-20B those
+    kernels were the largest non-GEMM compute (133 ms of a 1.31 s step, job
+    6375), the backward ~3.5x its byte cost, and the halves layout measured
+    +2.4% (1,010.27 vs 986.40 TF/GPU, jobs 7258 vs 7257). The 120b has the
+    same expert shapes (dim = hidden = 2880) and 36 layers instead of 24.
+
+    Same model up to a fixed permutation of mlp1's output rows; from-scratch
+    training only (GptOssStateDictAdapter refuses HF conversion with it).
+
+    MEASURED (200 steps, TF/GPU mean / median over steps 101-200, same day):
+        control _lr3e4        (job 7597)  499.23 / 511.53  173.76GiB
+        this config           (job 7599)  525.33 / 531.78  169.30GiB   +5.2%
+    -4.5GiB peak and 6 slow steps (<350 TF/GPU) against the control's 23.
+    """
+    return _set_swiglu_contiguous_halves(gpt_oss_120b_bf16reduce_lr3e4())
