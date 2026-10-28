@@ -137,6 +137,7 @@ def parallelize_gptoss(
         dp_mesh_dims=dp_mesh_dims,
         edp_mesh_dims=edp_mesh_dims,
         enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+        skip_unsharded_experts=parallelism.fsdp_skip_unsharded_experts,
     )
 
     return model
