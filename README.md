@@ -197,8 +197,19 @@ Source code is made available under a [BSD 3 license](./LICENSE), however you ma
 ## Recreating our runs
 
 For recreation of our runs, please follow the instructions below. Each
-workload has a baseline (the stock torchtitan config) and the most optimized
-run that reached our peak TFLOP/s. Numbers are TFLOP/s per GPU.
+workload has a baseline (the stock torchtitan config, out of the box) and the
+most optimized run that reached our peak TFLOP/s. Numbers are TFLOP/s per GPU
+at steady state.
+
+Get the code first. The B200 runs use the `lambda-moe-tflops` branch; the
+DeepSeek-V4 runs use `main`, where that work was merged.
+
+```bash
+git clone git@github.com:LambdaLabsML/torchtitan.git
+cd torchtitan
+git checkout lambda-moe-tflops   # runs 1 to 6
+git checkout main                # runs 7 and 8
+```
 
 **B200 runs** (1 to 6) use the `lambda-moe-tflops` branch and the launchers in
 `benchmarks/`. The launchers expect the shared layout on the B200 cluster:
@@ -214,15 +225,16 @@ cluster layout: `/mnt/dgxc/venvs/dsv4n` (venv), `/mnt/dgxc/pydeps-te` and
 `/mnt/dgxc/pydeps-cudnn` (side-installed Transformer Engine 2.19 and cuDNN
 frontend 1.29) and `/mnt/dgxc/cublas-new` (cuBLAS 13.8 preload).
 
-### 1. GPT-OSS-20B on 8x B200, baseline
+### 1. GPT-OSS-20B on 8x B200, baseline: 311 TF/GPU (job 806)
 
 Stock `gpt_oss_20b` config: bs=1, seq 8192, FullAC, fp32 master weights.
-If the run dies at step 2 with a CUDA-graph shape error, resubmit with
-`TT_EXTRA="--training.disable_cuda_graphs"` (the only deviation from stock).
+The one flag is required: stock leaves CUDA graphs on, and GPT-OSS's varlen
+attention changes shape every step, which fails at step 2.
 
 ```bash
-cd /data/dj-mat-torchtitan-mfu/torchtitan   # branch lambda-moe-tflops
-sbatch benchmarks/gpt_oss_20b/run_gptoss20b.sbatch
+cd /data/dj-mat-torchtitan-mfu/torchtitan   # git checkout lambda-moe-tflops
+TT_EXTRA="--training.disable_cuda_graphs" \
+  sbatch --export=ALL,TT_STEPS=40 benchmarks/gpt_oss_20b/run_gptoss20b.sbatch
 ```
 
 ### 2. GPT-OSS-20B on 8x B200, best: 1,010 TF/GPU (job 7258)
@@ -233,20 +245,20 @@ expert-bias gradient as a GEMM, contiguous-halves SwiGLU, TF32 fp32 matmuls,
 Inductor pointwise autotune. 100 steps, read over steps 21-100.
 
 ```bash
-cd /data/dj-mat-torchtitan-mfu/torchtitan   # branch lambda-moe-tflops
+cd /data/dj-mat-torchtitan-mfu/torchtitan   # git checkout lambda-moe-tflops
 TT_INDUCTOR="TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1 TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1" \
 sbatch --export=ALL,TT_REPO=$PWD,TT_CONFIG=gptoss20b_mxfp8_lmhead_bf16reduce_bf16train_sacgmm_noreshard_bs5_biasgemm_swigluhalves,TORCHTITAN_FP32_MATMUL_PRECISION=tf32 \
   benchmarks/gpt_oss_20b/run_gptoss20b_take2.sbatch
 ```
 
-### 3. GPT-OSS-120B on 8x B200, baseline
+### 3. GPT-OSS-120B on 8x B200, baseline: 182 TF/GPU (job 85)
 
 Stock `gpt_oss_120b` config with the two changes needed for it to run on one
 8x B200 node at all: CUDA graphs off (varlen attention changes shape every
 step) and full bf16 training (fp32 states do not fit in HBM).
 
 ```bash
-cd /data/dj-mat-torchtitan-mfu/torchtitan   # branch lambda-moe-tflops
+cd /data/dj-mat-torchtitan-mfu/torchtitan   # git checkout lambda-moe-tflops
 sbatch benchmarks/gpt_oss_120b/train_gptoss120b_bf16.sbatch
 ```
 
@@ -261,7 +273,7 @@ the warmup and reads lower). qos=dev is interactive-only, so the launcher
 goes through `srun_dev.sh`.
 
 ```bash
-cd /data/dj-mat-torchtitan-mfu/torchtitan   # branch lambda-moe-tflops
+cd /data/dj-mat-torchtitan-mfu/torchtitan   # git checkout lambda-moe-tflops
 TT_REPO=$PWD \
 TT_CONFIG=gpt_oss_120b_bf16reduce_lr3e4_take2stack_skipexperts_sacgmmall \
 TORCHTITAN_FP32_MATMUL_PRECISION=tf32 \
@@ -270,13 +282,13 @@ TT_STEPS= TT_TIME=00:50:00 \
   benchmarks/gpt_oss_120b/srun_dev.sh gptoss120b_best
 ```
 
-### 5. Qwen3-30B-A3B on 8x B200, baseline
+### 5. Qwen3-30B-A3B on 8x B200, baseline: 221 TF/GPU (job 1152)
 
 Stock `qwen3_30b_a3b` config: bs=2, seq 4096, FullAC, fp32 master weights,
-CUDA graphs on. The strict launcher passes nothing but the step count.
+CUDA graphs on. The strict launcher passes nothing but the step count (400).
 
 ```bash
-cd /data/dj-mat-torchtitan-mfu/torchtitan   # branch lambda-moe-tflops
+cd /data/dj-mat-torchtitan-mfu/torchtitan   # git checkout lambda-moe-tflops
 sbatch benchmarks/qwen3_30b_a3b/run_qwen3_30b_a3b_strict.sbatch
 ```
 
@@ -287,19 +299,19 @@ lm_head, varlen flash attention, full bf16 training, dataloader workers,
 bs=12, TF32 fp32 matmuls. 100 steps, read over steps 21-100.
 
 ```bash
-cd /data/dj-mat-torchtitan-mfu/torchtitan   # branch lambda-moe-tflops
+cd /data/dj-mat-torchtitan-mfu/torchtitan   # git checkout lambda-moe-tflops
 TT_EXTRA="--training.local_batch_size 12" \
 sbatch --export=ALL,TT_REPO=$PWD,TT_CONFIG=qwen3_30b_a3b_8k_bs10_selac_compile_bf16reduce_mxfp8_attn_lmhead_varlen_bf16train_loaderworkers,TORCHTITAN_FP32_MATMUL_PRECISION=tf32 \
   benchmarks/qwen3_30b_a3b/run_qwen3_30b_a3b_take2.sbatch
 ```
 
-### 7. DeepSeek-V4 Flash on 64x GB300, baseline
+### 7. DeepSeek-V4 Flash on 64x GB300, baseline: 24 TF/GPU
 
 Stock `deepseek_v4_flash` config (seq 4096, EP=64, flex attention, fp32
 master weights) on 16 nodes x 4 GB300. 30 steps, mean over steps 15 and up.
 
 ```bash
-cd /mnt/dgxc/worktrees/dsv4-flash   # branch main
+cd /mnt/dgxc/worktrees/dsv4-flash   # git checkout main
 WORKTREE=$PWD CONFIG=deepseek_v4_flash STEPS=30 \
   sbatch --nodes=16 --time=01:00:00 gb300/dsv4_64xgb300.slurm
 ```
@@ -316,7 +328,7 @@ On 32 GPUs (8 nodes, one rack) the same recipe with forced balanced routing
 (`..._tedense_9x_balanced`) reads 756 TF/GPU.
 
 ```bash
-cd /mnt/dgxc/worktrees/dsv4-flash   # branch main
+cd /mnt/dgxc/worktrees/dsv4-flash   # git checkout main
 WORKTREE=$PWD \
 EXTRA_PYTHONPATH=/mnt/dgxc/pydeps-te:/mnt/dgxc/pydeps-cudnn \
 TORCHTITAN_FP32_MATMUL_PRECISION=tf32 TE_DENSE_RECIPE=delayed TE_REDUCE_AMAX=0 TORCHTITAN_TE_MHC=1 \
