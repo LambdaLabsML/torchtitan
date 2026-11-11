@@ -316,7 +316,10 @@ WORKTREE=$PWD CONFIG=deepseek_v4_flash STEPS=30 \
   sbatch --nodes=16 --time=01:00:00 gb300/dsv4_64xgb300.slurm
 ```
 
-### 8. DeepSeek-V4 Flash on 128x GB300, best: 743.9 TF/GPU (job 257)
+### 8. DeepSeek-V4 Flash on 128x GB300, best: 620 TF/GPU (job 257)
+
+The trainer reported 743.9 TF/GPU at step 200; the 620 we quote is that
+number rescaled down for the expert load imbalance in the run.
 
 The full GB300 recipe: seq 8192, 9 sequences per GPU, EP=2, cuDNN fused DSA
 forward and backward with the atomic dKV path, cuDNN fused indexer, dense-never
