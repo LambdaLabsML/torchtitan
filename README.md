@@ -333,6 +333,10 @@ all-gather and reduce-scatter, full bf16 training. 200 steps on real C4,
 32 nodes as HSDP (replicate 4 x shard 32), one rack per 8 or 16 nodes.
 On 32 GPUs (8 nodes, one rack) the same recipe with forced balanced routing
 (`..._tedense_9x_balanced`) reads 756 TF/GPU.
+Every optimization in this recipe, and the ones we tried and dropped, is
+described in depth in
+[gb300/OPTIMIZATIONS_DETAILED.md](https://github.com/LambdaLabsML/torchtitan/blob/main/gb300/OPTIMIZATIONS_DETAILED.md)
+on `main`.
 
 ```bash
 cd torchtitan   # git checkout main
